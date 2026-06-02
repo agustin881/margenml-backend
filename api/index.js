@@ -14,9 +14,11 @@ const supabase = createClient(
 );
 
 // ML OAuth
-const ML_CLIENT_ID     = process.env.ML_CLIENT_ID     || '7675542594083413';
-const ML_CLIENT_SECRET = process.env.ML_CLIENT_SECRET || 'UMkN5YDMPQDGLK0GiipUgvTdpoIyYQAq';
-const ML_REDIRECT_URI  = process.env.ML_REDIRECT_URI  || 'https://zingy-creponne-a36346.netlify.app/';
+// OJO: no dejes el secret hardcodeado en un repo público. Rotalo en el panel
+// de ML y dejalo solo como variable de entorno en Vercel.
+const ML_CLIENT_ID     = process.env.ML_CLIENT_ID;
+const ML_CLIENT_SECRET = process.env.ML_CLIENT_SECRET;
+const ML_REDIRECT_URI  = process.env.ML_REDIRECT_URI || 'https://margenml-frontend.vercel.app/';
 
 // ── OAUTH: intercambiar code por token ────────────────────────────
 app.post('/api/auth/token', async (req, res) => {
@@ -47,8 +49,8 @@ app.post('/api/auth/token', async (req, res) => {
 
     if (error) console.error('Supabase upsert error:', error);
 
-    res.json({ 
-      access_token: data.access_token, 
+    res.json({
+      access_token: data.access_token,
       user_id: data.user_id,
       expires_in: data.expires_in
     });
@@ -63,7 +65,7 @@ app.post('/api/auth/refresh', async (req, res) => {
     const { user_id } = req.body;
     const { data: tokenRow } = await supabase
       .from('ml_tokens').select('*').eq('user_id', user_id).single();
-    
+
     if (!tokenRow) return res.status(404).json({ error: 'Token no encontrado' });
 
     const resp = await fetch('https://api.mercadolibre.com/oauth/token', {
@@ -93,51 +95,74 @@ app.post('/api/auth/refresh', async (req, res) => {
   }
 });
 
-// ── WEBHOOK: recibir notificaciones de ML en tiempo real ──────────
+// ── Helper: devuelve un access_token válido, refrescando si venció ─
+async function getValidToken(userId) {
+  const { data: tokenRow } = await supabase
+    .from('ml_tokens').select('*').eq('user_id', String(userId)).single();
+  if (!tokenRow) return null;
+
+  // Si todavía no venció (con 60s de margen), lo usamos tal cual
+  if (new Date(tokenRow.expires_at).getTime() - 60000 > Date.now()) {
+    return tokenRow.access_token;
+  }
+
+  // Vencido: refrescar
+  const resp = await fetch('https://api.mercadolibre.com/oauth/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type:    'refresh_token',
+      client_id:     ML_CLIENT_ID,
+      client_secret: ML_CLIENT_SECRET,
+      refresh_token: tokenRow.refresh_token
+    })
+  });
+  const data = await resp.json();
+  if (data.error) {
+    console.error('Refresh falló en webhook:', data);
+    return tokenRow.access_token; // probamos con el viejo igual
+  }
+
+  await supabase.from('ml_tokens').upsert({
+    user_id:       String(userId),
+    access_token:  data.access_token,
+    refresh_token: data.refresh_token,
+    expires_at:    new Date(Date.now() + data.expires_in * 1000).toISOString(),
+    updated_at:    new Date().toISOString()
+  }, { onConflict: 'user_id' });
+
+  return data.access_token;
+}
+
+// ── WEBHOOK: notificaciones de ML en tiempo real ──────────────────
+// IMPORTANTE: en Vercel (serverless) hay que procesar ANTES de responder.
+// Si respondés 200 primero, la función se congela y el await queda sin correr.
 app.post('/api/webhook/ml', async (req, res) => {
-  res.sendStatus(200); // ML requiere respuesta inmediata
   try {
-    const { resource, user_id, topic } = req.body;
-    if (topic !== 'orders_v2') return;
+    const { resource, user_id, topic } = req.body || {};
 
-    // Obtener el token del vendedor
-    const { data: tokenRow } = await supabase
-      .from('ml_tokens').select('*').eq('user_id', String(user_id)).single();
-    if (!tokenRow) return;
+    // Solo nos interesan órdenes. Filtramos por el resource para que sirva
+    // tanto si suscribís el topic 'orders' como 'orders_v2'.
+    const esOrden = typeof resource === 'string' && resource.startsWith('/orders/');
+    if (!esOrden) return res.sendStatus(200); // health-check / otros topics → 200 rápido
 
-    // Verificar si el token está vencido
-    let token = tokenRow.access_token;
-    if (new Date(tokenRow.expires_at) < new Date()) {
-      const refreshResp = await fetch('https://api.mercadolibre.com/oauth/token', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({
-          grant_type: 'refresh_token', client_id: ML_CLIENT_ID,
-          client_secret: ML_CLIENT_SECRET, refresh_token: tokenRow.refresh_token
-        })
-      });
-      const refreshData = await refreshResp.json();
-      if (!refreshData.error) {
-        token = refreshData.access_token;
-        await supabase.from('ml_tokens').upsert({
-          user_id: String(user_id), access_token: token,
-          refresh_token: refreshData.refresh_token,
-          expires_at: new Date(Date.now() + refreshData.expires_in*1000).toISOString(),
-          updated_at: new Date().toISOString()
-        }, { onConflict: 'user_id' });
-      }
-    }
+    const token = await getValidToken(user_id);
+    if (!token) return res.sendStatus(200);
 
-    // Obtener detalle de la orden
+    // Detalle de la orden
     const orderId = resource.split('/').pop();
-    const orderResp = await fetch(`https://api.mercadolibre.com/orders/${orderId}?access_token=${token}`);
+    const orderResp = await fetch(`https://api.mercadolibre.com/orders/${orderId}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
     const order = await orderResp.json();
-    if (order.error) return;
+    if (order.error || !order.id) return res.sendStatus(200);
 
-    // Obtener envío
+    // Envío
     let shipData = {};
     if (order.shipping && order.shipping.id) {
-      const shipResp = await fetch(`https://api.mercadolibre.com/shipments/${order.shipping.id}?access_token=${token}`);
+      const shipResp = await fetch(`https://api.mercadolibre.com/shipments/${order.shipping.id}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
       const ship = await shipResp.json();
       if (!ship.error) {
         shipData = {
@@ -148,15 +173,17 @@ app.post('/api/webhook/ml', async (req, res) => {
       }
     }
 
-    const item = order.order_items && order.order_items[0] ? order.order_items[0] : {};
-    const comision = order.order_items ? order.order_items.reduce((a, i) => a + (i.sale_fee||0), 0) : 0;
+    const item = (order.order_items && order.order_items[0]) || {};
+    const sku  = (item.item && (item.item.seller_sku || item.item.seller_custom_field)) || '';
+    const comision = order.order_items
+      ? order.order_items.reduce((a, i) => a + (i.sale_fee || 0), 0)
+      : 0;
 
-    // Guardar/actualizar venta en Supabase
     await supabase.from('ventas').upsert({
       nro_venta:     String(order.id),
       user_id:       String(user_id),
       fecha:         order.date_created,
-      sku:           item.item && item.item.seller_sku ? item.item.seller_sku.trim() : '',
+      sku:           sku ? String(sku).trim() : '',
       titulo:        item.item ? item.item.title : '',
       unidades:      item.quantity || 1,
       precio:        order.total_amount,
@@ -165,14 +192,18 @@ app.post('/api/webhook/ml', async (req, res) => {
       logistic_type: shipData.logistic_type || '',
       provincia:     shipData.provincia || '',
       estado:        order.status,
-      con_cuotas:    order.payments && order.payments[0] && (order.payments[0].installments||1) > 1,
+      con_cuotas:    !!(order.payments && order.payments[0] && (order.payments[0].installments || 1) > 1),
       pack_id:       order.pack_id ? String(order.pack_id) : null,
-      raw:           JSON.stringify(order)
+      raw:           order   // JSONB: guardamos el objeto, NO un string
     }, { onConflict: 'nro_venta' });
 
-    console.log('Venta guardada:', order.id);
+    console.log('Venta guardada (webhook):', order.id, order.status);
+    return res.sendStatus(200); // 200 DESPUÉS de procesar
   } catch (e) {
     console.error('Webhook error:', e.message);
+    // Devolvemos 200 igual: si mandamos error, ML reintenta y el upsert
+    // es idempotente (onConflict: nro_venta), así que no duplica.
+    return res.sendStatus(200);
   }
 });
 
