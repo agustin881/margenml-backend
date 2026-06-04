@@ -7,20 +7,16 @@ const app = express();
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// Supabase
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
 );
 
-// ML OAuth
-// OJO: no dejes el secret hardcodeado en un repo público. Rotalo en el panel
-// de ML y dejalo solo como variable de entorno en Vercel.
 const ML_CLIENT_ID     = process.env.ML_CLIENT_ID;
 const ML_CLIENT_SECRET = process.env.ML_CLIENT_SECRET;
 const ML_REDIRECT_URI  = process.env.ML_REDIRECT_URI || 'https://margenml-frontend.vercel.app/';
 
-// ── OAUTH: intercambiar code por token ────────────────────────────
+// ── OAUTH ─────────────────────────────────────────────────────────
 app.post('/api/auth/token', async (req, res) => {
   try {
     const { code } = req.body;
@@ -38,7 +34,6 @@ app.post('/api/auth/token', async (req, res) => {
     const data = await resp.json();
     if (data.error) return res.status(400).json(data);
 
-    // Guardar/actualizar token en Supabase
     const { error } = await supabase.from('ml_tokens').upsert({
       user_id:       String(data.user_id),
       access_token:  data.access_token,
@@ -49,11 +44,7 @@ app.post('/api/auth/token', async (req, res) => {
 
     if (error) console.error('Supabase upsert error:', error);
 
-    res.json({
-      access_token: data.access_token,
-      user_id: data.user_id,
-      expires_in: data.expires_in
-    });
+    res.json({ access_token: data.access_token, user_id: data.user_id, expires_in: data.expires_in });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -65,7 +56,6 @@ app.post('/api/auth/refresh', async (req, res) => {
     const { user_id } = req.body;
     const { data: tokenRow } = await supabase
       .from('ml_tokens').select('*').eq('user_id', user_id).single();
-
     if (!tokenRow) return res.status(404).json({ error: 'Token no encontrado' });
 
     const resp = await fetch('https://api.mercadolibre.com/oauth/token', {
@@ -95,18 +85,16 @@ app.post('/api/auth/refresh', async (req, res) => {
   }
 });
 
-// ── Helper: devuelve un access_token válido, refrescando si venció ─
+// ── Helper: token válido ──────────────────────────────────────────
 async function getValidToken(userId) {
   const { data: tokenRow } = await supabase
     .from('ml_tokens').select('*').eq('user_id', String(userId)).single();
   if (!tokenRow) return null;
 
-  // Si todavía no venció (con 60s de margen), lo usamos tal cual
   if (new Date(tokenRow.expires_at).getTime() - 60000 > Date.now()) {
     return tokenRow.access_token;
   }
 
-  // Vencido: refrescar
   const resp = await fetch('https://api.mercadolibre.com/oauth/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -119,8 +107,8 @@ async function getValidToken(userId) {
   });
   const data = await resp.json();
   if (data.error) {
-    console.error('Refresh falló en webhook:', data);
-    return tokenRow.access_token; // probamos con el viejo igual
+    console.error('Refresh falló:', data);
+    return tokenRow.access_token;
   }
 
   await supabase.from('ml_tokens').upsert({
@@ -134,22 +122,104 @@ async function getValidToken(userId) {
   return data.access_token;
 }
 
-// ── WEBHOOK: notificaciones de ML en tiempo real ──────────────────
-// IMPORTANTE: en Vercel (serverless) hay que procesar ANTES de responder.
-// Si respondés 200 primero, la función se congela y el await queda sin correr.
+// ── Helper: datos de envío completos ─────────────────────────────
+async function getShipData(shipmentId, token) {
+  if (!shipmentId) return {};
+  try {
+    const r = await fetch(`https://api.mercadolibre.com/shipments/${shipmentId}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    const ship = await r.json();
+    if (ship.error) return {};
+    return {
+      costo_envio:           (ship.shipping_option && ship.shipping_option.list_cost) || ship.base_cost || 0,
+      precio_comprador_envio:(ship.shipping_option && ship.shipping_option.cost) || 0,
+      logistic_type:          ship.logistic_type || '',
+      provincia:             (ship.receiver && ship.receiver.state  && ship.receiver.state.name)  || '',
+      ciudad:                (ship.receiver && ship.receiver.city   && ship.receiver.city.name)   || '',
+    };
+  } catch(e) {
+    return {};
+  }
+}
+
+// ── Helper: datos de ítem (tipo de publicación) ───────────────────
+async function getItemData(itemId, token) {
+  if (!itemId) return {};
+  try {
+    const r = await fetch(`https://api.mercadolibre.com/items/${itemId}?attributes=listing_type_id,seller_sku`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    const item = await r.json();
+    if (item.error) return {};
+    return {
+      tipo_publicacion: item.listing_type_id || '',
+    };
+  } catch(e) {
+    return {};
+  }
+}
+
+// ── Helper: construir objeto venta completo ───────────────────────
+async function buildVentaRow(order, userId, token, incluirEnvio = true) {
+  const item     = (order.order_items && order.order_items[0]) || {};
+  const payment  = (order.payments && order.payments[0]) || {};
+  const sku      = (item.item && (item.item.seller_sku || item.item.seller_custom_field)) || '';
+  const comision = order.order_items
+    ? order.order_items.reduce((a, i) => a + (i.sale_fee || 0), 0) : 0;
+
+  // Cuotas y costo financiero
+  const cuotas = payment.installments || 1;
+  // ML cobra un costo financiero por cuotas: total_paid_amount - transaction_amount
+  const costoFinanciero = (payment.total_paid_amount && payment.transaction_amount)
+    ? Math.max(0, payment.total_paid_amount - payment.transaction_amount)
+    : 0;
+
+  // Tipo de publicación
+  const itemData = incluirEnvio && item.item && item.item.id
+    ? await getItemData(item.item.id, token)
+    : {};
+
+  // Envío
+  const shipData = incluirEnvio && order.shipping && order.shipping.id
+    ? await getShipData(order.shipping.id, token)
+    : {};
+
+  return {
+    nro_venta:             String(order.id),
+    user_id:               String(userId),
+    fecha:                 order.date_created,
+    fecha_cierre:          order.date_closed || null,
+    sku:                   sku ? String(sku).trim() : '',
+    titulo:                item.item ? item.item.title : '',
+    unidades:              item.quantity || 1,
+    precio:                order.total_amount,
+    comision,
+    costo_envio:           shipData.costo_envio           || 0,
+    precio_comprador_envio:shipData.precio_comprador_envio || 0,
+    logistic_type:         shipData.logistic_type          || '',
+    provincia:             shipData.provincia              || '',
+    ciudad:                shipData.ciudad                 || '',
+    estado:                order.status,
+    con_cuotas:            cuotas > 1,
+    cuotas:                cuotas,
+    costo_financiero:      costoFinanciero,
+    tipo_publicacion:      itemData.tipo_publicacion       || '',
+    pack_id:               order.pack_id ? String(order.pack_id) : null,
+    raw:                   order
+  };
+}
+
+// ── WEBHOOK ───────────────────────────────────────────────────────
 app.post('/api/webhook/ml', async (req, res) => {
   try {
-    const { resource, user_id, topic } = req.body || {};
-
-    // Solo nos interesan órdenes. Filtramos por el resource para que sirva
-    // tanto si suscribís el topic 'orders' como 'orders_v2'.
+    const { resource, user_id } = req.body || {};
     const esOrden = typeof resource === 'string' && resource.startsWith('/orders/');
-    if (!esOrden) return res.sendStatus(200); // health-check / otros topics → 200 rápido
+    if (!esOrden) return res.sendStatus(200);
 
     const token = await getValidToken(user_id);
     if (!token) return res.sendStatus(200);
 
-    // Detalle de la orden
     const orderId = resource.split('/').pop();
     const orderResp = await fetch(`https://api.mercadolibre.com/orders/${orderId}`, {
       headers: { Authorization: `Bearer ${token}` }
@@ -157,52 +227,13 @@ app.post('/api/webhook/ml', async (req, res) => {
     const order = await orderResp.json();
     if (order.error || !order.id) return res.sendStatus(200);
 
-    // Envío
-    let shipData = {};
-    if (order.shipping && order.shipping.id) {
-      const shipResp = await fetch(`https://api.mercadolibre.com/shipments/${order.shipping.id}`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      const ship = await shipResp.json();
-      if (!ship.error) {
-        shipData = {
-          costo_envio:   (ship.shipping_option && ship.shipping_option.list_cost) || ship.base_cost || 0,
-          logistic_type: ship.logistic_type || '',
-          provincia:     ship.receiver && ship.receiver.state ? ship.receiver.state.name : ''
-        };
-      }
-    }
-
-    const item = (order.order_items && order.order_items[0]) || {};
-    const sku  = (item.item && (item.item.seller_sku || item.item.seller_custom_field)) || '';
-    const comision = order.order_items
-      ? order.order_items.reduce((a, i) => a + (i.sale_fee || 0), 0)
-      : 0;
-
-    await supabase.from('ventas').upsert({
-      nro_venta:     String(order.id),
-      user_id:       String(user_id),
-      fecha:         order.date_created,
-      sku:           sku ? String(sku).trim() : '',
-      titulo:        item.item ? item.item.title : '',
-      unidades:      item.quantity || 1,
-      precio:        order.total_amount,
-      comision:      comision,
-      costo_envio:   shipData.costo_envio || 0,
-      logistic_type: shipData.logistic_type || '',
-      provincia:     shipData.provincia || '',
-      estado:        order.status,
-      con_cuotas:    !!(order.payments && order.payments[0] && (order.payments[0].installments || 1) > 1),
-      pack_id:       order.pack_id ? String(order.pack_id) : null,
-      raw:           order   // JSONB: guardamos el objeto, NO un string
-    }, { onConflict: 'nro_venta' });
+    const row = await buildVentaRow(order, user_id, token, true);
+    await supabase.from('ventas').upsert(row, { onConflict: 'nro_venta' });
 
     console.log('Venta guardada (webhook):', order.id, order.status);
-    return res.sendStatus(200); // 200 DESPUÉS de procesar
+    return res.sendStatus(200);
   } catch (e) {
     console.error('Webhook error:', e.message);
-    // Devolvemos 200 igual: si mandamos error, ML reintenta y el upsert
-    // es idempotente (onConflict: nro_venta), así que no duplica.
     return res.sendStatus(200);
   }
 });
@@ -226,7 +257,63 @@ app.get('/api/ventas', async (req, res) => {
   }
 });
 
-// ── SINCRONIZAR: traer órdenes históricas ─────────────────────────
+// ── SYNC DIARIO: cron job, trae ventas de ayer completas ──────────
+app.get('/api/sync/diario', async (req, res) => {
+  const secret = req.headers['x-cron-secret'];
+  if (process.env.CRON_SECRET && secret !== process.env.CRON_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+
+  res.json({ message: 'Sync diario iniciado' });
+
+  try {
+    const { data: tokens } = await supabase.from('ml_tokens').select('*');
+    if (!tokens || tokens.length === 0) return;
+
+    for (const tokenRow of tokens) {
+      const userId = tokenRow.user_id;
+      const token  = await getValidToken(userId);
+      if (!token) continue;
+
+      // Ayer completo en hora Argentina (UTC-3)
+      const ayer = new Date();
+      ayer.setDate(ayer.getDate() - 1);
+      const desdeISO = ayer.toISOString().substring(0,10) + 'T00:00:00.000-03:00';
+      const hastaISO = ayer.toISOString().substring(0,10) + 'T23:59:59.000-03:00';
+
+      let offset = 0, total = 999, guardadas = 0;
+
+      while (offset < Math.min(total, 9950)) {
+        const url = `https://api.mercadolibre.com/orders/search?seller=${userId}`
+          + `&order.date_created.from=${encodeURIComponent(desdeISO)}`
+          + `&order.date_created.to=${encodeURIComponent(hastaISO)}`
+          + `&sort=date_asc&offset=${offset}&limit=50&access_token=${token}`;
+
+        const resp = await fetch(url);
+        const data = await resp.json();
+        if (data.error) { console.error('Sync diario error ML:', data.error); break; }
+
+        total = data.paging.total;
+
+        for (const order of data.results || []) {
+          const row = await buildVentaRow(order, userId, token, true);
+          await supabase.from('ventas').upsert(row, { onConflict: 'nro_venta' });
+          guardadas++;
+          await new Promise(r => setTimeout(r, 150)); // pausa entre ventas
+        }
+
+        offset += 50;
+        await new Promise(r => setTimeout(r, 400));
+      }
+
+      console.log(`Sync diario user ${userId}: ${guardadas} ventas procesadas`);
+    }
+  } catch (e) {
+    console.error('Sync diario error:', e.message);
+  }
+});
+
+// ── SYNC HISTÓRICO (manual, sin datos de envío por volumen) ───────
 app.post('/api/sync', async (req, res) => {
   const { user_id, dias } = req.body;
   res.json({ message: 'Sincronización iniciada', user_id, dias });
@@ -240,7 +327,6 @@ app.post('/api/sync', async (req, res) => {
     const desde = new Date();
     desde.setDate(desde.getDate() - (dias || 90));
 
-    let todasOrdenes = [];
     let chunkDesde = new Date(desde);
     const hoy = new Date();
 
@@ -254,12 +340,21 @@ app.post('/api/sync', async (req, res) => {
 
       let offset = 0, total = 999;
       while (offset < Math.min(total, 9950)) {
-        const url = `https://api.mercadolibre.com/orders/search?seller=${user_id}&order.date_created.from=${encodeURIComponent(desdeISO)}&order.date_created.to=${encodeURIComponent(hastaISO)}&sort=date_asc&offset=${offset}&limit=50&access_token=${token}`;
+        const url = `https://api.mercadolibre.com/orders/search?seller=${user_id}`
+          + `&order.date_created.from=${encodeURIComponent(desdeISO)}`
+          + `&order.date_created.to=${encodeURIComponent(hastaISO)}`
+          + `&sort=date_asc&offset=${offset}&limit=50&access_token=${token}`;
         const resp = await fetch(url);
         const data = await resp.json();
         if (data.error) break;
         total = data.paging.total;
-        todasOrdenes = todasOrdenes.concat(data.results || []);
+
+        for (const order of data.results || []) {
+          // Sync histórico: sin envío (demasiado volumen), solo datos básicos
+          const row = await buildVentaRow(order, user_id, token, false);
+          await supabase.from('ventas').upsert(row, { onConflict: 'nro_venta' });
+        }
+
         offset += 50;
         await new Promise(r => setTimeout(r, 200));
       }
@@ -267,24 +362,7 @@ app.post('/api/sync', async (req, res) => {
       chunkDesde.setDate(chunkDesde.getDate() + 8);
       await new Promise(r => setTimeout(r, 500));
     }
-
-    // Guardar todas en Supabase
-    for (const order of todasOrdenes) {
-      const item = order.order_items && order.order_items[0] ? order.order_items[0] : {};
-      const comision = order.order_items ? order.order_items.reduce((a, i) => a + (i.sale_fee||0), 0) : 0;
-      await supabase.from('ventas').upsert({
-        nro_venta: String(order.id), user_id: String(user_id),
-        fecha: order.date_created,
-        sku: item.item && item.item.seller_sku ? item.item.seller_sku.trim() : '',
-        titulo: item.item ? item.item.title : '',
-        unidades: item.quantity || 1, precio: order.total_amount,
-        comision, costo_envio: 0, logistic_type: '', provincia: '',
-        estado: order.status,
-        con_cuotas: order.payments && order.payments[0] && (order.payments[0].installments||1) > 1,
-        pack_id: order.pack_id ? String(order.pack_id) : null
-      }, { onConflict: 'nro_venta' });
-    }
-    console.log('Sync completo:', todasOrdenes.length, 'órdenes para user', user_id);
+    console.log('Sync histórico completo para user', user_id);
   } catch (e) {
     console.error('Sync error:', e.message);
   }
@@ -292,10 +370,10 @@ app.post('/api/sync', async (req, res) => {
 
 // ── STATUS ────────────────────────────────────────────────────────
 app.get('/api/status', (req, res) => {
-  res.json({ status: 'ok', version: '1.0.0', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.0.0', timestamp: new Date().toISOString() });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`MargenML backend corriendo en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`MargenML backend v3 corriendo en puerto ${PORT}`));
 
 module.exports = app;
