@@ -1,19 +1,12 @@
 {
   "version": 2,
-  "builds": [
-    {
-      "src": "api/index.js",
-      "use": "@vercel/node"
-    }
-  ],
   "routes": [
+    { "src": "/api/(.*)", "dest": "/api/index.js" }
+  ],
+  "crons": [
     {
-      "src": "/api/(.*)",
-      "dest": "api/index.js"
-    },
-    {
-      "src": "/",
-      "dest": "api/index.js"
+      "path": "/api/sync/diario",
+      "schedule": "0 5 * * *"
     }
   ]
 }
