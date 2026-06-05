@@ -238,20 +238,32 @@ app.post('/api/webhook/ml', async (req, res) => {
   }
 });
 
-// ── VENTAS: obtener ventas guardadas ──────────────────────────────
+// ── VENTAS: obtener ventas guardadas (paginado para superar límite de 1000) ─
 app.get('/api/ventas', async (req, res) => {
   try {
     const { user_id, desde, hasta } = req.query;
     if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
 
-    let query = supabase.from('ventas').select('*').eq('user_id', user_id);
-    if (desde) query = query.gte('fecha', desde);
-    if (hasta) query = query.lte('fecha', hasta);
-    query = query.order('fecha', { ascending: false }).limit(50000);
+    let todas = [];
+    let offset = 0;
+    const lote = 1000;
 
-    const { data, error } = await query;
-    if (error) return res.status(500).json({ error: error.message });
-    res.json({ ventas: data, total: data.length });
+    while (true) {
+      let query = supabase.from('ventas').select('*').eq('user_id', user_id);
+      if (desde) query = query.gte('fecha', desde);
+      if (hasta) query = query.lte('fecha', hasta);
+      query = query.order('fecha', { ascending: false }).range(offset, offset + lote - 1);
+
+      const { data, error } = await query;
+      if (error) return res.status(500).json({ error: error.message });
+
+      todas = todas.concat(data);
+      if (data.length < lote) break;   // último lote
+      offset += lote;
+      if (offset > 500000) break;       // tope de seguridad
+    }
+
+    res.json({ ventas: todas, total: todas.length });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -391,32 +403,50 @@ app.get('/api/costos/contabilium', async (req, res) => {
   try {
     const token = await getContabiliumToken();
 
-    // Traer productos paginados (Search devuelve lista)
     let productos = [];
     let page = 1;
-    const pageSize = 100;
+    const pageSize = 50;       // Contabilium pagina de a 50
+    let totalEsperado = null;
 
     while (true) {
       const url = `https://rest.contabilium.com/api/conceptos/search?pageSize=${pageSize}&pageIndex=${page}`;
-      const r = await fetch(url, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
+      const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
       const data = await r.json();
 
-      const items = data.items || data.Items || data.results || data || [];
+      // La respuesta puede venir como array directo o como objeto { Items:[...], Total:N }
+      let items;
+      if (Array.isArray(data)) {
+        items = data;
+      } else if (data && typeof data === 'object') {
+        items = data.Items || data.items || data.Resultado || data.resultado
+              || data.Lista || data.lista || data.results || data.data || [];
+        // capturar total si viene
+        if (totalEsperado === null) {
+          totalEsperado = data.Total || data.total || data.TotalRegistros || data.Count || data.count || null;
+        }
+      } else {
+        items = [];
+      }
+
+      if (page === 1) console.log('Contabilium primera página, claves:', Array.isArray(data) ? 'array' : Object.keys(data).join(','));
+
       if (!Array.isArray(items) || items.length === 0) break;
 
       productos = productos.concat(items);
+
+      // Cortar si ya trajimos todo lo esperado, o si la página vino incompleta
+      if (totalEsperado && productos.length >= totalEsperado) break;
       if (items.length < pageSize) break;
+
       page++;
-      await new Promise(r => setTimeout(r, 200));
+      if (page > 2000) break;   // tope de seguridad (~100k productos)
+      await new Promise(r => setTimeout(r, 150));
     }
 
-    // Mapear a formato simple
     const costos = productos
-      .filter(p => p.Codigo || p.codigo)
+      .filter(p => p && (p.Codigo || p.codigo))
       .map(p => ({
-        codigo:       (p.Codigo || p.codigo || '').toUpperCase().trim(),
+        codigo:       String(p.Codigo || p.codigo || '').toUpperCase().trim(),
         nombre:       p.Nombre || p.nombre || '',
         costoInterno: p.CostoInterno || p.costoInterno || 0,
         iva:          p.Iva || p.iva || 0,
@@ -425,7 +455,7 @@ app.get('/api/costos/contabilium', async (req, res) => {
       }))
       .filter(p => p.codigo);
 
-    console.log(`Contabilium: ${costos.length} productos traídos`);
+    console.log(`Contabilium: ${costos.length} productos traídos (esperado: ${totalEsperado})`);
     res.json({ costos, total: costos.length });
   } catch (e) {
     console.error('Contabilium error:', e.message);
@@ -457,7 +487,7 @@ app.get('/api/costos/contabilium/:sku', async (req, res) => {
 
 // ── STATUS ────────────────────────────────────────────────────────
 app.get('/api/status', (req, res) => {
-  res.json({ status: 'ok', version: '4.0.0', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '4.2.0', timestamp: new Date().toISOString() });
 });
 
 const PORT = process.env.PORT || 3000;
