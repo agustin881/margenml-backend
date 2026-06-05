@@ -368,9 +368,96 @@ app.post('/api/sync', async (req, res) => {
   }
 });
 
+// ── CONTABILIUM: obtener token ────────────────────────────────────
+async function getContabiliumToken() {
+  const resp = await fetch('https://rest.contabilium.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type:    'client_credentials',
+      client_id:     process.env.CONTABILIUM_CLIENT_ID,
+      client_secret: process.env.CONTABILIUM_CLIENT_SECRET
+    })
+  });
+  const data = await resp.json();
+  if (!data.access_token) throw new Error('Contabilium auth falló: ' + JSON.stringify(data));
+  return data.access_token;
+}
+
+// ── CONTABILIUM: traer todos los productos con costo ──────────────
+// GET /api/costos/contabilium
+// Devuelve array de { codigo, nombre, costoInterno, iva, precio }
+app.get('/api/costos/contabilium', async (req, res) => {
+  try {
+    const token = await getContabiliumToken();
+
+    // Traer productos paginados (Search devuelve lista)
+    let productos = [];
+    let page = 1;
+    const pageSize = 100;
+
+    while (true) {
+      const url = `https://rest.contabilium.com/api/conceptos/search?pageSize=${pageSize}&pageIndex=${page}`;
+      const r = await fetch(url, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      const data = await r.json();
+
+      const items = data.items || data.Items || data.results || data || [];
+      if (!Array.isArray(items) || items.length === 0) break;
+
+      productos = productos.concat(items);
+      if (items.length < pageSize) break;
+      page++;
+      await new Promise(r => setTimeout(r, 200));
+    }
+
+    // Mapear a formato simple
+    const costos = productos
+      .filter(p => p.Codigo || p.codigo)
+      .map(p => ({
+        codigo:       (p.Codigo || p.codigo || '').toUpperCase().trim(),
+        nombre:       p.Nombre || p.nombre || '',
+        costoInterno: p.CostoInterno || p.costoInterno || 0,
+        iva:          p.Iva || p.iva || 0,
+        precio:       p.Precio || p.precio || 0,
+        estado:       p.Estado || p.estado || ''
+      }))
+      .filter(p => p.codigo);
+
+    console.log(`Contabilium: ${costos.length} productos traídos`);
+    res.json({ costos, total: costos.length });
+  } catch (e) {
+    console.error('Contabilium error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── CONTABILIUM: buscar producto por SKU ──────────────────────────
+app.get('/api/costos/contabilium/:sku', async (req, res) => {
+  try {
+    const token = await getContabiliumToken();
+    const sku = encodeURIComponent(req.params.sku);
+    const r = await fetch(`https://rest.contabilium.com/api/conceptos/getByCodigo?codigo=${sku}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    const data = await r.json();
+    if (data.error || !data.Codigo) return res.status(404).json({ error: 'SKU no encontrado' });
+    res.json({
+      codigo:       data.Codigo,
+      nombre:       data.Nombre,
+      costoInterno: data.CostoInterno || 0,
+      iva:          data.Iva || 0,
+      precio:       data.Precio || 0
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── STATUS ────────────────────────────────────────────────────────
 app.get('/api/status', (req, res) => {
-  res.json({ status: 'ok', version: '3.0.0', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '4.0.0', timestamp: new Date().toISOString() });
 });
 
 const PORT = process.env.PORT || 3000;
