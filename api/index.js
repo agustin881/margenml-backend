@@ -406,40 +406,34 @@ app.get('/api/costos/contabilium', async (req, res) => {
     let productos = [];
     let page = 1;
     const pageSize = 50;       // Contabilium pagina de a 50
-    let totalEsperado = null;
+    let totalItems = null;
+    let totalPages = null;
 
     while (true) {
       const url = `https://rest.contabilium.com/api/conceptos/search?pageSize=${pageSize}&pageIndex=${page}`;
       const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
       const data = await r.json();
 
-      // La respuesta puede venir como array directo o como objeto { Items:[...], Total:N }
-      let items;
-      if (Array.isArray(data)) {
-        items = data;
-      } else if (data && typeof data === 'object') {
-        items = data.Items || data.items || data.Resultado || data.resultado
-              || data.Lista || data.lista || data.results || data.data || [];
-        // capturar total si viene
-        if (totalEsperado === null) {
-          totalEsperado = data.Total || data.total || data.TotalRegistros || data.Count || data.count || null;
-        }
-      } else {
-        items = [];
-      }
+      // Respuesta de Contabilium: { Items:[...], TotalPage:N, TotalItems:N }
+      const items = (data && (data.Items || data.items)) || [];
 
-      if (page === 1) console.log('Contabilium primera página, claves:', Array.isArray(data) ? 'array' : Object.keys(data).join(','));
+      if (page === 1) {
+        totalItems = data.TotalItems != null ? data.TotalItems : null;
+        totalPages = data.TotalPage  != null ? data.TotalPage  : null;
+        console.log(`Contabilium: TotalItems=${totalItems}, TotalPage=${totalPages}, primera página=${items.length}`);
+      }
 
       if (!Array.isArray(items) || items.length === 0) break;
 
       productos = productos.concat(items);
 
-      // Cortar si ya trajimos todo lo esperado, o si la página vino incompleta
-      if (totalEsperado && productos.length >= totalEsperado) break;
-      if (items.length < pageSize) break;
+      // Cortar según lo que informa Contabilium
+      if (totalItems != null && productos.length >= totalItems) break;
+      if (totalPages != null && page >= totalPages) break;
+      if (totalItems == null && totalPages == null && items.length < pageSize) break;
 
       page++;
-      if (page > 2000) break;   // tope de seguridad (~100k productos)
+      if (page > 2000) break;   // tope de seguridad
       await new Promise(r => setTimeout(r, 150));
     }
 
@@ -455,7 +449,7 @@ app.get('/api/costos/contabilium', async (req, res) => {
       }))
       .filter(p => p.codigo);
 
-    console.log(`Contabilium: ${costos.length} productos traídos (esperado: ${totalEsperado})`);
+    console.log(`Contabilium: ${costos.length} productos traídos (esperado: ${totalItems})`);
     res.json({ costos, total: costos.length });
   } catch (e) {
     console.error('Contabilium error:', e.message);
@@ -487,7 +481,7 @@ app.get('/api/costos/contabilium/:sku', async (req, res) => {
 
 // ── STATUS ────────────────────────────────────────────────────────
 app.get('/api/status', (req, res) => {
-  res.json({ status: 'ok', version: '4.2.0', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '4.3.0', timestamp: new Date().toISOString() });
 });
 
 const PORT = process.env.PORT || 3000;
