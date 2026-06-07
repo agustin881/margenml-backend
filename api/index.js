@@ -370,7 +370,6 @@ app.get('/api/sync/diario', async (req, res) => {
 // incluirEnvio = true trae tipo de envío (Flex/Full/Colecta/M1) — más lento.
 async function runSync(userId, dias, incluirEnvio) {
   let guardadas = 0;
-  let errores = 0;
   try {
     const desde = new Date();
     desde.setDate(desde.getDate() - (dias || 90));
@@ -378,15 +377,10 @@ async function runSync(userId, dias, incluirEnvio) {
     let chunkDesde = new Date(desde);
     const hoy = new Date();
 
-    console.log(`========================================`);
-    console.log(`[SYNC] ARRANCA user=${userId} dias=${dias} envio=${incluirEnvio}`);
-    console.log(`[SYNC] rango: ${desde.toISOString().substring(0,10)} -> ${hoy.toISOString().substring(0,10)}`);
-    console.log(`========================================`);
-
     while (chunkDesde < hoy) {
       // Token renovado por chunk (los syncs largos pueden superar la vida del token)
       const token = await getValidToken(userId);
-      if (!token) { console.error('[SYNC] CORTE: sin token para', userId); break; }
+      if (!token) { console.error('Sync: sin token para', userId); break; }
 
       const chunkHasta = new Date(chunkDesde);
       chunkHasta.setDate(chunkDesde.getDate() + 7);
@@ -394,8 +388,6 @@ async function runSync(userId, dias, incluirEnvio) {
 
       const desdeISO = chunkDesde.toISOString().substring(0,10)+'T00:00:00.000-03:00';
       const hastaISO = chunkHasta.toISOString().substring(0,10)+'T23:59:59.000-03:00';
-
-      console.log(`[SYNC] CHUNK ${desdeISO.substring(0,10)} -> ${hastaISO.substring(0,10)} | guardadas hasta ahora=${guardadas}`);
 
       let offset = 0, total = 999;
       while (offset < Math.min(total, 9950)) {
@@ -405,21 +397,13 @@ async function runSync(userId, dias, incluirEnvio) {
           + `&sort=date_asc&offset=${offset}&limit=50&access_token=${token}`;
         const resp = await fetch(url);
         const data = await resp.json();
-        if (data.error) { console.error('[SYNC] ERROR ML orders/search:', JSON.stringify(data)); break; }
+        if (data.error) { console.error('Sync error ML:', data.error); break; }
         total = (data.paging && data.paging.total) || 0;
-        const cantidad = (data.results || []).length;
-        console.log(`[SYNC]   pagina offset=${offset} total_ML=${total} trajo=${cantidad}`);
 
         for (const order of data.results || []) {
-          try {
-            const row = await buildVentaRow(order, userId, token, incluirEnvio);
-            const { error: upErr } = await supabase.from('ventas').upsert(row, { onConflict: 'nro_venta' });
-            if (upErr) { errores++; console.error('[SYNC] ERROR upsert venta', order.id, ':', upErr.message); }
-            else guardadas++;
-          } catch (orderErr) {
-            errores++;
-            console.error('[SYNC] ERROR procesando venta', order && order.id, ':', orderErr.message);
-          }
+          const row = await buildVentaRow(order, userId, token, incluirEnvio);
+          await supabase.from('ventas').upsert(row, { onConflict: 'nro_venta' });
+          guardadas++;
           if (incluirEnvio) await new Promise(r => setTimeout(r, 120));
         }
 
@@ -430,11 +414,9 @@ async function runSync(userId, dias, incluirEnvio) {
       chunkDesde.setDate(chunkDesde.getDate() + 8);
       await new Promise(r => setTimeout(r, 500));
     }
-    console.log(`========================================`);
-    console.log(`[SYNC] COMPLETO user ${userId}: ${guardadas} guardadas, ${errores} errores (dias=${dias}, envio=${incluirEnvio})`);
-    console.log(`========================================`);
+    console.log(`Sync completo user ${userId}: ${guardadas} ventas procesadas (dias=${dias}, envio=${incluirEnvio})`);
   } catch (e) {
-    console.error('[SYNC] ERROR FATAL:', e.message, '|', e.stack);
+    console.error('Sync error:', e.message);
   }
   return guardadas;
 }
@@ -488,9 +470,12 @@ app.get('/api/costos/contabilium', async (req, res) => {
     const pageSize = 50;       // Contabilium pagina de a 50
     let totalItems = null;
     let totalPages = null;
+    let primerCodigoPaginaAnterior = null;
 
     while (true) {
-      const url = `https://rest.contabilium.com/api/conceptos/search?pageSize=${pageSize}&pageIndex=${page}`;
+      // Mandamos varios nombres de parametro de pagina a la vez: Contabilium toma
+      // el que entienda e ignora los demas. Asi paginamos de verdad y no repetimos la pagina 1.
+      const url = `https://rest.contabilium.com/api/conceptos/search?pageSize=${pageSize}&pageIndex=${page}&pageNumber=${page}&page=${page}`;
       const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
       const data = await r.json();
 
@@ -505,6 +490,15 @@ app.get('/api/costos/contabilium', async (req, res) => {
 
       if (!Array.isArray(items) || items.length === 0) break;
 
+      // Diagnostico + corte si Contabilium devuelve la misma pagina otra vez
+      const primerCodigoPagina = (items[0] && (items[0].Codigo || items[0].codigo)) || null;
+      console.log(`Contabilium pagina ${page}: ${items.length} items, primer codigo=${primerCodigoPagina}`);
+      if (page > 1 && primerCodigoPagina && primerCodigoPagina === primerCodigoPaginaAnterior) {
+        console.log(`Contabilium: la pagina ${page} repite la anterior -> el parametro de paginacion no se respeta. Corto aca.`);
+        break;
+      }
+      primerCodigoPaginaAnterior = primerCodigoPagina;
+
       productos = productos.concat(items);
 
       // Cortar según lo que informa Contabilium
@@ -514,7 +508,7 @@ app.get('/api/costos/contabilium', async (req, res) => {
 
       page++;
       if (page > 2000) break;   // tope de seguridad
-      await new Promise(r => setTimeout(r, 150));
+      await new Promise(r => setTimeout(r, 500));  // Contabilium: max 25 pedidos / 10s
     }
 
     const costos = productos
