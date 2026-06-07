@@ -470,9 +470,12 @@ app.get('/api/costos/contabilium', async (req, res) => {
     const pageSize = 50;       // Contabilium pagina de a 50
     let totalItems = null;
     let totalPages = null;
+    let primerCodigoPaginaAnterior = null;
 
     while (true) {
-      const url = `https://rest.contabilium.com/api/conceptos/search?pageSize=${pageSize}&pageIndex=${page}`;
+      // Mandamos varios nombres de parametro de pagina a la vez: Contabilium toma
+      // el que entienda e ignora los demas. Asi paginamos de verdad y no repetimos la pagina 1.
+      const url = `https://rest.contabilium.com/api/conceptos/search?pageSize=${pageSize}&pageIndex=${page}&pageNumber=${page}&page=${page}`;
       const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
       const data = await r.json();
 
@@ -487,6 +490,15 @@ app.get('/api/costos/contabilium', async (req, res) => {
 
       if (!Array.isArray(items) || items.length === 0) break;
 
+      // Diagnostico + corte si Contabilium devuelve la misma pagina otra vez
+      const primerCodigoPagina = (items[0] && (items[0].Codigo || items[0].codigo)) || null;
+      console.log(`Contabilium pagina ${page}: ${items.length} items, primer codigo=${primerCodigoPagina}`);
+      if (page > 1 && primerCodigoPagina && primerCodigoPagina === primerCodigoPaginaAnterior) {
+        console.log(`Contabilium: la pagina ${page} repite la anterior -> el parametro de paginacion no se respeta. Corto aca.`);
+        break;
+      }
+      primerCodigoPaginaAnterior = primerCodigoPagina;
+
       productos = productos.concat(items);
 
       // Cortar según lo que informa Contabilium
@@ -496,7 +508,7 @@ app.get('/api/costos/contabilium', async (req, res) => {
 
       page++;
       if (page > 2000) break;   // tope de seguridad
-      await new Promise(r => setTimeout(r, 150));
+      await new Promise(r => setTimeout(r, 500));  // Contabilium: max 25 pedidos / 10s
     }
 
     const costos = productos
