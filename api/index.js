@@ -210,27 +210,67 @@ async function buildVentaRow(order, userId, token, incluirEnvio = true) {
   };
 }
 
+// ── Helper: encontrar la orden asociada a un envío (Flex/shipments) ─
+async function getOrderIdFromShipment(shipmentId, token) {
+  if (!shipmentId) return null;
+  try {
+    // 1) El detalle del envío a veces ya trae order_id
+    const r = await fetch(`https://api.mercadolibre.com/shipments/${shipmentId}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    const ship = await r.json();
+    if (ship && ship.order_id) return String(ship.order_id);
+
+    // 2) Si no, /shipments/{id}/items devuelve el order_id de cada ítem
+    const ri = await fetch(`https://api.mercadolibre.com/shipments/${shipmentId}/items`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    const items = await ri.json();
+    if (Array.isArray(items) && items[0] && items[0].order_id) {
+      return String(items[0].order_id);
+    }
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
 // ── WEBHOOK ───────────────────────────────────────────────────────
 app.post('/api/webhook/ml', async (req, res) => {
   try {
-    const { resource, user_id } = req.body || {};
-    const esOrden = typeof resource === 'string' && resource.startsWith('/orders/');
-    if (!esOrden) return res.sendStatus(200);
+    const { topic, resource, user_id } = req.body || {};
+    if (typeof resource !== 'string') return res.sendStatus(200);
 
     const token = await getValidToken(user_id);
     if (!token) return res.sendStatus(200);
 
-    const orderId = resource.split('/').pop();
+    let orderId = null;
+
+    if (resource.startsWith('/orders/')) {
+      // Ventas normales (Full / Colecta / M1) y cambios de estado (cancela/devuelve)
+      orderId = resource.split('/').pop();
+    } else if (resource.startsWith('/shipments/')) {
+      // Envíos (incluye Flex): hay que sacar la orden asociada al envío
+      const shipmentId = resource.split('/').pop();
+      orderId = await getOrderIdFromShipment(shipmentId, token);
+    } else {
+      // Cualquier otro tópico que no nos interesa
+      return res.sendStatus(200);
+    }
+
+    if (!orderId) return res.sendStatus(200);
+
     const orderResp = await fetch(`https://api.mercadolibre.com/orders/${orderId}`, {
       headers: { Authorization: `Bearer ${token}` }
     });
     const order = await orderResp.json();
     if (order.error || !order.id) return res.sendStatus(200);
 
+    // upsert: si la orden ya existía, se actualiza su estado (cancelada / devuelta / etc.)
     const row = await buildVentaRow(order, user_id, token, true);
     await supabase.from('ventas').upsert(row, { onConflict: 'nro_venta' });
 
-    console.log('Venta guardada (webhook):', order.id, order.status);
+    console.log('Venta guardada (webhook):', order.id, order.status, '/', topic || resource.split('/')[1]);
     return res.sendStatus(200);
   } catch (e) {
     console.error('Webhook error:', e.message);
@@ -325,17 +365,12 @@ app.get('/api/sync/diario', async (req, res) => {
   }
 });
 
-// ── SYNC HISTÓRICO (manual, sin datos de envío por volumen) ───────
-app.post('/api/sync', async (req, res) => {
-  const { user_id, dias } = req.body;
-  res.json({ message: 'Sincronización iniciada', user_id, dias });
-
+// ── SYNC (manual) ─────────────────────────────────────────────────
+// Recorre las ventas desde hoy hacia atrás `dias` días y las guarda.
+// incluirEnvio = true trae tipo de envío (Flex/Full/Colecta/M1) — más lento.
+async function runSync(userId, dias, incluirEnvio) {
+  let guardadas = 0;
   try {
-    const { data: tokenRow } = await supabase
-      .from('ml_tokens').select('*').eq('user_id', String(user_id)).single();
-    if (!tokenRow) return;
-
-    const token = tokenRow.access_token;
     const desde = new Date();
     desde.setDate(desde.getDate() - (dias || 90));
 
@@ -343,6 +378,10 @@ app.post('/api/sync', async (req, res) => {
     const hoy = new Date();
 
     while (chunkDesde < hoy) {
+      // Token renovado por chunk (los syncs largos pueden superar la vida del token)
+      const token = await getValidToken(userId);
+      if (!token) { console.error('Sync: sin token para', userId); break; }
+
       const chunkHasta = new Date(chunkDesde);
       chunkHasta.setDate(chunkDesde.getDate() + 7);
       if (chunkHasta > hoy) chunkHasta.setTime(hoy.getTime());
@@ -352,32 +391,55 @@ app.post('/api/sync', async (req, res) => {
 
       let offset = 0, total = 999;
       while (offset < Math.min(total, 9950)) {
-        const url = `https://api.mercadolibre.com/orders/search?seller=${user_id}`
+        const url = `https://api.mercadolibre.com/orders/search?seller=${userId}`
           + `&order.date_created.from=${encodeURIComponent(desdeISO)}`
           + `&order.date_created.to=${encodeURIComponent(hastaISO)}`
           + `&sort=date_asc&offset=${offset}&limit=50&access_token=${token}`;
         const resp = await fetch(url);
         const data = await resp.json();
-        if (data.error) break;
-        total = data.paging.total;
+        if (data.error) { console.error('Sync error ML:', data.error); break; }
+        total = (data.paging && data.paging.total) || 0;
 
         for (const order of data.results || []) {
-          // Sync histórico: sin envío (demasiado volumen), solo datos básicos
-          const row = await buildVentaRow(order, user_id, token, false);
+          const row = await buildVentaRow(order, userId, token, incluirEnvio);
           await supabase.from('ventas').upsert(row, { onConflict: 'nro_venta' });
+          guardadas++;
+          if (incluirEnvio) await new Promise(r => setTimeout(r, 120));
         }
 
         offset += 50;
-        await new Promise(r => setTimeout(r, 200));
+        await new Promise(r => setTimeout(r, incluirEnvio ? 300 : 200));
       }
 
       chunkDesde.setDate(chunkDesde.getDate() + 8);
       await new Promise(r => setTimeout(r, 500));
     }
-    console.log('Sync histórico completo para user', user_id);
+    console.log(`Sync completo user ${userId}: ${guardadas} ventas procesadas (dias=${dias}, envio=${incluirEnvio})`);
   } catch (e) {
     console.error('Sync error:', e.message);
   }
+  return guardadas;
+}
+
+// POST /api/sync  { user_id, dias, envio }
+app.post('/api/sync', (req, res) => {
+  const { user_id, dias, envio } = req.body || {};
+  const incluirEnvio = envio !== false && envio !== 'no';
+  res.json({ message: 'Sincronización iniciada', user_id, dias, envio: incluirEnvio });
+  runSync(String(user_id), Number(dias) || 90, incluirEnvio);
+});
+
+// GET /api/sync?user_id=...&dias=...&envio=si|no  (para disparar desde el navegador)
+app.get('/api/sync', (req, res) => {
+  const user_id = req.query.user_id;
+  const dias    = Number(req.query.dias) || 7;
+  const incluirEnvio = req.query.envio !== 'no';
+  if (!user_id) return res.status(400).json({ error: 'Falta user_id. Ej: /api/sync?user_id=67619515&dias=7' });
+  res.json({
+    message: 'Sincronización iniciada. Corre en segundo plano; mirá los logs de Railway para ver el avance.',
+    user_id, dias, envio: incluirEnvio
+  });
+  runSync(String(user_id), dias, incluirEnvio);
 });
 
 // ── CONTABILIUM: obtener token ────────────────────────────────────
@@ -481,7 +543,7 @@ app.get('/api/costos/contabilium/:sku', async (req, res) => {
 
 // ── STATUS ────────────────────────────────────────────────────────
 app.get('/api/status', (req, res) => {
-  res.json({ status: 'ok', version: '4.3.0', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '4.4.0', timestamp: new Date().toISOString() });
 });
 
 const PORT = process.env.PORT || 3000;
