@@ -492,6 +492,7 @@ app.get('/api/costos/contabilium', async (req, res) => {
     const token = await getContabiliumToken();
 
     let productos = [];
+    const _seenCod = new Map();   // codigo -> producto (deduplica páginas repetidas)
     let page = 1;
     const pageSize = 50;       // Contabilium pagina de a 50
     let totalItems = null;
@@ -513,17 +514,22 @@ app.get('/api/costos/contabilium', async (req, res) => {
 
       if (!Array.isArray(items) || items.length === 0) break;
 
-      productos = productos.concat(items);
+      let nuevos = 0;
+      for (const it of items) {
+        const cod = String((it && (it.Codigo || it.codigo)) || '').toUpperCase().trim();
+        if (cod && !_seenCod.has(cod)) { _seenCod.set(cod, it); nuevos++; }
+      }
 
-      // Cortar según lo que informa Contabilium
-      if (totalItems != null && productos.length >= totalItems) break;
-      if (totalPages != null && page >= totalPages) break;
-      if (totalItems == null && totalPages == null && items.length < pageSize) break;
+      // Cortar: página repetida (no trajo nada nuevo) o última página
+      if (nuevos === 0) break;
+      if (items.length < pageSize) break;
 
       page++;
       if (page > 2000) break;   // tope de seguridad
       await new Promise(r => setTimeout(r, 150));
     }
+
+    productos = [..._seenCod.values()];
 
     const costos = productos
       .filter(p => p && (p.Codigo || p.codigo))
@@ -537,7 +543,7 @@ app.get('/api/costos/contabilium', async (req, res) => {
       }))
       .filter(p => p.codigo);
 
-    console.log(`Contabilium: ${costos.length} productos traídos (esperado: ${totalItems})`);
+    console.log(`Contabilium: ${costos.length} productos únicos (deduplicados, esperado ~${totalItems})`);
     res.json({ costos, total: costos.length });
   } catch (e) {
     console.error('Contabilium error:', e.message);
@@ -573,6 +579,78 @@ app.get('/api/status', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+// ── MEDIDAS: planilla de pesos/medidas publicada en Google Sheets ────
+const MEDIDAS_CSV_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vTpXeWJBa0W6P4uZuEl8VrR2HN75pHr5oDXlD3BraTnSsVpjDh950v6O6k3y_q-lIA2S-feSRlh6tdu/pub?gid=1181343863&single=true&output=csv';
+let _medidasCache = null, _medidasTs = 0;
+
+function _parseCSV(text){
+  const rows=[]; let row=[]; let field=''; let inQ=false;
+  for(let i=0;i<text.length;i++){
+    const c=text[i];
+    if(inQ){
+      if(c==='"'){ if(text[i+1]==='"'){ field+='"'; i++; } else inQ=false; }
+      else field+=c;
+    } else {
+      if(c==='"') inQ=true;
+      else if(c===','){ row.push(field); field=''; }
+      else if(c==='\n'){ row.push(field); rows.push(row); row=[]; field=''; }
+      else if(c==='\r'){ /* ignorar */ }
+      else field+=c;
+    }
+  }
+  if(field!==''||row.length){ row.push(field); rows.push(row); }
+  return rows;
+}
+function _numAR(s){
+  if(s==null) return 0;
+  s=String(s).replace(/[$\s\u00a0]/g,'');
+  if(!s) return 0;
+  if(s.indexOf('.')>-1 && s.indexOf(',')>-1) s=s.replace(/\./g,'').replace(',','.');
+  else if(s.indexOf(',')>-1) s=s.replace(',','.');
+  const n=parseFloat(s);
+  return isNaN(n)?0:n;
+}
+function _normH(c){ return (c||'').replace(/\s+/g,' ').trim().toLowerCase(); }
+function buildMedidas(text){
+  const rows=_parseCSV(text);
+  let hi=-1;
+  for(let i=0;i<rows.length;i++){ if(rows[i].some(c=>_normH(c)==='sku producto')){ hi=i; break; } }
+  if(hi<0) return {};
+  const hdr=rows[hi].map(_normH);
+  const cSku=hdr.indexOf('sku producto');
+  const cLargo=hdr.indexOf('largo'), cAncho=hdr.indexOf('ancho'), cAlto=hdr.indexOf('alto');
+  const cPeso=hdr.indexOf('peso'), cKg=hdr.indexOf('kg de envio'), cEnvioML=hdr.indexOf('envio mercado libre');
+  const map={};
+  for(let i=hi+1;i<rows.length;i++){
+    const r=rows[i]; const sku=(r[cSku]||'').trim();
+    if(!sku) continue;
+    map[sku.toUpperCase()]={
+      sku, largo:_numAR(r[cLargo]), ancho:_numAR(r[cAncho]), alto:_numAR(r[cAlto]),
+      peso:_numAR(r[cPeso]), kgEnvio:_numAR(r[cKg]), envioML:_numAR(r[cEnvioML])
+    };
+  }
+  return map;
+}
+
+// GET /api/medidas -> mapa SKU -> medidas (cacheado 5 min). Lee la planilla publicada.
+app.get('/api/medidas', async (req, res) => {
+  try {
+    const ahora = Date.now();
+    if (_medidasCache && (ahora - _medidasTs) < 5*60*1000) {
+      return res.json({ medidas: _medidasCache, skus: Object.keys(_medidasCache).length, cache: true });
+    }
+    const r = await fetch(MEDIDAS_CSV_URL);
+    const text = await r.text();
+    const map = buildMedidas(text);
+    if (Object.keys(map).length > 0) { _medidasCache = map; _medidasTs = ahora; }
+    console.log('[MEDIDAS] cargadas', Object.keys(map).length, 'SKUs desde Google Sheets');
+    res.json({ medidas: map, skus: Object.keys(map).length, cache: false });
+  } catch (e) {
+    console.error('[MEDIDAS] error:', e.message);
+    res.status(500).json({ error: e.message, medidas: {} });
+  }
+});
+
 app.listen(PORT, () => console.log(`MargenML backend v3 corriendo en puerto ${PORT}`));
 
 module.exports = app;
