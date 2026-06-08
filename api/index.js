@@ -490,61 +490,76 @@ async function getContabiliumToken() {
 app.get('/api/costos/contabilium', async (req, res) => {
   try {
     const token = await getContabiliumToken();
+    const pageSize = 50;
+    const base = 'https://rest.contabilium.com/api/conceptos/search';
+    const PAUSA = 500; // Contabilium limita a 25 pedidos/10s -> ~2/seg es seguro
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-    let productos = [];
-    const _seenCod = new Map();   // codigo -> producto (deduplica páginas repetidas)
-    let page = 1;
-    const pageSize = 50;       // Contabilium pagina de a 50
-    let totalItems = null;
-    let totalPages = null;
-
-    while (true) {
-      const url = `https://rest.contabilium.com/api/conceptos/search?pageSize=${pageSize}&pageIndex=${page}`;
+    const getPage = async (pageParam, n) => {
+      const url = `${base}?pageSize=${pageSize}&${pageParam}=${n}`;
       const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-      const data = await r.json();
-
-      // Respuesta de Contabilium: { Items:[...], TotalPage:N, TotalItems:N }
-      const items = (data && (data.Items || data.items)) || [];
-
-      if (page === 1) {
-        totalItems = data.TotalItems != null ? data.TotalItems : null;
-        totalPages = data.TotalPage  != null ? data.TotalPage  : null;
-        console.log(`Contabilium: TotalItems=${totalItems}, TotalPage=${totalPages}, primera página=${items.length}`);
+      return r.json();
+    };
+    const primerCod = (d) => {
+      const it = (d && (d.Items || d.items)) || [];
+      return it.length ? String(it[0].Codigo || it[0].codigo || '').toUpperCase().trim() : '';
+    };
+    const _seen = new Map();
+    const addItems = (d) => {
+      const it = (d && (d.Items || d.items)) || [];
+      let n = 0;
+      for (const x of it) {
+        const c = String(x.Codigo || x.codigo || '').toUpperCase().trim();
+        if (c && !_seen.has(c)) { _seen.set(c, x); n++; }
       }
+      return { nuevos: n, len: it.length };
+    };
 
-      if (!Array.isArray(items) || items.length === 0) break;
+    // Página 1 (cualquier nombre da la primera página si el parámetro se ignora)
+    const d1 = await getPage('pageNumber', 1);
+    const cod1 = primerCod(d1);
+    const totalItems = (d1 && d1.TotalItems != null) ? d1.TotalItems : null;
+    console.log(`[CONTA] pagina 1: primerCod=${cod1} TotalItems=${totalItems}`);
+    addItems(d1);
 
-      let nuevos = 0;
-      for (const it of items) {
-        const cod = String((it && (it.Codigo || it.codigo)) || '').toUpperCase().trim();
-        if (cod && !_seenCod.has(cod)) { _seenCod.set(cod, it); nuevos++; }
-      }
-
-      // Cortar: página repetida (no trajo nada nuevo) o última página
-      if (nuevos === 0) break;
-      if (items.length < pageSize) break;
-
-      page++;
-      if (page > 2000) break;   // tope de seguridad
-      await new Promise(r => setTimeout(r, 150));
+    // Detectar cuál parámetro pagina DE VERDAD (que la página 2 traiga otros códigos)
+    const candidatos = ['pageNumber', 'page', 'nroPagina', 'pagina', 'nroPag', 'pageIndex'];
+    let pageParam = null;
+    for (const cand of candidatos) {
+      await sleep(PAUSA);
+      const d2 = await getPage(cand, 2);
+      const cod2 = primerCod(d2);
+      console.log(`[CONTA] probando "${cand}=2" -> primerCod=${cod2}`);
+      if (cod2 && cod2 !== cod1) { pageParam = cand; addItems(d2); break; }
     }
 
-    productos = [..._seenCod.values()];
+    if (pageParam) {
+      console.log(`[CONTA] paginación OK con parámetro "${pageParam}"`);
+      let page = 3; // ya tenemos página 1 y 2
+      while (true) {
+        await sleep(PAUSA);
+        const d = await getPage(pageParam, page);
+        const { nuevos, len } = addItems(d);
+        console.log(`[CONTA] pagina ${page} (${pageParam}) nuevos=${nuevos} | unicos=${_seen.size}`);
+        if (len === 0 || nuevos === 0 || len < pageSize) break;
+        page++;
+        if (page > 500) break;
+      }
+    } else {
+      console.error('[CONTA] NINGUN parametro de paginacion cambio la pagina -> solo ' + _seen.size + ' productos. Revisar el nombre del parametro en la doc de Contabilium.');
+    }
 
-    const costos = productos
-      .filter(p => p && (p.Codigo || p.codigo))
-      .map(p => ({
-        codigo:       String(p.Codigo || p.codigo || '').toUpperCase().trim(),
-        nombre:       p.Nombre || p.nombre || '',
-        costoInterno: p.CostoInterno || p.costoInterno || 0,
-        iva:          p.Iva || p.iva || 0,
-        precio:       p.Precio || p.precio || 0,
-        estado:       p.Estado || p.estado || ''
-      }))
-      .filter(p => p.codigo);
+    const costos = [..._seen.values()].map(p => ({
+      codigo:       String(p.Codigo || p.codigo || '').toUpperCase().trim(),
+      nombre:       p.Nombre || p.nombre || '',
+      costoInterno: p.CostoInterno || p.costoInterno || 0,
+      iva:          p.Iva || p.iva || 0,
+      precio:       p.Precio || p.precio || 0,
+      estado:       p.Estado || p.estado || ''
+    })).filter(p => p.codigo);
 
-    console.log(`Contabilium: ${costos.length} productos únicos (deduplicados, esperado ~${totalItems})`);
-    res.json({ costos, total: costos.length });
+    console.log(`[CONTA] TOTAL: ${costos.length} productos unicos (parametro=${pageParam || 'NINGUNO'}, esperado ~${totalItems})`);
+    res.json({ costos, total: costos.length, pageParam: pageParam || null });
   } catch (e) {
     console.error('Contabilium error:', e.message);
     res.status(500).json({ error: e.message });
