@@ -131,9 +131,37 @@ async function getShipData(shipmentId, token) {
     });
     const ship = await r.json();
     if (ship.error) return {};
+
+    // Costo "bruto" del envío = tarifa total de ML (con IVA)
+    let costoEnvio   = (ship.shipping_option && ship.shipping_option.list_cost) || ship.base_cost || 0;
+    // Aporte del comprador (fallback: campo del shipment; suele venir 0 en envíos subsidiados)
+    let pagoComprador = (ship.shipping_option && ship.shipping_option.cost) || 0;
+
+    // Desglose real de costos: acá está lo que paga el comprador y lo que banca el vendedor.
+    try {
+      const rc = await fetch(`https://api.mercadolibre.com/shipments/${shipmentId}/costs`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      const costs = await rc.json();
+      if (costs && !costs.error) {
+        const gross    = Number(costs.gross_amount) || 0;
+        const recvCost = (costs.receiver && Number(costs.receiver.cost)) || 0;
+        const sender   = (Array.isArray(costs.senders) && costs.senders[0]) || {};
+        const sendCost = Number(sender.cost) || 0;
+
+        // Solo piso el aporte del comprador si el desglose lo informa (>0).
+        if (recvCost > 0) pagoComprador = recvCost;
+        // Si el shipment no traía list_cost pero el desglose sí trae el bruto, lo uso.
+        if (!costoEnvio && gross > 0) costoEnvio = gross;
+
+        // Log de verificación: bruto - aporteComprador debería dar el neto del vendedor (senders.cost)
+        console.log(`[ENVIO] ship=${shipmentId} bruto=${costoEnvio} pagoComprador=${pagoComprador} netoCalc=${costoEnvio - pagoComprador} netoVendedor(senders.cost)=${sendCost} | keys=${Object.keys(costs).join(',')}`);
+      }
+    } catch(e) { /* si /costs falla, quedan los valores del shipment */ }
+
     return {
-      costo_envio:           (ship.shipping_option && ship.shipping_option.list_cost) || ship.base_cost || 0,
-      precio_comprador_envio:(ship.shipping_option && ship.shipping_option.cost) || 0,
+      costo_envio:            costoEnvio,
+      precio_comprador_envio: pagoComprador,
       logistic_type:          ship.logistic_type || '',
       provincia:             (ship.receiver && ship.receiver.state  && ship.receiver.state.name)  || '',
       ciudad:                (ship.receiver && ship.receiver.city   && ship.receiver.city.name)   || '',
