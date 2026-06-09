@@ -159,12 +159,15 @@ async function getShipData(shipmentId, token) {
       }
     } catch(e) { /* si /costs falla, quedan los valores del shipment */ }
 
+    // ML devuelve la dirección del comprador bajo receiver_address (no receiver)
+    const rcv = ship.receiver_address || ship.receiver || {};
+    console.log(`[PROV] ship=${shipmentId} provincia=${(rcv.state && rcv.state.name) || '(vacío)'} ciudad=${(rcv.city && rcv.city.name) || '(vacío)'} | shipKeys=${Object.keys(ship).join(',')}`);
     return {
       costo_envio:            costoEnvio,
       precio_comprador_envio: pagoComprador,
       logistic_type:          ship.logistic_type || '',
-      provincia:             (ship.receiver && ship.receiver.state  && ship.receiver.state.name)  || '',
-      ciudad:                (ship.receiver && ship.receiver.city   && ship.receiver.city.name)   || '',
+      provincia:             (rcv.state && rcv.state.name) || '',
+      ciudad:                (rcv.city  && rcv.city.name)  || '',
     };
   } catch(e) {
     return {};
