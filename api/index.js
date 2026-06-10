@@ -12,6 +12,21 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
+// ── Middleware: exige usuario logueado (token de Supabase) ────────
+async function requireAuth(req, res, next) {
+  try {
+    const h = req.headers.authorization || '';
+    const token = h.startsWith('Bearer ') ? h.slice(7) : '';
+    if (!token) return res.status(401).json({ error: 'No autorizado' });
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error || !data || !data.user) return res.status(401).json({ error: 'Sesion invalida' });
+    req.authUser = data.user;
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+}
+
 const ML_CLIENT_ID     = process.env.ML_CLIENT_ID;
 const ML_CLIENT_SECRET = process.env.ML_CLIENT_SECRET;
 const ML_REDIRECT_URI  = process.env.ML_REDIRECT_URI || 'https://margenml-frontend.vercel.app/';
@@ -311,7 +326,7 @@ app.post('/api/webhook/ml', async (req, res) => {
 });
 
 // ── VENTAS: obtener ventas guardadas (paginado para superar límite de 1000) ─
-app.get('/api/ventas', async (req, res) => {
+app.get('/api/ventas', requireAuth, async (req, res) => {
   try {
     const { user_id, desde, hasta } = req.query;
     if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
@@ -519,7 +534,7 @@ async function getContabiliumToken() {
 // ── CONTABILIUM: traer todos los productos con costo ──────────────
 // GET /api/costos/contabilium
 // Devuelve array de { codigo, nombre, costoInterno, iva, precio }
-app.get('/api/costos/contabilium', async (req, res) => {
+app.get('/api/costos/contabilium', requireAuth, async (req, res) => {
   try {
     const token = await getContabiliumToken();
     const pageSize = 50;
@@ -599,7 +614,7 @@ app.get('/api/costos/contabilium', async (req, res) => {
 });
 
 // ── CONTABILIUM: buscar producto por SKU ──────────────────────────
-app.get('/api/costos/contabilium/:sku', async (req, res) => {
+app.get('/api/costos/contabilium/:sku', requireAuth, async (req, res) => {
   try {
     const token = await getContabiliumToken();
     const sku = encodeURIComponent(req.params.sku);
@@ -680,7 +695,7 @@ function buildMedidas(text){
 }
 
 // GET /api/medidas -> mapa SKU -> medidas (cacheado 5 min). Lee la planilla publicada.
-app.get('/api/medidas', async (req, res) => {
+app.get('/api/medidas', requireAuth, async (req, res) => {
   try {
     const ahora = Date.now();
     if (_medidasCache && (ahora - _medidasTs) < 5*60*1000) {
