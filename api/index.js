@@ -283,6 +283,23 @@ async function getOrderIdFromShipment(shipmentId, token) {
 }
 
 // ── WEBHOOK ───────────────────────────────────────────────────────
+// ── Helper: costo interno de Contabilium para un SKU ──────────────
+async function getCostoInterno(sku) {
+  try {
+    if (!sku) return null;
+    const token = await getContabiliumToken();
+    if (!token) return null;
+    const r = await fetch(`https://rest.contabilium.com/api/conceptos/getByCodigo?codigo=${encodeURIComponent(sku)}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    const data = await r.json();
+    if (data && data.CostoInterno != null) return data.CostoInterno;
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
 app.post('/api/webhook/ml', async (req, res) => {
   try {
     const { topic, resource, user_id } = req.body || {};
@@ -317,6 +334,17 @@ app.post('/api/webhook/ml', async (req, res) => {
     const row = await buildVentaRow(order, user_id, token, true);
     await supabase.from('ventas').upsert(row, { onConflict: 'nro_venta' });
 
+    // Congelar el costo de Contabilium al momento de la venta (solo si aun no lo tiene)
+    if (row.sku) {
+      const cInterno = await getCostoInterno(row.sku);
+      if (cInterno != null) {
+        await supabase.from('ventas')
+          .update({ costo_congelado: cInterno })
+          .eq('nro_venta', row.nro_venta)
+          .is('costo_congelado', null);
+      }
+    }
+
     console.log('Venta guardada (webhook):', order.id, order.status, '/', topic || resource.split('/')[1]);
     return res.sendStatus(200);
   } catch (e) {
@@ -336,7 +364,7 @@ app.get('/api/ventas', requireAuth, async (req, res) => {
     const lote = 1000;
 
     while (true) {
-      let query = supabase.from('ventas').select('nro_venta,user_id,fecha,fecha_cierre,sku,titulo,unidades,precio,comision,costo_envio,precio_comprador_envio,logistic_type,provincia,ciudad,estado,con_cuotas,cuotas,costo_financiero,tipo_publicacion,pack_id,item_id').eq('user_id', user_id);
+      let query = supabase.from('ventas').select('nro_venta,user_id,fecha,fecha_cierre,sku,titulo,unidades,precio,comision,costo_envio,precio_comprador_envio,logistic_type,provincia,ciudad,estado,con_cuotas,cuotas,costo_financiero,tipo_publicacion,pack_id,item_id,costo_congelado').eq('user_id', user_id);
       if (desde) query = query.gte('fecha', desde);
       if (hasta) query = query.lte('fecha', hasta);
       query = query.order('fecha', { ascending: false }).range(offset, offset + lote - 1);
