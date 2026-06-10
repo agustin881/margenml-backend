@@ -237,6 +237,7 @@ async function buildVentaRow(order, userId, token, incluirEnvio = true) {
     costo_financiero:      costoFinanciero,
     tipo_publicacion:      itemData.tipo_publicacion       || '',
     pack_id:               order.pack_id ? String(order.pack_id) : null,
+    item_id:               (item.item && item.item.id) ? String(item.item.id) : null,
     raw:                   order
   };
 }
@@ -320,7 +321,7 @@ app.get('/api/ventas', async (req, res) => {
     const lote = 1000;
 
     while (true) {
-      let query = supabase.from('ventas').select('*').eq('user_id', user_id);
+      let query = supabase.from('ventas').select('nro_venta,user_id,fecha,fecha_cierre,sku,titulo,unidades,precio,comision,costo_envio,precio_comprador_envio,logistic_type,provincia,ciudad,estado,con_cuotas,cuotas,costo_financiero,tipo_publicacion,pack_id,item_id').eq('user_id', user_id);
       if (desde) query = query.gte('fecha', desde);
       if (hasta) query = query.lte('fecha', hasta);
       query = query.order('fecha', { ascending: false }).range(offset, offset + lote - 1);
