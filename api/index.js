@@ -663,6 +663,100 @@ app.get('/api/costos/contabilium/:sku', requireAuth, async (req, res) => {
   }
 });
 
+// ── BACKFILL HISTÓRICO (TEMPORAL): carga costo_congelado desde el CMV ──
+// Matchea cada venta con el CMV por SKU exacto + precio (c/IVA) + día (±2),
+// y si no, por el precio más cercano del mismo SKU en el mes. Sobreescribe.
+app.post('/api/costos/backfill', requireAuth, async (req, res) => {
+  try {
+    const userId = req.body.user_id;
+    const filas  = req.body.rows || [];
+    if (!userId || !filas.length) return res.status(400).json({ error: 'Faltan datos' });
+
+    const DAY = 864e5;
+    const cmv = [];
+    let minD = null, maxD = null;
+    for (const f of filas) {
+      const sku   = String(f.sku || '').trim();
+      const cant  = (parseFloat(f.cantidad) || 1) || 1;
+      const pu    = parseFloat(f.precioUnit);
+      const iva   = parseFloat(f.iva) || 0;
+      const costo = parseFloat(f.costo);
+      const dia   = f.fecha ? new Date(f.fecha) : null;
+      if (!sku || isNaN(pu) || isNaN(costo) || !dia || isNaN(dia.getTime())) continue;
+      const t = dia.getTime();
+      cmv.push({ sku, bruto_u: pu * (1 + iva / 100), costo_u: costo / cant, t });
+      if (minD === null || t < minD) minD = t;
+      if (maxD === null || t > maxD) maxD = t;
+    }
+    if (!cmv.length) return res.status(400).json({ error: 'CMV vacio o invalido' });
+
+    const bySku = {};
+    for (const r of cmv) { (bySku[r.sku] = bySku[r.sku] || []).push(r); }
+
+    // Traer ventas del rango (±2 dias) paginando (tope 1000 del plan free)
+    const desde = new Date(minD - 2 * DAY).toISOString();
+    const hasta = new Date(maxD + 2 * DAY).toISOString();
+    let ventas = [], from = 0;
+    while (true) {
+      const { data, error } = await supabase.from('ventas')
+        .select('nro_venta,sku,precio,unidades,fecha_cierre,fecha')
+        .eq('user_id', userId)
+        .gte('fecha_cierre', desde).lte('fecha_cierre', hasta)
+        .range(from, from + 999);
+      if (error) return res.status(500).json({ error: error.message });
+      if (!data || !data.length) break;
+      ventas = ventas.concat(data);
+      if (data.length < 1000) break;
+      from += 1000;
+    }
+
+    const updates = [];
+    let exacto = 0, aprox = 0, sin = 0;
+    for (const v of ventas) {
+      const sku = String(v.sku || '').trim();
+      const cands = bySku[sku];
+      const unidades = parseFloat(v.unidades) || 1;
+      const precio = parseFloat(v.precio) || 0;
+      const dt = new Date(v.fecha_cierre || v.fecha);
+      if (!cands || !precio || isNaN(dt.getTime())) { sin++; continue; }
+      const bruto_u = unidades > 0 ? precio / unidades : precio;
+      const t = dt.getTime();
+      let best = null;
+      for (const c of cands) {
+        if (Math.abs(c.t - t) / DAY <= 2.5) {
+          const pdif = Math.abs(c.bruto_u - bruto_u);
+          if (best === null || pdif < best.pdif) best = { pdif, costo_u: c.costo_u };
+        }
+      }
+      let costo_u = null, esExacto = false;
+      if (best) {
+        costo_u = best.costo_u;
+        esExacto = bruto_u > 0 && (best.pdif / bruto_u) <= 0.005;
+      } else {
+        let b2 = null;
+        for (const c of cands) {
+          const pdif = Math.abs(c.bruto_u - bruto_u);
+          if (b2 === null || pdif < b2.pdif) b2 = { pdif, costo_u: c.costo_u };
+        }
+        if (b2) costo_u = b2.costo_u;
+      }
+      if (costo_u === null) { sin++; continue; }
+      if (esExacto) exacto++; else aprox++;
+      updates.push({ nro_venta: v.nro_venta, costo_congelado: Math.round(costo_u * unidades * 100) / 100 });
+    }
+
+    for (let i = 0; i < updates.length; i += 500) {
+      const { error } = await supabase.from('ventas')
+        .upsert(updates.slice(i, i + 500), { onConflict: 'nro_venta' });
+      if (error) return res.status(500).json({ error: error.message });
+    }
+
+    res.json({ ventas: ventas.length, exacto, aprox, sin, actualizadas: updates.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── STATUS ────────────────────────────────────────────────────────
 app.get('/api/status', (req, res) => {
   res.json({ status: 'ok', version: '4.4.0', timestamp: new Date().toISOString() });
