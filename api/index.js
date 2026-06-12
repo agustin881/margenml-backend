@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v6-costo-unidad', costo_congelado: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v8-costo-unidad', costo_congelado: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
