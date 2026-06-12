@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v8-costo-unidad', costo_congelado: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v8-bonif-diag', costo_congelado: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -217,8 +217,9 @@ async function buildVentaRow(order, userId, token, incluirEnvio = true) {
   const item     = (order.order_items && order.order_items[0]) || {};
   const payment  = (order.payments && order.payments[0]) || {};
   const sku      = (item.item && (item.item.seller_sku || item.item.seller_custom_field)) || '';
+  // sale_fee de ML es POR UNIDAD → multiplicar por la cantidad de cada item
   const comision = order.order_items
-    ? order.order_items.reduce((a, i) => a + (i.sale_fee || 0), 0) : 0;
+    ? order.order_items.reduce((a, i) => a + (i.sale_fee || 0) * (i.quantity || 1), 0) : 0;
 
   // Cuotas y costo financiero
   const cuotas = payment.installments || 1;
@@ -772,6 +773,50 @@ app.post('/api/costos/backfill', requireAuth, async (req, res) => {
   }
 });
 
+// ── DIAGNÓSTICO BONIFICACIONES (TEMPORAL, abierto): respuesta cruda de facturación ──
+// Uso: /api/bonif/diag?user_id=67619515&nro_venta=2000016718538322
+app.get('/api/bonif/diag', async (req, res) => {
+  try {
+    const { user_id, nro_venta } = req.query;
+    if (!user_id || !nro_venta) return res.status(400).json({ error: 'Falta user_id o nro_venta' });
+    const token = await getValidToken(user_id);
+    if (!token) return res.status(400).json({ error: 'Sin token ML para ese user_id' });
+    const auth = { headers: { Authorization: `Bearer ${token}` } };
+
+    const probe = async (url) => {
+      try {
+        const r = await fetch(url, auth);
+        let b; try { b = await r.json(); } catch { b = await r.text(); }
+        return { url, status: r.status, body: b };
+      } catch (e) { return { url, error: e.message }; }
+    };
+
+    const out = { nro_venta, order_payments: [], mediations: null, probes: [] };
+
+    // 1) Orden → payment_ids, estado de pagos, reembolsos y mediaciones
+    const order = await (await fetch(`https://api.mercadolibre.com/orders/${nro_venta}`, auth)).json();
+    const pays = Array.isArray(order.payments) ? order.payments : [];
+    out.order_payments = pays.map(p => ({
+      id: p.id, status: p.status, status_detail: p.status_detail,
+      transaction_amount: p.transaction_amount, total_paid_amount: p.total_paid_amount,
+      transaction_amount_refunded: p.transaction_amount_refunded
+    }));
+    out.mediations = order.mediations || null;
+    out.pack_id = order.pack_id || null;
+
+    // 2) Probar endpoints de facturación (devuelvo crudo el que ande)
+    for (const p of pays) {
+      out.probes.push(await probe(`https://api.mercadolibre.com/billing/integration/payment/${p.id}/charges`));
+    }
+    out.probes.push(await probe(`https://api.mercadolibre.com/billing/integration/monthly/periods?group=ML&limit=6`));
+    out.probes.push(await probe(`https://api.mercadolibre.com/billing/monthly/periods?group=ML&limit=6`));
+
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── STATUS ────────────────────────────────────────────────────────
 app.get('/api/status', (req, res) => {
   res.json({ status: 'ok', version: '4.4.0', timestamp: new Date().toISOString() });
@@ -850,47 +895,47 @@ app.get('/api/medidas', requireAuth, async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`MargenML backend v3 corriendo en puerto ${PORT}`));
-
-module.exports = app;
-// ── DIAGNÓSTICO BONIFICACIONES (TEMPORAL, abierto): respuesta cruda de facturación ──
-// Uso: /api/bonif/diag?user_id=67619515&nro_venta=2000016718538322
-app.get('/api/bonif/diag', async (req, res) => {
+// ── DIAGNÓSTICO BONIFICACIONES 2 (TEMPORAL): periodos + detalles de facturacion ──
+// Uso: /api/bonif/diag2?user_id=67619515&nro_venta=2000016718538322
+app.get('/api/bonif/diag2', async (req, res) => {
   try {
     const { user_id, nro_venta } = req.query;
-    if (!user_id || !nro_venta) return res.status(400).json({ error: 'Falta user_id o nro_venta' });
+    if (!user_id) return res.status(400).json({ error: 'Falta user_id' });
     const token = await getValidToken(user_id);
-    if (!token) return res.status(400).json({ error: 'Sin token ML para ese user_id' });
+    if (!token) return res.status(400).json({ error: 'Sin token ML' });
     const auth = { headers: { Authorization: `Bearer ${token}` } };
-
-    const probe = async (url) => {
-      try {
-        const r = await fetch(url, auth);
-        let b; try { b = await r.json(); } catch { b = await r.text(); }
-        return { url, status: r.status, body: b };
-      } catch (e) { return { url, error: e.message }; }
+    const get = async (url) => {
+      try { const r = await fetch(url, auth); let b; try { b = await r.json(); } catch { b = await r.text(); }
+            return { status: r.status, body: b }; } catch (e) { return { error: e.message }; }
     };
+    const out = { nro_venta: nro_venta || null, periods: {}, sample: {}, matches: {} };
 
-    const out = { nro_venta, order_payments: [], mediations: null, probes: [] };
-
-    const order = await (await fetch(`https://api.mercadolibre.com/orders/${nro_venta}`, auth)).json();
-    const pays = Array.isArray(order.payments) ? order.payments : [];
-    out.order_payments = pays.map(p => ({
-      id: p.id, status: p.status, status_detail: p.status_detail,
-      transaction_amount: p.transaction_amount, total_paid_amount: p.total_paid_amount,
-      transaction_amount_refunded: p.transaction_amount_refunded
-    }));
-    out.mediations = order.mediations || null;
-    out.pack_id = order.pack_id || null;
-
-    for (const p of pays) {
-      out.probes.push(await probe(`https://api.mercadolibre.com/billing/integration/payment/${p.id}/charges`));
+    for (const dt of ['BILL', 'CREDIT_NOTE']) {
+      const per = await get(`https://api.mercadolibre.com/billing/integration/monthly/periods?group=ML&document_type=${dt}&limit=6`);
+      out.periods[dt] = per;
+      let arr = per.body && (per.body.results || per.body.periods || per.body.data || per.body.last_periods);
+      let key = (Array.isArray(arr) && arr.length) ? (arr[0].key || arr[0].period_key || arr[0].period || arr[0].id) : null;
+      if (!key) continue;
+      out.periods[dt + '_used_key'] = key;
+      out.sample[dt] = await get(`https://api.mercadolibre.com/billing/integration/periods/key/${key}/group/ML/details?document_type=${dt}&limit=2`);
+      if (nro_venta) {
+        const found = [];
+        for (let off = 0; off < 20 * 150; off += 150) {
+          const pg = await get(`https://api.mercadolibre.com/billing/integration/periods/key/${key}/group/ML/details?document_type=${dt}&limit=150&offset=${off}`);
+          const rs = pg.body && pg.body.results;
+          if (!Array.isArray(rs) || rs.length === 0) break;
+          for (const row of rs) { if (JSON.stringify(row).includes(String(nro_venta))) found.push(row); }
+          if (found.length) break;
+        }
+        out.matches[dt] = found;
+      }
     }
-    out.probes.push(await probe(`https://api.mercadolibre.com/billing/integration/monthly/periods?group=ML&limit=6`));
-    out.probes.push(await probe(`https://api.mercadolibre.com/billing/monthly/periods?group=ML&limit=6`));
-
     res.json(out);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
+
+app.listen(PORT, () => console.log(`MargenML backend v3 corriendo en puerto ${PORT}`));
+
+module.exports = app;
