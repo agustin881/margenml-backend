@@ -853,3 +853,44 @@ app.get('/api/medidas', requireAuth, async (req, res) => {
 app.listen(PORT, () => console.log(`MargenML backend v3 corriendo en puerto ${PORT}`));
 
 module.exports = app;
+// ── DIAGNÓSTICO BONIFICACIONES (TEMPORAL, abierto): respuesta cruda de facturación ──
+// Uso: /api/bonif/diag?user_id=67619515&nro_venta=2000016718538322
+app.get('/api/bonif/diag', async (req, res) => {
+  try {
+    const { user_id, nro_venta } = req.query;
+    if (!user_id || !nro_venta) return res.status(400).json({ error: 'Falta user_id o nro_venta' });
+    const token = await getValidToken(user_id);
+    if (!token) return res.status(400).json({ error: 'Sin token ML para ese user_id' });
+    const auth = { headers: { Authorization: `Bearer ${token}` } };
+
+    const probe = async (url) => {
+      try {
+        const r = await fetch(url, auth);
+        let b; try { b = await r.json(); } catch { b = await r.text(); }
+        return { url, status: r.status, body: b };
+      } catch (e) { return { url, error: e.message }; }
+    };
+
+    const out = { nro_venta, order_payments: [], mediations: null, probes: [] };
+
+    const order = await (await fetch(`https://api.mercadolibre.com/orders/${nro_venta}`, auth)).json();
+    const pays = Array.isArray(order.payments) ? order.payments : [];
+    out.order_payments = pays.map(p => ({
+      id: p.id, status: p.status, status_detail: p.status_detail,
+      transaction_amount: p.transaction_amount, total_paid_amount: p.total_paid_amount,
+      transaction_amount_refunded: p.transaction_amount_refunded
+    }));
+    out.mediations = order.mediations || null;
+    out.pack_id = order.pack_id || null;
+
+    for (const p of pays) {
+      out.probes.push(await probe(`https://api.mercadolibre.com/billing/integration/payment/${p.id}/charges`));
+    }
+    out.probes.push(await probe(`https://api.mercadolibre.com/billing/integration/monthly/periods?group=ML&limit=6`));
+    out.probes.push(await probe(`https://api.mercadolibre.com/billing/monthly/periods?group=ML&limit=6`));
+
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
