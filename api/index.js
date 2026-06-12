@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v5-envio-colecta', costo_congelado: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v6-costo-unidad', costo_congelado: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -691,7 +691,9 @@ app.post('/api/costos/backfill', requireAuth, async (req, res) => {
       const dia   = f.fecha ? new Date(f.fecha) : null;
       if (!sku || isNaN(pu) || isNaN(costo) || !dia || isNaN(dia.getTime())) continue;
       const t = dia.getTime();
-      cmv.push({ sku, bruto_u: pu * (1 + iva / 100), costo_u: costo / cant, t });
+      // El "Costo" del CMV YA viene por unidad → NO dividir por cantidad.
+      // costo_congelado se calcula despues como costo_u * unidades (total).
+      cmv.push({ sku, bruto_u: pu * (1 + iva / 100), costo_u: costo, t });
       if (minD === null || t < minD) minD = t;
       if (maxD === null || t > maxD) maxD = t;
     }
