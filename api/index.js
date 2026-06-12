@@ -7,6 +7,9 @@ const app = express();
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
+// Marcador de version (para verificar que Railway tiene el codigo nuevo)
+app.get('/api/version', (req, res) => res.json({ version: 'v5-envio-colecta', costo_congelado: true }));
+
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
@@ -168,6 +171,9 @@ async function getShipData(shipmentId, token) {
         if (recvCost > 0) pagoComprador = recvCost;
         // Si el shipment no traía list_cost pero el desglose sí trae el bruto, lo uso.
         if (!costoEnvio && gross > 0) costoEnvio = gross;
+        // Colecta / envio propio: el costo que banca el vendedor viene en senders.cost.
+        // Lo uso como bruto (neto = bruto - aporteComprador = senders.cost).
+        if (!costoEnvio && sendCost > 0) costoEnvio = sendCost + pagoComprador;
 
         // Log de verificación: bruto - aporteComprador debería dar el neto del vendedor (senders.cost)
         console.log(`[ENVIO] ship=${shipmentId} bruto=${costoEnvio} pagoComprador=${pagoComprador} netoCalc=${costoEnvio - pagoComprador} netoVendedor(senders.cost)=${sendCost} | keys=${Object.keys(costs).join(',')}`);
@@ -338,8 +344,9 @@ app.post('/api/webhook/ml', async (req, res) => {
     if (row.sku) {
       const cInterno = await getCostoInterno(row.sku);
       if (cInterno != null) {
+        const totalCosto = cInterno * (Number(row.unidades) || 1);
         await supabase.from('ventas')
-          .update({ costo_congelado: cInterno })
+          .update({ costo_congelado: totalCosto })
           .eq('nro_venta', row.nro_venta)
           .is('costo_congelado', null);
       }
