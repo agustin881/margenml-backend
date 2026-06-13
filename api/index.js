@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v8-bonif-diag', costo_congelado: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v9-completo', costo_congelado: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -929,6 +929,38 @@ app.get('/api/bonif/diag2', async (req, res) => {
         }
         out.matches[dt] = found;
       }
+    }
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── DIAGNÓSTICO BONIFICACIONES 3 (TEMPORAL): detalle del pago (Mercado Pago) ──
+// Uso: /api/bonif/diag3?user_id=67619515&nro_venta=2000016718538322
+app.get('/api/bonif/diag3', async (req, res) => {
+  try {
+    const { user_id, nro_venta, payment_id } = req.query;
+    if (!user_id) return res.status(400).json({ error: 'Falta user_id' });
+    const token = await getValidToken(user_id);
+    if (!token) return res.status(400).json({ error: 'Sin token ML' });
+    const auth = { headers: { Authorization: `Bearer ${token}` } };
+    const get = async (url) => {
+      try { const r = await fetch(url, auth); let b; try { b = await r.json(); } catch { b = await r.text(); }
+            return { url, status: r.status, body: b }; } catch (e) { return { url, error: e.message }; }
+    };
+    const out = { payment_id: payment_id || null, probes: [] };
+    let pid = payment_id;
+    if (!pid && nro_venta) {
+      const order = await get(`https://api.mercadolibre.com/orders/${nro_venta}`);
+      const pays = (order.body && order.body.payments) || [];
+      pid = pays[0] && pays[0].id;
+      out.payment_id = pid;
+    }
+    if (pid) {
+      out.probes.push(await get(`https://api.mercadolibre.com/v1/payments/${pid}`));
+      out.probes.push(await get(`https://api.mercadolibre.com/payments/${pid}`));
+      out.probes.push(await get(`https://api.mercadolibre.com/v1/payments/${pid}/refunds`));
     }
     res.json(out);
   } catch (e) {
