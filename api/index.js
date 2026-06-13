@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v9-completo', costo_congelado: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v10-flexdiag', costo_congelado: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -811,6 +811,39 @@ app.get('/api/bonif/diag', async (req, res) => {
     out.probes.push(await probe(`https://api.mercadolibre.com/billing/integration/monthly/periods?group=ML&limit=6`));
     out.probes.push(await probe(`https://api.mercadolibre.com/billing/monthly/periods?group=ML&limit=6`));
 
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── DIAGNÓSTICO FLEX (TEMPORAL): vuelca el desglose del envío para ubicar la bonificación ──
+// Uso: /api/bonif/diagflex?user_id=67619515&nro_venta=2000016891494744
+app.get('/api/bonif/diagflex', async (req, res) => {
+  try {
+    const { user_id, nro_venta } = req.query;
+    if (!user_id || !nro_venta) return res.status(400).json({ error: 'Falta user_id o nro_venta' });
+    const token = await getValidToken(user_id);
+    if (!token) return res.status(400).json({ error: 'Sin token ML para ese user_id' });
+    const auth = { headers: { Authorization: `Bearer ${token}` } };
+
+    const order = await (await fetch(`https://api.mercadolibre.com/orders/${nro_venta}`, auth)).json();
+    const out = {
+      nro_venta,
+      shipping_id: (order.shipping && order.shipping.id) || null,
+      order_coupon: order.coupon || null,
+      order_taxes: order.taxes || null,
+      order_payments: (Array.isArray(order.payments) ? order.payments : []).map(p => ({
+        id: p.id, transaction_amount: p.transaction_amount, total_paid_amount: p.total_paid_amount,
+        shipping_cost: p.shipping_cost, coupon_amount: p.coupon_amount, taxes_amount: p.taxes_amount
+      }))
+    };
+    const shipId = out.shipping_id;
+    if (shipId) {
+      const ship = await (await fetch(`https://api.mercadolibre.com/shipments/${shipId}`, auth)).json();
+      out.shipment = { logistic_type: ship.logistic_type, base_cost: ship.base_cost, shipping_option: ship.shipping_option, status: ship.status };
+      out.shipment_costs = await (await fetch(`https://api.mercadolibre.com/shipments/${shipId}/costs`, auth)).json();
+    }
     res.json(out);
   } catch (e) {
     res.status(500).json({ error: e.message });
