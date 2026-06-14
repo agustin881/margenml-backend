@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v10-flexdiag', costo_congelado: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v11-rango', costo_congelado: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -451,15 +451,16 @@ app.get('/api/sync/diario', async (req, res) => {
 // ── SYNC (manual) ─────────────────────────────────────────────────
 // Recorre las ventas desde hoy hacia atrás `dias` días y las guarda.
 // incluirEnvio = true trae tipo de envío (Flex/Full/Colecta/M1) — más lento.
-async function runSync(userId, dias, incluirEnvio) {
+async function runSync(userId, dias, incluirEnvio, desdeStr, hastaStr) {
   let guardadas = 0;
   let errores = 0;
   try {
-    const desde = new Date();
-    desde.setDate(desde.getDate() - (dias || 90));
+    let desde;
+    if (desdeStr) { desde = new Date(desdeStr + 'T00:00:00.000-03:00'); }
+    else { desde = new Date(); desde.setDate(desde.getDate() - (dias || 90)); }
 
     let chunkDesde = new Date(desde);
-    const hoy = new Date();
+    const hoy = hastaStr ? new Date(hastaStr + 'T23:59:59.000-03:00') : new Date();
 
     console.log(`========================================`);
     console.log(`[SYNC] ARRANCA user=${userId} dias=${dias} envio=${incluirEnvio}`);
@@ -543,12 +544,14 @@ app.get('/api/sync', (req, res) => {
   const user_id = req.query.user_id;
   const dias    = Number(req.query.dias) || 7;
   const incluirEnvio = req.query.envio !== 'no';
+  const desde = req.query.desde || null;
+  const hasta = req.query.hasta || null;
   if (!user_id) return res.status(400).json({ error: 'Falta user_id. Ej: /api/sync?user_id=67619515&dias=7' });
   res.json({
     message: 'Sincronización iniciada. Corre en segundo plano; mirá los logs de Railway para ver el avance.',
-    user_id, dias, envio: incluirEnvio
+    user_id, dias, desde, hasta, envio: incluirEnvio
   });
-  runSync(String(user_id), dias, incluirEnvio);
+  runSync(String(user_id), dias, incluirEnvio, desde, hasta);
 });
 
 // ── CONTABILIUM: obtener token ────────────────────────────────────
