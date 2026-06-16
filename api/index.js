@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v11-rango', costo_congelado: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v12-reenvio-deposito', costo_congelado: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -307,7 +307,35 @@ async function getCostoInterno(sku) {
   }
 }
 
+// ── Reenvío de webhooks al backend del Depósito ───────────────────
+// Una sola app de ML notifica acá (MargenML). Le pasamos una copia de
+// cada notificación al Depósito para que mantenga su panel al día.
+// Es "fire-and-forget": no esperamos la respuesta y cualquier error se
+// traga en silencio, así NUNCA afecta el procesamiento de MargenML.
+const DEPOSITO_WEBHOOK_URL = process.env.DEPOSITO_WEBHOOK_URL
+  || 'https://depositoml-backend-production.up.railway.app/api/despacho/webhook';
+
+function reenviarADeposito(payload) {
+  try {
+    if (!payload || typeof payload !== 'object') return;
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 4000); // corta a los 4s, no cuelga
+    fetch(DEPOSITO_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: ctrl.signal
+    }).then(() => clearTimeout(t))
+      .catch(e => { clearTimeout(t); console.error('[REENVIO-DEPOSITO]', e.message); });
+  } catch (e) {
+    console.error('[REENVIO-DEPOSITO] sync', e.message);
+  }
+}
+
 app.post('/api/webhook/ml', async (req, res) => {
+  // Reenvío al backend del Depósito (fire-and-forget): le mandamos una
+  // copia de TODA notificación. Si falla, no afecta a MargenML.
+  reenviarADeposito(req.body);
   try {
     const { topic, resource, user_id } = req.body || {};
     if (typeof resource !== 'string') return res.sendStatus(200);
