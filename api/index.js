@@ -888,7 +888,8 @@ app.get('/api/status', (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 // ── MEDIDAS: planilla de pesos/medidas publicada en Google Sheets ────
-const MEDIDAS_CSV_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vTpXeWJBa0W6P4uZuEl8VrR2HN75pHr5oDXlD3BraTnSsVpjDh950v6O6k3y_q-lIA2S-feSRlh6tdu/pub?gid=1181343863&single=true&output=csv';
+const MEDIDAS_CSV_URL = process.env.MEDIDAS_CSV_URL
+  || 'https://docs.google.com/spreadsheets/d/e/2PACX-1vTpXeWJBa0W6P4uZuEl8VrR2HN75pHr5oDXlD3BraTnSsVpjDh950v6O6k3y_q-lIA2S-feSRlh6tdu/pub?gid=1181343863&single=true&output=csv';
 let _medidasCache = null, _medidasTs = 0;
 
 function _parseCSV(text){
@@ -918,19 +919,35 @@ function _numAR(s){
   const n=parseFloat(s);
   return isNaN(n)?0:n;
 }
-function _normH(c){ return (c||'').replace(/\s+/g,' ').trim().toLowerCase(); }
+// Normaliza encabezados: saca acentos, colapsa espacios, minúsculas.
+// (Antes NO sacaba acentos, así que "KG de envío" y "Costo envío Mercado Libre"
+//  no matcheaban y envioML quedaba en 0 para todos.)
+function _normH(c){
+  return (c||'')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g,'') // saca tildes/acentos
+    .replace(/\s+/g,' ').trim().toLowerCase();
+}
 function buildMedidas(text){
   const rows=_parseCSV(text);
   let hi=-1;
   for(let i=0;i<rows.length;i++){ if(rows[i].some(c=>_normH(c)==='sku producto')){ hi=i; break; } }
   if(hi<0) return {};
   const hdr=rows[hi].map(_normH);
-  const cSku=hdr.indexOf('sku producto');
-  const cLargo=hdr.indexOf('largo'), cAncho=hdr.indexOf('ancho'), cAlto=hdr.indexOf('alto');
-  const cPeso=hdr.indexOf('peso'), cKg=hdr.indexOf('kg de envio'), cEnvioML=hdr.indexOf('envio mercado libre');
+  // Busca por coincidencia exacta y, si no, por "contiene" (tolera prefijos como "Costo ...").
+  const findCol=(...needles)=>{
+    for(const n of needles){ const i=hdr.indexOf(n); if(i>-1) return i; }
+    for(const n of needles){ const i=hdr.findIndex(h=>h.indexOf(n)>-1); if(i>-1) return i; }
+    return -1;
+  };
+  const cSku=findCol('sku producto');
+  const cLargo=findCol('largo'), cAncho=findCol('ancho'), cAlto=findCol('alto');
+  const cPeso=findCol('peso'), cKg=findCol('kg de envio');
+  // En la planilla la columna se llama "Costo envío Mercado Libre": la tomamos por "contiene".
+  const cEnvioML=findCol('envio mercado libre','costo envio mercado libre');
+  console.log(`[MEDIDAS] cols -> sku=${cSku} largo=${cLargo} ancho=${cAncho} alto=${cAlto} peso=${cPeso} kg=${cKg} envioML=${cEnvioML}`);
   const map={};
   for(let i=hi+1;i<rows.length;i++){
-    const r=rows[i]; const sku=(r[cSku]||'').trim();
+    const r=rows[i]; const sku=(cSku>-1?(r[cSku]||''):'').trim();
     if(!sku) continue;
     map[sku.toUpperCase()]={
       sku, largo:_numAR(r[cLargo]), ancho:_numAR(r[cAncho]), alto:_numAR(r[cAlto]),
