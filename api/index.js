@@ -1049,6 +1049,59 @@ app.get('/api/bonif/diag3', async (req, res) => {
   }
 });
 
+// ── DIAGNÓSTICO PUBLICIDAD (TEMPORAL): vuelca lo que devuelve la API de Product Ads ──
+// Uso: /api/ads/diag?user_id=67619515
+app.get('/api/ads/diag', async (req, res) => {
+  try {
+    const { user_id } = req.query;
+    if (!user_id) return res.status(400).json({ error: 'Falta user_id. Ej: /api/ads/diag?user_id=67619515' });
+    const token = await getValidToken(user_id);
+    if (!token) return res.status(400).json({ error: 'Sin token ML para ese user_id' });
+
+    const probe = async (url, extra) => {
+      try {
+        const r = await fetch(url, { headers: Object.assign({ Authorization: `Bearer ${token}` }, extra || {}) });
+        let b; try { b = await r.json(); } catch (_) { b = await r.text(); }
+        return { url, status: r.status, body: b };
+      } catch (e) { return { url, error: e.message }; }
+    };
+
+    const V1 = { 'Api-Version': '1' };
+    const V2 = { 'Api-Version': '2' };
+    const out = { user_id, advertiser_id: null, probes: [] };
+
+    // 1) Buscar el "advertiser" (la cuenta publicitaria). Es la clave para lo demás.
+    const adv = await probe('https://api.mercadolibre.com/advertising/advertisers?product_id=PADS', V1);
+    out.probes.push(adv);
+    try {
+      const arr = adv.body && (adv.body.advertisers || adv.body.results || adv.body);
+      if (Array.isArray(arr) && arr.length) out.advertiser_id = arr[0].advertiser_id || arr[0].id || null;
+    } catch (_) {}
+
+    // Rango: últimos 30 días
+    const hoy = new Date(); const desde = new Date(hoy); desde.setDate(hoy.getDate() - 30);
+    const f = d => d.toISOString().substring(0, 10);
+    const rango = `date_from=${f(desde)}&date_to=${f(hoy)}`;
+
+    // 2) Endpoints candidatos (probamos varios y devolvemos lo que ande)
+    const urls = [
+      'https://api.mercadolibre.com/advertising/product_ads/campaigns',
+      `https://api.mercadolibre.com/advertising/product_ads/campaigns?${rango}`
+    ];
+    if (out.advertiser_id) {
+      const a = out.advertiser_id;
+      urls.push(`https://api.mercadolibre.com/advertising/advertisers/${a}/product_ads/campaigns`);
+      urls.push(`https://api.mercadolibre.com/advertising/advertisers/${a}/product_ads/campaigns/metrics?${rango}`);
+      urls.push(`https://api.mercadolibre.com/advertising/advertisers/${a}/product_ads/items?${rango}&limit=10`);
+    }
+    for (const u of urls) out.probes.push(await probe(u, V2));
+
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.listen(PORT, () => console.log(`MargenML backend v3 corriendo en puerto ${PORT}`));
 
 module.exports = app;
