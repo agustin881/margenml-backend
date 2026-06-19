@@ -1049,7 +1049,7 @@ app.get('/api/bonif/diag3', async (req, res) => {
   }
 });
 
-// ── DIAGNÓSTICO PUBLICIDAD v2 (TEMPORAL): busca el GASTO real por campaña/item ──
+// ── DIAGNÓSTICO PUBLICIDAD v3 (TEMPORAL): anuncios ACTIVOS (gasto>0) por publicación ──
 // Uso: /api/ads/diag?user_id=67619515
 app.get('/api/ads/diag', async (req, res) => {
   try {
@@ -1059,51 +1059,50 @@ app.get('/api/ads/diag', async (req, res) => {
     if (!token) return res.status(400).json({ error: 'Sin token ML para ese user_id' });
 
     const V2 = { 'Api-Version': '2' };
-    const probe = async (url, extra) => {
+    const probe = async (url) => {
       try {
-        const r = await fetch(url, { headers: Object.assign({ Authorization: `Bearer ${token}` }, extra || {}) });
+        const r = await fetch(url, { headers: { Authorization: `Bearer ${token}`, 'Api-Version': '2' } });
         let b; try { b = await r.json(); } catch (_) { b = await r.text(); }
-        return { url, status: r.status, body: b };
-      } catch (e) { return { url, error: e.message }; }
+        return { status: r.status, body: b };
+      } catch (e) { return { error: e.message }; }
     };
 
-    const out = { user_id, advertiser_id: 10904, sample_campaign: null, probes: [] };
-
-    // advertiser
-    const adv = await probe('https://api.mercadolibre.com/advertising/advertisers?product_id=PADS', { 'Api-Version': '1' });
-    try {
-      const arr = adv.body && (adv.body.advertisers || adv.body.results);
-      if (Array.isArray(arr) && arr.length) out.advertiser_id = arr[0].advertiser_id || arr[0].id;
-    } catch (_) {}
-    const a = out.advertiser_id;
-
-    // tomar una campaña de muestra
-    const camps = await probe(`https://api.mercadolibre.com/advertising/advertisers/${a}/product_ads/campaigns`, V2);
-    try { out.sample_campaign = camps.body.results[0].id; } catch (_) {}
-    const c = out.sample_campaign;
-
-    // rango: últimos 30 días
+    const a = 10904;
     const hoy = new Date(); const desde = new Date(hoy); desde.setDate(hoy.getDate() - 30);
     const f = d => d.toISOString().substring(0, 10);
-    const r = `date_from=${f(desde)}&date_to=${f(hoy)}`;
-    const M = 'clicks,prints,cost,cpc,acos,organic_units_quantity,direct_items_quantity,indirect_items_quantity,units_quantity,direct_amount,indirect_amount,total_amount';
+    const M = 'clicks,prints,cost,cpc,acos,units_quantity,direct_amount,indirect_amount,total_amount,organic_units_quantity';
+    const base = `https://api.mercadolibre.com/advertising/advertisers/${a}/product_ads/items?date_from=${f(desde)}&date_to=${f(hoy)}&metrics=${M}`;
 
-    const base = `https://api.mercadolibre.com/advertising/advertisers/${a}/product_ads`;
-    const urls = [
-      // campañas con métricas (varias formas de pedirlas)
-      `${base}/campaigns?${r}&metrics=${M}`,
-      `${base}/campaigns?${r}&metrics_summary=true`,
-      // una campaña puntual con métricas
-      c ? `${base}/campaigns/${c}?${r}&metrics=${M}` : null,
-      c ? `${base}/campaigns/${c}/metrics?${r}` : null,
-      // items con métricas (lo más granular)
-      `${base}/items?${r}&metrics=${M}&limit=5`,
-      `${base}/items?${r}&metrics_summary=true&limit=5`,
-      // ruta alternativa de métricas a nivel advertiser
-      `https://api.mercadolibre.com/advertising/advertisers/${a}/product_ads/metrics?${r}`
-    ].filter(Boolean);
+    const out = { rango: `${f(desde)} a ${f(hoy)}`, sort_probes: [], total_items: null, paginas_escaneadas: 0, activos_encontrados: 0, top_anuncios: [] };
 
-    for (const u of urls) out.probes.push(await probe(u, V2));
+    // 1) probar si soporta ordenar por gasto (así una sola página trae los que más gastan)
+    for (const s of ['sort=cost_desc', 'sort_field=cost&sort_order=desc', 'order=cost_desc']) {
+      const r = await probe(`${base}&${s}&limit=5`);
+      const first = (r.body && r.body.results) ? r.body.results.slice(0, 3).map(x => ({ item: x.item_id, cost: x.metrics && x.metrics.cost })) : null;
+      out.sort_probes.push({ probe: s, status: r.status, primeros: first });
+    }
+
+    // 2) escanear páginas y juntar los anuncios con gasto > 0
+    const activos = [];
+    for (let off = 0; off < 500; off += 50) {
+      const r = await probe(`${base}&limit=50&offset=${off}`);
+      out.paginas_escaneadas++;
+      const arr = (r.body && r.body.results) || [];
+      if (out.total_items === null && r.body && r.body.paging) out.total_items = r.body.paging.total;
+      for (const it of arr) {
+        const m = it.metrics || {};
+        if ((m.cost || 0) > 0) activos.push({
+          item_id: it.item_id, campaign_id: it.campaign_id, title: it.title,
+          status: it.status, cost: m.cost, acos: m.acos, units_quantity: m.units_quantity,
+          total_amount: m.total_amount, organic_units: m.organic_units_quantity
+        });
+      }
+      if (!arr.length) break;
+    }
+    activos.sort((x, y) => (y.cost || 0) - (x.cost || 0));
+    out.activos_encontrados = activos.length;
+    out.top_anuncios = activos.slice(0, 25);
+
     res.json(out);
   } catch (e) {
     res.status(500).json({ error: e.message });
