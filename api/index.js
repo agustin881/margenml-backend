@@ -1109,6 +1109,74 @@ app.get('/api/ads/diag', async (req, res) => {
   }
 });
 
+// ── PUBLICIDAD: gasto real por anuncio (item) en un rango, con caché ──
+// Uso: /api/ads/items?user_id=67619515&desde=2026-06-01&hasta=2026-06-19
+const _adsCache = {}; // key: user|desde|hasta -> { ts, data }
+const ADS_TTL_MS = 6 * 60 * 60 * 1000; // 6 horas
+
+app.get('/api/ads/items', async (req, res) => {
+  try {
+    const { user_id, desde, hasta } = req.query;
+    if (!user_id || !desde || !hasta) return res.status(400).json({ error: 'Faltan user_id, desde, hasta (YYYY-MM-DD)' });
+
+    const key = `${user_id}|${desde}|${hasta}`;
+    const hit = _adsCache[key];
+    if (hit && Date.now() - hit.ts < ADS_TTL_MS) return res.json(Object.assign({ cached: true }, hit.data));
+
+    const token = await getValidToken(user_id);
+    if (!token) return res.status(400).json({ error: 'Sin token ML para ese user_id' });
+
+    const a = 10904; // advertiser PONTEC SA
+    const M = 'cost,acos,units_quantity,total_amount,organic_units_quantity';
+    const base = `https://api.mercadolibre.com/advertising/advertisers/${a}/product_ads/items?date_from=${desde}&date_to=${hasta}&metrics=${M}`;
+    const headers = { Authorization: `Bearer ${token}`, 'Api-Version': '2' };
+
+    const map = {};
+    let gastoTotal = 0;
+    const acc = (arr) => {
+      for (const it of arr || []) {
+        const c = (it.metrics && it.metrics.cost) || 0;
+        if (c > 0) {
+          map[it.item_id] = { cost: c, acos: it.metrics.acos || 0, units: it.metrics.units_quantity || 0 };
+          gastoTotal += c;
+        }
+      }
+    };
+
+    // primera página: saber el total
+    const first = await fetch(`${base}&limit=50&offset=0`, { headers });
+    const fj = await first.json();
+    if (first.status !== 200) return res.status(first.status).json({ error: 'Error API ads', detalle: fj });
+    const total = (fj.paging && fj.paging.total) || 0;
+    acc(fj.results);
+
+    // resto en lotes concurrentes (rápido)
+    const offsets = [];
+    for (let o = 50; o < total; o += 50) offsets.push(o);
+    const LOTE = 6;
+    for (let i = 0; i < offsets.length; i += LOTE) {
+      const batch = offsets.slice(i, i + LOTE).map(o =>
+        fetch(`${base}&limit=50&offset=${o}`, { headers }).then(r => r.json()).catch(() => ({}))
+      );
+      const results = await Promise.all(batch);
+      results.forEach(j => acc(j.results));
+    }
+
+    const data = {
+      advertiser_id: a,
+      rango: `${desde} a ${hasta}`,
+      total_items: total,
+      anuncios_con_gasto: Object.keys(map).length,
+      gasto_total: Math.round(gastoTotal),
+      gastos: map
+    };
+    _adsCache[key] = { ts: Date.now(), data };
+    res.json(Object.assign({ cached: false }, data));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.listen(PORT, () => console.log(`MargenML backend v3 corriendo en puerto ${PORT}`));
 
 module.exports = app;
