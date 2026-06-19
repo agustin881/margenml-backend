@@ -1049,7 +1049,7 @@ app.get('/api/bonif/diag3', async (req, res) => {
   }
 });
 
-// ── DIAGNÓSTICO PUBLICIDAD (TEMPORAL): vuelca lo que devuelve la API de Product Ads ──
+// ── DIAGNÓSTICO PUBLICIDAD v2 (TEMPORAL): busca el GASTO real por campaña/item ──
 // Uso: /api/ads/diag?user_id=67619515
 app.get('/api/ads/diag', async (req, res) => {
   try {
@@ -1058,6 +1058,7 @@ app.get('/api/ads/diag', async (req, res) => {
     const token = await getValidToken(user_id);
     if (!token) return res.status(400).json({ error: 'Sin token ML para ese user_id' });
 
+    const V2 = { 'Api-Version': '2' };
     const probe = async (url, extra) => {
       try {
         const r = await fetch(url, { headers: Object.assign({ Authorization: `Bearer ${token}` }, extra || {}) });
@@ -1066,36 +1067,43 @@ app.get('/api/ads/diag', async (req, res) => {
       } catch (e) { return { url, error: e.message }; }
     };
 
-    const V1 = { 'Api-Version': '1' };
-    const V2 = { 'Api-Version': '2' };
-    const out = { user_id, advertiser_id: null, probes: [] };
+    const out = { user_id, advertiser_id: 10904, sample_campaign: null, probes: [] };
 
-    // 1) Buscar el "advertiser" (la cuenta publicitaria). Es la clave para lo demás.
-    const adv = await probe('https://api.mercadolibre.com/advertising/advertisers?product_id=PADS', V1);
-    out.probes.push(adv);
+    // advertiser
+    const adv = await probe('https://api.mercadolibre.com/advertising/advertisers?product_id=PADS', { 'Api-Version': '1' });
     try {
-      const arr = adv.body && (adv.body.advertisers || adv.body.results || adv.body);
-      if (Array.isArray(arr) && arr.length) out.advertiser_id = arr[0].advertiser_id || arr[0].id || null;
+      const arr = adv.body && (adv.body.advertisers || adv.body.results);
+      if (Array.isArray(arr) && arr.length) out.advertiser_id = arr[0].advertiser_id || arr[0].id;
     } catch (_) {}
+    const a = out.advertiser_id;
 
-    // Rango: últimos 30 días
+    // tomar una campaña de muestra
+    const camps = await probe(`https://api.mercadolibre.com/advertising/advertisers/${a}/product_ads/campaigns`, V2);
+    try { out.sample_campaign = camps.body.results[0].id; } catch (_) {}
+    const c = out.sample_campaign;
+
+    // rango: últimos 30 días
     const hoy = new Date(); const desde = new Date(hoy); desde.setDate(hoy.getDate() - 30);
     const f = d => d.toISOString().substring(0, 10);
-    const rango = `date_from=${f(desde)}&date_to=${f(hoy)}`;
+    const r = `date_from=${f(desde)}&date_to=${f(hoy)}`;
+    const M = 'clicks,prints,cost,cpc,acos,organic_units_quantity,direct_items_quantity,indirect_items_quantity,units_quantity,direct_amount,indirect_amount,total_amount';
 
-    // 2) Endpoints candidatos (probamos varios y devolvemos lo que ande)
+    const base = `https://api.mercadolibre.com/advertising/advertisers/${a}/product_ads`;
     const urls = [
-      'https://api.mercadolibre.com/advertising/product_ads/campaigns',
-      `https://api.mercadolibre.com/advertising/product_ads/campaigns?${rango}`
-    ];
-    if (out.advertiser_id) {
-      const a = out.advertiser_id;
-      urls.push(`https://api.mercadolibre.com/advertising/advertisers/${a}/product_ads/campaigns`);
-      urls.push(`https://api.mercadolibre.com/advertising/advertisers/${a}/product_ads/campaigns/metrics?${rango}`);
-      urls.push(`https://api.mercadolibre.com/advertising/advertisers/${a}/product_ads/items?${rango}&limit=10`);
-    }
-    for (const u of urls) out.probes.push(await probe(u, V2));
+      // campañas con métricas (varias formas de pedirlas)
+      `${base}/campaigns?${r}&metrics=${M}`,
+      `${base}/campaigns?${r}&metrics_summary=true`,
+      // una campaña puntual con métricas
+      c ? `${base}/campaigns/${c}?${r}&metrics=${M}` : null,
+      c ? `${base}/campaigns/${c}/metrics?${r}` : null,
+      // items con métricas (lo más granular)
+      `${base}/items?${r}&metrics=${M}&limit=5`,
+      `${base}/items?${r}&metrics_summary=true&limit=5`,
+      // ruta alternativa de métricas a nivel advertiser
+      `https://api.mercadolibre.com/advertising/advertisers/${a}/product_ads/metrics?${r}`
+    ].filter(Boolean);
 
+    for (const u of urls) out.probes.push(await probe(u, V2));
     res.json(out);
   } catch (e) {
     res.status(500).json({ error: e.message });
