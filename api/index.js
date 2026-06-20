@@ -167,13 +167,20 @@ async function getShipData(shipmentId, token) {
         const sender   = (Array.isArray(costs.senders) && costs.senders[0]) || {};
         const sendCost = Number(sender.cost) || 0;
 
-        // Solo piso el aporte del comprador si el desglose lo informa (>0).
-        if (recvCost > 0) pagoComprador = recvCost;
-        // Si el shipment no traía list_cost pero el desglose sí trae el bruto, lo uso.
-        if (!costoEnvio && gross > 0) costoEnvio = gross;
-        // Colecta / envio propio: el costo que banca el vendedor viene en senders.cost.
-        // Lo uso como bruto (neto = bruto - aporteComprador = senders.cost).
-        if (!costoEnvio && sendCost > 0) costoEnvio = sendCost + pagoComprador;
+        const esFlexShip = ship.logistic_type === 'self_service';
+        const haySenders = Array.isArray(costs.senders) && costs.senders.length > 0;
+        if (!esFlexShip && haySenders) {
+          // FIX envio: el costo REAL del vendedor es senders.cost (ya neto del aporte del
+          // comprador y del descuento de ML). Es 0 cuando el envio lo paga el comprador
+          // (productos baratos). Evita cargar el bruto cuando no hay list_cost.
+          costoEnvio    = sendCost;
+          pagoComprador = 0;
+        } else {
+          // Flex u otros sin desglose de senders: logica anterior
+          if (recvCost > 0) pagoComprador = recvCost;
+          if (!costoEnvio && gross > 0) costoEnvio = gross;
+          if (!costoEnvio && sendCost > 0) costoEnvio = sendCost + pagoComprador;
+        }
 
         // Log de verificación: bruto - aporteComprador debería dar el neto del vendedor (senders.cost)
         console.log(`[ENVIO] ship=${shipmentId} bruto=${costoEnvio} pagoComprador=${pagoComprador} netoCalc=${costoEnvio - pagoComprador} netoVendedor(senders.cost)=${sendCost} | keys=${Object.keys(costs).join(',')}`);
