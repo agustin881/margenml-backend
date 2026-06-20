@@ -1177,49 +1177,75 @@ app.get('/api/ads/items', async (req, res) => {
   }
 });
 
-// ── DIAGNÓSTICO ENVÍO (TEMPORAL): desglose real de costos de un envío ──
-// Uso: /api/envio/diag?user_id=67619515&order=2000017022730948
+// ── DIAGNÓSTICO ENVÍO (TEMPORAL) ──
+// 1 venta:  /api/envio/diag?user_id=67619515&order=2000017022730948
+// muestra varias: /api/envio/diag?user_id=67619515&sample=1
 app.get('/api/envio/diag', async (req, res) => {
   try {
-    const { user_id, order, shipment } = req.query;
-    if (!user_id || (!order && !shipment)) return res.status(400).json({ error: 'Falta user_id y order (o shipment)' });
+    const { user_id, order, shipment, sample } = req.query;
+    if (!user_id) return res.status(400).json({ error: 'Falta user_id' });
     const token = await getValidToken(user_id);
     if (!token) return res.status(400).json({ error: 'Sin token ML' });
     const H = { headers: { Authorization: `Bearer ${token}` } };
 
+    // helper: trae el desglose real de un shipment
+    const desglose = async (shipId) => {
+      const rs = await fetch(`https://api.mercadolibre.com/shipments/${shipId}`, H);
+      const ship = await rs.json();
+      const rc = await fetch(`https://api.mercadolibre.com/shipments/${shipId}/costs`, H);
+      const costs = await rc.json();
+      const sender = (Array.isArray(costs.senders) && costs.senders[0]) || {};
+      return {
+        logistic_type: ship.logistic_type,
+        list_cost: ship.shipping_option && ship.shipping_option.list_cost,
+        base_cost: ship.base_cost,
+        gross_amount: costs.gross_amount,
+        comprador_cost: costs.receiver && costs.receiver.cost,
+        vendedor_cost: sender.cost
+      };
+    };
+
+    // MODO SAMPLE: ventas más caras con envío guardado > 0
+    if (sample) {
+      const { data, error } = await supabase.from('ventas')
+        .select('nro_venta,sku,titulo,precio,costo_envio')
+        .eq('user_id', String(user_id))
+        .gt('costo_envio', 0)
+        .order('precio', { ascending: false })
+        .limit(10);
+      if (error) return res.status(500).json({ error: error.message });
+      const out = [];
+      for (const v of (data || [])) {
+        try {
+          const ro = await fetch(`https://api.mercadolibre.com/orders/${v.nro_venta}`, H);
+          const o = await ro.json();
+          const shipId = o.shipping && o.shipping.id;
+          let dg = {};
+          if (shipId) dg = await desglose(shipId);
+          out.push({
+            nro: v.nro_venta, sku: v.sku, precio: v.precio,
+            logistic: dg.logistic_type,
+            GUARDADO_costo_envio: v.costo_envio,          // lo que usa MargenML hoy (bruto)
+            REAL_vendedor_cost: dg.vendedor_cost,         // lo que pagás de verdad (senders.cost)
+            comprador_cost: dg.comprador_cost,
+            gross: dg.gross_amount
+          });
+        } catch (e) { out.push({ nro: v.nro_venta, error: e.message }); }
+      }
+      return res.json({ modo: 'sample', n: out.length, ventas: out });
+    }
+
+    // MODO 1 VENTA
+    if (!order && !shipment) return res.status(400).json({ error: 'Pasá order=... o sample=1' });
     let shipId = shipment, ord = null;
     if (order) {
       const ro = await fetch(`https://api.mercadolibre.com/orders/${order}`, H);
       ord = await ro.json();
       shipId = ord.shipping && ord.shipping.id;
     }
-    if (!shipId) return res.json({ error: 'No encontré shipment para esa orden', order, ord_keys: ord ? Object.keys(ord) : null });
-
-    const rs = await fetch(`https://api.mercadolibre.com/shipments/${shipId}`, H);
-    const ship = await rs.json();
-    const rc = await fetch(`https://api.mercadolibre.com/shipments/${shipId}/costs`, H);
-    const costs = await rc.json();
-
-    const sender = (Array.isArray(costs.senders) && costs.senders[0]) || {};
-    res.json({
-      order: order || null,
-      shipment_id: shipId,
-      precio_item: ord && ord.order_items && ord.order_items[0] && ord.order_items[0].unit_price,
-      logistic_type: ship.logistic_type,
-      mode: ship.mode,
-      // lo que mira el backend hoy
-      shipment_list_cost: ship.shipping_option && ship.shipping_option.list_cost,
-      shipment_option_cost: ship.shipping_option && ship.shipping_option.cost,
-      base_cost: ship.base_cost,
-      // EL DESGLOSE REAL (la fuente de verdad)
-      costs_gross_amount: costs.gross_amount,
-      costs_receiver_cost: costs.receiver && costs.receiver.cost,   // lo que paga el COMPRADOR
-      costs_sender_cost: sender.cost,                              // lo que paga el VENDEDOR (neto real)
-      costs_sender_compensation: sender.compensation,
-      costs_sender_discounts: sender.discounts,
-      costs_keys: Object.keys(costs),
-      costs_sender_keys: Object.keys(sender)
-    });
+    if (!shipId) return res.json({ error: 'No encontré shipment', order });
+    const dg = await desglose(shipId);
+    res.json(Object.assign({ order: order || null, shipment_id: shipId, precio_item: ord && ord.order_items && ord.order_items[0] && ord.order_items[0].unit_price }, dg));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
