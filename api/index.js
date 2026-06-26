@@ -421,6 +421,25 @@ app.get('/api/ventas', requireAuth, async (req, res) => {
       if (offset > 500000) break;       // tope de seguridad
     }
 
+    // monto_bonificado (reembolsos parciales): se calcula del raw YA guardado, sin re-sync
+    try {
+      const refundIds = todas.filter(v => String(v.estado||'').includes('partially_refunded')).map(v => v.nro_venta);
+      if (refundIds.length) {
+        const bonifMap = {};
+        for (let i = 0; i < refundIds.length; i += 200) {
+          const chunk = refundIds.slice(i, i + 200);
+          const { data: rawRows } = await supabase.from('ventas').select('nro_venta,raw').in('nro_venta', chunk);
+          (rawRows || []).forEach(r => {
+            const o = r.raw || {};
+            let mb = (o.total_amount != null && o.paid_amount != null) ? (Number(o.total_amount) - Number(o.paid_amount)) : 0;
+            if (!(mb > 0) && Array.isArray(o.payments)) mb = o.payments.reduce((a, p) => a + (Number(p.transaction_amount_refunded) || 0), 0);
+            bonifMap[r.nro_venta] = mb > 0 ? mb : 0;
+          });
+        }
+        todas.forEach(v => { v.monto_bonificado = bonifMap[v.nro_venta] || 0; });
+      }
+    } catch (eb) { console.error('monto_bonificado enrich error:', eb.message); }
+
     res.json({ ventas: todas, total: todas.length });
   } catch (e) {
     res.status(500).json({ error: e.message });
