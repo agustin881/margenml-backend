@@ -764,8 +764,10 @@ app.get('/api/costos/contabilium', requireAuth, async (req, res) => {
       costoInterno: p.CostoInterno || p.costoInterno || 0,
       iva:          p.Iva || p.iva || 0,
       precio:       p.Precio || p.precio || 0,
-      estado:       p.Estado || p.estado || ''
+      estado:       p.Estado || p.estado || '',
+      stock:        (p.Stock!=null?Number(p.Stock):(p.StockActual!=null?Number(p.StockActual):(p.StockDisponible!=null?Number(p.StockDisponible):(p.Inventario!=null?Number(p.Inventario):(p.Cantidad!=null?Number(p.Cantidad):null)))))
     })).filter(p => p.codigo);
+    try { const _s0=[..._seen.values()][0]; if(_s0) console.log('[CONTA] claves del concepto:', Object.keys(_s0).join(', ')); } catch(e){}
 
     console.log(`[CONTA] TOTAL: ${costos.length} productos unicos (parametro=${pageParam || 'NINGUNO'}, esperado ~${totalItems})`);
     res.json({ costos, total: costos.length, pageParam: pageParam || null });
