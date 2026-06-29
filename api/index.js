@@ -624,6 +624,75 @@ async function getContabiliumToken() {
   return data.access_token;
 }
 
+// ── ML: thumbnails por item_id (proxy, evita CORS en el navegador) ──
+// GET /api/thumbs?ids=MLA1,MLA2&user_id=...  -> { id: url }
+app.get('/api/thumbs', async (req, res) => {
+  try {
+    const ids = String(req.query.ids||'').split(',').map(s=>s.trim()).filter(Boolean);
+    if (!ids.length) return res.json({});
+    const userId = req.query.user_id || '67619515';
+    let token = null; try { token = await getValidToken(userId); } catch(e) {}
+    const out = {};
+    for (let i=0;i<ids.length;i+=20){
+      const chunk = ids.slice(i,i+20);
+      const url = 'https://api.mercadolibre.com/items?ids='+chunk.join(',')+'&attributes=id,secure_thumbnail,thumbnail';
+      try {
+        const r = await fetch(url, { headers: token ? { Authorization: 'Bearer '+token } : {} });
+        const arr = await r.json();
+        (Array.isArray(arr)?arr:[]).forEach(row=>{
+          const b = row && row.body;
+          if (b && b.id) { let u = b.secure_thumbnail || b.thumbnail || ''; if (u) out[b.id] = u.replace(/^http:/,'https:'); }
+        });
+      } catch(e) {}
+    }
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── CONTABILIUM: PROBE de compras (diagnostico TEMPORAL, solo lectura) ──
+// GET /api/compras/probe -> prueba rutas candidatas y devuelve cual responde + muestra.
+// Si seteas PROBE_SECRET en Railway, hay que pasar ?secret=...; si no, queda abierto.
+// Borrar este endpoint cuando armemos la feature real de compras.
+app.get('/api/compras/probe', async (req, res) => {
+  try {
+    if (process.env.PROBE_SECRET && req.query.secret !== process.env.PROBE_SECRET) {
+      return res.status(401).json({ error: 'secret requerido' });
+    }
+    const token = await getContabiliumToken();
+    const base  = 'https://rest.contabilium.com';
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    const candidatos = [
+      '/api/comprobantescompra/search?pageSize=3&pageNumber=1',
+      '/api/comprobantesdecompra/search?pageSize=3&pageNumber=1',
+      '/api/compras/search?pageSize=3&pageNumber=1',
+      '/api/comprobantes/search?pageSize=3&pageNumber=1',
+      '/api/ordenescompra/search?pageSize=3&pageNumber=1',
+      '/api/comprobantescompra/get?pageSize=3'
+    ];
+    const resultados = [];
+    for (const path of candidatos) {
+      try {
+        const r   = await fetch(base + path, { headers: { Authorization: `Bearer ${token}` } });
+        const txt = await r.text();
+        let j = null; try { j = JSON.parse(txt); } catch (e) {}
+        let cuenta = null, keys = null, muestra = null;
+        if (j) {
+          const items = j.Items || j.items || (Array.isArray(j) ? j : null);
+          if (Array.isArray(items)) { cuenta = items.length; muestra = items[0] || null; keys = items[0] ? Object.keys(items[0]) : []; }
+          else { keys = Object.keys(j); }
+        }
+        resultados.push({ path, status: r.status, ok: r.ok, cuenta, keys, muestra, body: (j ? undefined : txt.slice(0, 200)) });
+      } catch (e) {
+        resultados.push({ path, error: e.message });
+      }
+      await sleep(500); // rate limit 25/10s
+    }
+    res.json({ probe: 'compras', resultados });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── CONTABILIUM: traer todos los productos con costo ──────────────
 // GET /api/costos/contabilium
 // Devuelve array de { codigo, nombre, costoInterno, iva, precio }
