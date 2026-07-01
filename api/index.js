@@ -571,6 +571,38 @@ app.get('/api/devol/probe', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── PROBE2 devoluciones (TEMPORAL): comparar caso conocido "se lo queda" vs "lo devuelve" ──
+// GET /api/devol/probe2?user_id=67619515   (usa freidora vs silla por defecto; ?nros=a,b para otros)
+app.get('/api/devol/probe2', async (req, res) => {
+  try {
+    const user_id = req.query.user_id;
+    if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
+    const nros = String(req.query.nros || '2000017077382238,2000017080396472').split(',').map(x => x.trim()).filter(Boolean);
+    const token = await getValidToken(user_id);
+    const out = [];
+    for (const nro of nros) {
+      const { data } = await supabase.from('ventas').select('nro_venta,sku,raw').eq('user_id', String(user_id)).eq('nro_venta', nro).limit(1);
+      const row = data && data[0];
+      if (!row) { out.push({ nro, error: 'no encontrado en la base' }); continue; }
+      const o = row.raw || {};
+      const medId = Array.isArray(o.mediations) && o.mediations[0] && o.mediations[0].id;
+      const caso = { nro, sku: row.sku, cancelCode: o.cancel_detail && o.cancel_detail.code, medId: medId || null };
+      if (medId) {
+        try {
+          const rc = await fetch('https://api.mercadolibre.com/post-purchase/v1/claims/' + medId, { headers: { Authorization: 'Bearer ' + token } });
+          const jc = await rc.json();
+          caso.type = jc.type; caso.stage = jc.stage; caso.status = jc.status; caso.reason_id = jc.reason_id;
+          caso.resolution = jc.resolution || null;
+          caso.related_entities = jc.related_entities || null;
+          caso.players = Array.isArray(jc.players) ? jc.players.map(p => ({ type: p.type, role: p.role })) : null;
+        } catch (e) { caso.claimError = e.message; }
+      }
+      out.push(caso);
+    }
+    res.json({ casos: out, nota: 'probe2: se-lo-queda (freidora) vs lo-devuelve (silla)' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── SYNC DIARIO: cron job, trae ventas de ayer completas ──────────
 app.get('/api/sync/diario', async (req, res) => {
   const secret = req.headers['x-cron-secret'];
