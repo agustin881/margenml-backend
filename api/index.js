@@ -484,6 +484,48 @@ app.get('/api/ventas/estados', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── DIAGNOSTICO devoluciones (TEMPORAL): estructura de una orden con mediacion ──
+// GET /api/ventas/raw-devol?user_id=67619515  -> campos NO sensibles para saber si volvio el producto
+app.get('/api/ventas/raw-devol', async (req, res) => {
+  try {
+    const user_id = req.query.user_id;
+    if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
+    const out = [];
+    let offset = 0; const lote = 500;
+    while (out.length < 4 && offset < 6000) {
+      const { data, error } = await supabase.from('ventas')
+        .select('raw').eq('user_id', String(user_id)).eq('estado', 'cancelled')
+        .range(offset, offset + lote - 1);
+      if (error) return res.status(500).json({ error: error.message });
+      if (!data || !data.length) break;
+      for (const r of data) {
+        const o = r.raw || {};
+        const code = o.cancel_detail ? (o.cancel_detail.code || '') : '';
+        if (code !== 'mediations') continue;
+        const sh = o.shipping || {};
+        out.push({
+          topKeys: Object.keys(o),
+          status: o.status || null,
+          status_detail: o.status_detail || null,
+          cancel_detail: o.cancel_detail || null,
+          tags: o.tags || null,
+          mediationsRaw: o.mediations || null,
+          shipping_keys: Object.keys(sh),
+          shipping_status: sh.status || null,
+          shipping_substatus: sh.substatus || null,
+          shipping_tags: sh.tags || null,
+          logistic: sh.logistic || sh.logistic_type || null,
+          payments: Array.isArray(o.payments) ? o.payments.map(p => ({ status: p.status, refundedPct: o.total_amount ? Math.round((Number(p.transaction_amount_refunded) || 0) / Number(o.total_amount) * 100) : null })) : null
+        });
+        if (out.length >= 4) break;
+      }
+      if (data.length < lote) break;
+      offset += lote;
+    }
+    res.json({ muestra: out, nota: 'para detectar si el producto volvio al stock' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── SYNC DIARIO: cron job, trae ventas de ayer completas ──────────
 app.get('/api/sync/diario', async (req, res) => {
   const secret = req.headers['x-cron-secret'];
