@@ -645,6 +645,27 @@ app.get('/api/devol/enrich', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── LOOKUP devolucion (TEMPORAL): ver como quedo analizada una venta ──
+// GET /api/devol/ver?user_id=67619515&nro=2000017080396472
+app.get('/api/devol/ver', async (req, res) => {
+  try {
+    const user_id = req.query.user_id;
+    const nros = String(req.query.nro || '2000017080396472,2000017080396318').split(',').map(x => x.trim()).filter(Boolean);
+    if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
+    const out = [];
+    for (const nro of nros) {
+      const { data, error } = await supabase.from('ventas')
+        .select('nro_venta, sku, estado, dev_return, dev_benef, dev_checked, cc:raw->cancel_detail->>code, med:raw->mediations')
+        .eq('user_id', String(user_id)).eq('nro_venta', nro).limit(1);
+      if (error) return res.status(500).json({ error: error.message });
+      const r = data && data[0];
+      if (!r) { out.push({ nro, error: 'no encontrado' }); continue; }
+      out.push({ nro: r.nro_venta, sku: r.sku, estado: r.estado, cancelCode: r.cc, tieneMed: Array.isArray(r.med) && !!r.med.length, dev_return: r.dev_return, dev_benef: r.dev_benef, dev_checked: r.dev_checked });
+    }
+    res.json({ casos: out });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── SYNC DIARIO: cron job, trae ventas de ayer completas ──────────
 app.get('/api/sync/diario', async (req, res) => {
   const secret = req.headers['x-cron-secret'];
