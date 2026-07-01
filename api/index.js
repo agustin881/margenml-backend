@@ -407,7 +407,7 @@ app.get('/api/ventas', requireAuth, async (req, res) => {
     const lote = 1000;
 
     while (true) {
-      let query = supabase.from('ventas').select('nro_venta,user_id,fecha,fecha_cierre,sku,titulo,unidades,precio,comision,costo_envio,precio_comprador_envio,logistic_type,provincia,ciudad,estado,con_cuotas,cuotas,costo_financiero,tipo_publicacion,pack_id,item_id,costo_congelado,cancel_code:raw->cancel_detail->>code,ml_tags:raw->tags').eq('user_id', user_id);
+      let query = supabase.from('ventas').select('nro_venta,user_id,fecha,fecha_cierre,sku,titulo,unidades,precio,comision,costo_envio,precio_comprador_envio,logistic_type,provincia,ciudad,estado,con_cuotas,cuotas,costo_financiero,tipo_publicacion,pack_id,item_id,costo_congelado,cancel_code:raw->cancel_detail->>code,ml_tags:raw->tags,dev_return,dev_benef').eq('user_id', user_id);
       if (desde) query = query.gte('fecha', desde);
       if (hasta) query = query.lte('fecha', hasta);
       query = query.order('fecha', { ascending: false }).range(offset, offset + lote - 1);
@@ -600,6 +600,48 @@ app.get('/api/devol/probe2', async (req, res) => {
       out.push(caso);
     }
     res.json({ casos: out, nota: 'probe2: se-lo-queda (freidora) vs lo-devuelve (silla)' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── DEVOLUCIONES: enriquecer con el reclamo de ML (se lo queda vs lo devuelve) ──
+// GET /api/devol/enrich?user_id=67619515&limit=150  (llamar en loop hasta faltan=0)
+app.get('/api/devol/enrich', async (req, res) => {
+  try {
+    const user_id = req.query.user_id;
+    if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
+    const limit = Math.min(parseInt(req.query.limit) || 150, 300);
+    const token = await getValidToken(user_id);
+    const { data, error } = await supabase.from('ventas')
+      .select('nro_venta, med:raw->mediations')
+      .eq('user_id', String(user_id)).eq('estado', 'cancelled')
+      .filter('raw->cancel_detail->>code', 'eq', 'mediations')
+      .is('dev_checked', null)
+      .limit(limit);
+    if (error) return res.status(500).json({ error: error.message, hint: 'faltan las columnas dev_return/dev_benef/dev_checked?' });
+    let procesados = 0, seQueda = 0, devuelve = 0, aFavor = 0, errores = 0;
+    for (const r of (data || [])) {
+      const med = r.med;
+      const medId = Array.isArray(med) && med[0] && med[0].id;
+      let dev_return = null, dev_benef = null;
+      if (medId) {
+        try {
+          const rc = await fetch('https://api.mercadolibre.com/post-purchase/v1/claims/' + medId, { headers: { Authorization: 'Bearer ' + token } });
+          const jc = await rc.json();
+          const rel = Array.isArray(jc.related_entities) ? jc.related_entities : [];
+          dev_return = rel.indexOf('return') > -1;
+          dev_benef = (jc.resolution && Array.isArray(jc.resolution.benefited) && jc.resolution.benefited[0]) || null;
+          if (dev_benef === 'respondent') aFavor++; else if (dev_return) devuelve++; else seQueda++;
+        } catch (e) { errores++; }
+      } else { errores++; }
+      await supabase.from('ventas').update({ dev_return, dev_benef, dev_checked: new Date().toISOString() }).eq('user_id', String(user_id)).eq('nro_venta', r.nro_venta);
+      procesados++;
+      await new Promise(rs => setTimeout(rs, 110));
+    }
+    const { count: faltan } = await supabase.from('ventas').select('nro_venta', { count: 'exact', head: true })
+      .eq('user_id', String(user_id)).eq('estado', 'cancelled')
+      .filter('raw->cancel_detail->>code', 'eq', 'mediations')
+      .is('dev_checked', null);
+    res.json({ procesados, seQueda, devuelve, aFavor, errores, faltan: faltan == null ? 0 : faltan });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
