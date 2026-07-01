@@ -446,6 +446,49 @@ app.get('/api/ventas', requireAuth, async (req, res) => {
   }
 });
 
+// ── DIAGNOSTICO devoluciones (TEMPORAL): estados reales + reembolsos ──
+// GET /api/ventas/estados?user_id=67619515
+app.get('/api/ventas/estados', async (req, res) => {
+  try {
+    const user_id = req.query.user_id;
+    if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
+    const counts = {};
+    let offset = 0; const lote = 1000;
+    while (true) {
+      const { data, error } = await supabase.from('ventas').select('estado').eq('user_id', String(user_id)).range(offset, offset + lote - 1);
+      if (error) return res.status(500).json({ error: error.message });
+      if (!data || !data.length) break;
+      data.forEach(r => { const e = String(r.estado == null ? '(null)' : r.estado); counts[e] = (counts[e] || 0) + 1; });
+      if (data.length < lote) break;
+      offset += lote; if (offset > 500000) break;
+    }
+    const estados = Object.entries(counts).map(([estado, n]) => ({ estado, n })).sort((a, b) => b.n - a.n);
+    // muestra NO sensible de filas con reembolso (sin nro de orden ni montos absolutos)
+    let muestraRefund = [];
+    try {
+      const { data: rows } = await supabase.from('ventas').select('estado,raw').eq('user_id', String(user_id)).limit(3000);
+      (rows || []).forEach(r => {
+        const o = r.raw || {};
+        let refund = 0;
+        if (Array.isArray(o.payments)) refund = o.payments.reduce((a, p) => a + (Number(p.transaction_amount_refunded) || 0), 0);
+        const total = Number(o.total_amount) || 0;
+        const paidLess = (o.total_amount != null && o.paid_amount != null && Number(o.paid_amount) < total);
+        if (refund > 0 || paidLess) {
+          if (muestraRefund.length < 20) muestraRefund.push({
+            estado: r.estado,
+            statusRaw: o.status || null,
+            refundPct: total ? Math.round((refund / total) * 100) : null,
+            paidPct: (o.paid_amount != null && total) ? Math.round((Number(o.paid_amount) / total) * 100) : null,
+            cancelCode: o.cancel_detail ? (o.cancel_detail.code || o.cancel_detail.group || true) : null,
+            payStatuses: Array.isArray(o.payments) ? [...new Set(o.payments.map(p => p.status))].join(',') : null
+          });
+        }
+      });
+    } catch (e) { muestraRefund = [{ error: e.message }]; }
+    res.json({ estados, muestraRefund, nota: 'diagnostico temporal' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── SYNC DIARIO: cron job, trae ventas de ayer completas ──────────
 app.get('/api/sync/diario', async (req, res) => {
   const secret = req.headers['x-cron-secret'];
