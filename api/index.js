@@ -407,7 +407,7 @@ app.get('/api/ventas', requireAuth, async (req, res) => {
     const lote = 1000;
 
     while (true) {
-      let query = supabase.from('ventas').select('nro_venta,user_id,fecha,fecha_cierre,sku,titulo,unidades,precio,comision,costo_envio,precio_comprador_envio,logistic_type,provincia,ciudad,estado,con_cuotas,cuotas,costo_financiero,tipo_publicacion,pack_id,item_id,costo_congelado').eq('user_id', user_id);
+      let query = supabase.from('ventas').select('nro_venta,user_id,fecha,fecha_cierre,sku,titulo,unidades,precio,comision,costo_envio,precio_comprador_envio,logistic_type,provincia,ciudad,estado,con_cuotas,cuotas,costo_financiero,tipo_publicacion,pack_id,item_id,costo_congelado,cancel_code:raw->cancel_detail->>code').eq('user_id', user_id);
       if (desde) query = query.gte('fecha', desde);
       if (hasta) query = query.lte('fecha', hasta);
       query = query.order('fecha', { ascending: false }).range(offset, offset + lote - 1);
@@ -463,29 +463,24 @@ app.get('/api/ventas/estados', async (req, res) => {
       offset += lote; if (offset > 500000) break;
     }
     const estados = Object.entries(counts).map(([estado, n]) => ({ estado, n })).sort((a, b) => b.n - a.n);
-    // muestra NO sensible de filas con reembolso (sin nro de orden ni montos absolutos)
-    let muestraRefund = [];
+    // histograma de cancel_detail.code entre canceladas (para decidir cuales son devoluciones)
+    let codes = {};
     try {
-      const { data: rows } = await supabase.from('ventas').select('estado,raw').eq('user_id', String(user_id)).limit(3000);
-      (rows || []).forEach(r => {
-        const o = r.raw || {};
-        let refund = 0;
-        if (Array.isArray(o.payments)) refund = o.payments.reduce((a, p) => a + (Number(p.transaction_amount_refunded) || 0), 0);
-        const total = Number(o.total_amount) || 0;
-        const paidLess = (o.total_amount != null && o.paid_amount != null && Number(o.paid_amount) < total);
-        if (refund > 0 || paidLess) {
-          if (muestraRefund.length < 20) muestraRefund.push({
-            estado: r.estado,
-            statusRaw: o.status || null,
-            refundPct: total ? Math.round((refund / total) * 100) : null,
-            paidPct: (o.paid_amount != null && total) ? Math.round((Number(o.paid_amount) / total) * 100) : null,
-            cancelCode: o.cancel_detail ? (o.cancel_detail.code || o.cancel_detail.group || true) : null,
-            payStatuses: Array.isArray(o.payments) ? [...new Set(o.payments.map(p => p.status))].join(',') : null
-          });
-        }
-      });
-    } catch (e) { muestraRefund = [{ error: e.message }]; }
-    res.json({ estados, muestraRefund, nota: 'diagnostico temporal' });
+      let off2 = 0; const lote2 = 1000;
+      while (true) {
+        const { data, error } = await supabase.from('ventas')
+          .select('ccode:raw->cancel_detail->>code, cgrp:raw->cancel_detail->>group')
+          .eq('user_id', String(user_id)).eq('estado', 'cancelled')
+          .range(off2, off2 + lote2 - 1);
+        if (error) { codes = { _error: error.message }; break; }
+        if (!data || !data.length) break;
+        data.forEach(r => { const c = r.ccode || r.cgrp || '(sin code)'; codes[c] = (codes[c] || 0) + 1; });
+        if (data.length < lote2) break;
+        off2 += lote2; if (off2 > 500000) break;
+      }
+    } catch (e) { codes = { _error: e.message }; }
+    const cancelCodes = Object.entries(codes).map(([code, n]) => ({ code, n })).sort((a, b) => (b.n || 0) - (a.n || 0));
+    res.json({ estados, cancelCodes, nota: 'diagnostico temporal' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
