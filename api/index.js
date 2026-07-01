@@ -407,7 +407,7 @@ app.get('/api/ventas', requireAuth, async (req, res) => {
     const lote = 1000;
 
     while (true) {
-      let query = supabase.from('ventas').select('nro_venta,user_id,fecha,fecha_cierre,sku,titulo,unidades,precio,comision,costo_envio,precio_comprador_envio,logistic_type,provincia,ciudad,estado,con_cuotas,cuotas,costo_financiero,tipo_publicacion,pack_id,item_id,costo_congelado,cancel_code:raw->cancel_detail->>code').eq('user_id', user_id);
+      let query = supabase.from('ventas').select('nro_venta,user_id,fecha,fecha_cierre,sku,titulo,unidades,precio,comision,costo_envio,precio_comprador_envio,logistic_type,provincia,ciudad,estado,con_cuotas,cuotas,costo_financiero,tipo_publicacion,pack_id,item_id,costo_congelado,cancel_code:raw->cancel_detail->>code,ml_tags:raw->tags').eq('user_id', user_id);
       if (desde) query = query.gte('fecha', desde);
       if (hasta) query = query.lte('fecha', hasta);
       query = query.order('fecha', { ascending: false }).range(offset, offset + lote - 1);
@@ -523,6 +523,51 @@ app.get('/api/ventas/raw-devol', async (req, res) => {
       offset += lote;
     }
     res.json({ muestra: out, nota: 'para detectar si el producto volvio al stock' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── PROBE devoluciones (TEMPORAL): detectar "se lo queda" vs "lo devuelve" ──
+// GET /api/devol/probe?user_id=67619515
+app.get('/api/devol/probe', async (req, res) => {
+  try {
+    const user_id = req.query.user_id;
+    if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
+    const token = await getValidToken(user_id);
+    const { data } = await supabase.from('ventas')
+      .select('raw').eq('user_id', String(user_id)).eq('estado', 'cancelled')
+      .order('fecha', { ascending: false }).limit(400);
+    const casos = [];
+    for (const r of (data || [])) {
+      const o = r.raw || {};
+      if (!(o.cancel_detail && o.cancel_detail.code === 'mediations')) continue;
+      const shipId = o.shipping && o.shipping.id;
+      const medId = Array.isArray(o.mediations) && o.mediations[0] && o.mediations[0].id;
+      const caso = { fecha: o.date_created ? String(o.date_created).slice(0,10) : null, tieneShip: !!shipId, tieneMed: !!medId, related_orders: o.related_orders || null, probes: {} };
+      if (shipId) {
+        try {
+          const rs = await fetch('https://api.mercadolibre.com/shipments/' + shipId, { headers: { Authorization: 'Bearer ' + token, 'x-format-new': 'true' } });
+          const js = await rs.json();
+          caso.probes.shipment = { http: rs.status, status: js.status, substatus: js.substatus, mode: js.mode, logistic_type: js.logistic_type, return_keys: js.return_details ? Object.keys(js.return_details) : null, hasReturn: !!(js.return_details || js.returns), keys: Object.keys(js || {}) };
+        } catch (e) { caso.probes.shipment = { error: e.message }; }
+      }
+      if (medId) {
+        const urls = [
+          'post-purchase/v1/claims/' + medId,
+          'post-purchase/v1/claims/' + medId + '/returns',
+          'post-purchase/v1/claims/' + medId + '/returns/shipments'
+        ];
+        for (const path of urls) {
+          try {
+            const rc = await fetch('https://api.mercadolibre.com/' + path, { headers: { Authorization: 'Bearer ' + token } });
+            let jc = {}; try { jc = await rc.json(); } catch(e2) {}
+            caso.probes[path.replace('post-purchase/v1/claims/'+medId,'claim')] = { http: rc.status, keys: Array.isArray(jc) ? ('array:' + jc.length) : Object.keys(jc || {}), status: jc && jc.status, type: jc && jc.type, stage: jc && jc.stage };
+          } catch (e) { caso.probes[path] = { error: e.message }; }
+        }
+      }
+      casos.push(caso);
+      if (casos.length >= 3) break;
+    }
+    res.json({ casos, nota: 'probe se-lo-queda vs lo-devuelve' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
