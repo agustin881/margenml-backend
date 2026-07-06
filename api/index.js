@@ -832,7 +832,12 @@ app.get('/api/sync', (req, res) => {
 async function getContabiliumToken() {
   const resp = await fetch('https://rest.contabilium.com/token', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Connection': 'close',
+      'Accept-Encoding': 'identity'
+    },
+    compress: false,
     body: new URLSearchParams({
       grant_type:    'client_credentials',
       client_id:     process.env.CONTABILIUM_CLIENT_ID,
