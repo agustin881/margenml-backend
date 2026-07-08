@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v12-reenvio-deposito', costo_congelado: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v13-roles', costo_congelado: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -16,6 +16,8 @@ const supabase = createClient(
 );
 
 // ── Middleware: exige usuario logueado (token de Supabase) ────────
+// NUEVO v13: ademas del login, carga el ROL del usuario desde mml_roles.
+// Si el email no esta en la tabla, queda como 'operador' (lo mas restrictivo).
 async function requireAuth(req, res, next) {
   try {
     const h = req.headers.authorization || '';
@@ -24,11 +26,35 @@ async function requireAuth(req, res, next) {
     const { data, error } = await supabase.auth.getUser(token);
     if (error || !data || !data.user) return res.status(401).json({ error: 'Sesion invalida' });
     req.authUser = data.user;
+    try {
+      const email = String(data.user.email || '').toLowerCase().trim();
+      const { data: rolRow } = await supabase.from('mml_roles')
+        .select('rol,pestanas').eq('email', email).single();
+      req.rol      = (rolRow && rolRow.rol) || 'operador';
+      req.pestanas = (rolRow && rolRow.pestanas) || null;
+    } catch (e) {
+      req.rol = 'operador';
+      req.pestanas = null;
+    }
     next();
   } catch (e) {
     return res.status(401).json({ error: 'No autorizado' });
   }
 }
+
+// ── Middleware: exige uno de estos roles (usar DESPUES de requireAuth) ──
+// Ejemplo: app.get('/ruta', requireAuth, soloRoles('admin','encargado'), handler)
+function soloRoles(...roles) {
+  return (req, res, next) => {
+    if (roles.includes(req.rol)) return next();
+    return res.status(403).json({ error: 'Sin permiso para esta seccion', rol: req.rol });
+  };
+}
+
+// ── Quien soy: el frontend pregunta el rol para armar el menu ──────
+app.get('/api/mi-rol', requireAuth, (req, res) => {
+  res.json({ email: req.authUser.email, rol: req.rol, pestanas: req.pestanas });
+});
 
 const ML_CLIENT_ID     = process.env.ML_CLIENT_ID;
 const ML_CLIENT_SECRET = process.env.ML_CLIENT_SECRET;
@@ -439,6 +465,12 @@ app.get('/api/ventas', requireAuth, async (req, res) => {
         todas.forEach(v => { v.monto_bonificado = bonifMap[v.nro_venta] || 0; });
       }
     } catch (eb) { console.error('monto_bonificado enrich error:', eb.message); }
+
+    // NUEVO v13: el rol operador NO recibe el costo del producto (dato sensible).
+    // El frontend le esconde la pestaña, y aca el backend lo bloquea de verdad.
+    if (req.rol === 'operador') {
+      todas.forEach(v => { delete v.costo_congelado; });
+    }
 
     res.json({ ventas: todas, total: todas.length });
   } catch (e) {
@@ -921,7 +953,8 @@ app.get('/api/compras/probe', async (req, res) => {
 // ── CONTABILIUM: traer todos los productos con costo ──────────────
 // GET /api/costos/contabilium
 // Devuelve array de { codigo, nombre, costoInterno, iva, precio }
-app.get('/api/costos/contabilium', requireAuth, async (req, res) => {
+// v13: SOLO admin y encargado. El operador recibe 403 aunque pruebe la URL a mano.
+app.get('/api/costos/contabilium', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
   try {
     const token = await getContabiliumToken();
     const pageSize = 50;
@@ -1003,7 +1036,8 @@ app.get('/api/costos/contabilium', requireAuth, async (req, res) => {
 });
 
 // ── CONTABILIUM: buscar producto por SKU ──────────────────────────
-app.get('/api/costos/contabilium/:sku', requireAuth, async (req, res) => {
+// v13: SOLO admin y encargado (devuelve costo interno = dato sensible)
+app.get('/api/costos/contabilium/:sku', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
   try {
     const token = await getContabiliumToken();
     const sku = encodeURIComponent(req.params.sku);
@@ -1027,7 +1061,8 @@ app.get('/api/costos/contabilium/:sku', requireAuth, async (req, res) => {
 // ── BACKFILL HISTÓRICO (TEMPORAL): carga costo_congelado desde el CMV ──
 // Matchea cada venta con el CMV por SKU exacto + precio (c/IVA) + día (±2),
 // y si no, por el precio más cercano del mismo SKU en el mes. Sobreescribe.
-app.post('/api/costos/backfill', requireAuth, async (req, res) => {
+// v13: SOLO admin (modifica costos de toda la base)
+app.post('/api/costos/backfill', requireAuth, soloRoles('admin'), async (req, res) => {
   try {
     const userId = req.body.user_id;
     const filas  = req.body.rows || [];
@@ -1573,6 +1608,6 @@ app.get('/api/envio/diag', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`MargenML backend v3 corriendo en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`MargenML backend v13 (roles) corriendo en puerto ${PORT}`));
 
 module.exports = app;
