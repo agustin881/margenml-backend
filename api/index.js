@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v13-roles', costo_congelado: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v14-usuarios', costo_congelado: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -54,6 +54,81 @@ function soloRoles(...roles) {
 // ── Quien soy: el frontend pregunta el rol para armar el menu ──────
 app.get('/api/mi-rol', requireAuth, (req, res) => {
   res.json({ email: req.authUser.email, rol: req.rol, pestanas: req.pestanas });
+});
+
+// ══ USUARIOS v14 (solo admin): gestion del equipo desde el panel ══
+// Crea el login en Supabase Auth Y la fila de rol en mml_roles de un saque.
+
+// Listar equipo
+app.get('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('mml_roles')
+      .select('email,rol,user_id,creado').order('creado', { ascending: true });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ usuarios: data || [] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Crear usuario (login + rol)
+app.post('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) => {
+  try {
+    const email    = String((req.body && req.body.email) || '').toLowerCase().trim();
+    const password = String((req.body && req.body.password) || '');
+    const rol      = String((req.body && req.body.rol) || 'operador');
+    if (!email || email.indexOf('@') === -1) return res.status(400).json({ error: 'Email invalido' });
+    if (password.length < 6) return res.status(400).json({ error: 'La contrasena debe tener 6 caracteres o mas' });
+    if (['admin','encargado','operador'].indexOf(rol) === -1) return res.status(400).json({ error: 'Rol invalido' });
+
+    const { data: created, error: eAuth } = await supabase.auth.admin.createUser({
+      email, password, email_confirm: true
+    });
+    if (eAuth) return res.status(400).json({ error: 'No se pudo crear el login: ' + eAuth.message });
+    const uid = created && created.user && created.user.id;
+
+    const { error: eRol } = await supabase.from('mml_roles')
+      .upsert({ email, rol, user_id: uid || null }, { onConflict: 'email' });
+    if (eRol) return res.status(500).json({ error: 'Login creado pero fallo el rol: ' + eRol.message });
+
+    res.json({ ok: true, email, rol });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Cambiar rol
+app.put('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) => {
+  try {
+    const email = String((req.body && req.body.email) || '').toLowerCase().trim();
+    const rol   = String((req.body && req.body.rol) || '');
+    if (!email || ['admin','encargado','operador'].indexOf(rol) === -1) return res.status(400).json({ error: 'Datos invalidos' });
+    if (email === String(req.authUser.email || '').toLowerCase() && rol !== 'admin') {
+      return res.status(400).json({ error: 'No podes sacarte el rol admin a vos mismo' });
+    }
+    const { error } = await supabase.from('mml_roles').upsert({ email, rol }, { onConflict: 'email' });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ ok: true, email, rol });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Borrar usuario (rol + login)
+app.delete('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) => {
+  try {
+    const email = String(req.query.email || (req.body && req.body.email) || '').toLowerCase().trim();
+    if (!email) return res.status(400).json({ error: 'Falta email' });
+    if (email === String(req.authUser.email || '').toLowerCase()) {
+      return res.status(400).json({ error: 'No podes borrarte a vos mismo' });
+    }
+    const { data: row } = await supabase.from('mml_roles').select('user_id').eq('email', email).single();
+    let uid = row && row.user_id;
+    if (!uid) {
+      try {
+        const { data: lu } = await supabase.auth.admin.listUsers({ page: 1, perPage: 200 });
+        const u = lu && lu.users && lu.users.find(x => String(x.email || '').toLowerCase() === email);
+        uid = u && u.id;
+      } catch (e2) {}
+    }
+    if (uid) { try { await supabase.auth.admin.deleteUser(uid); } catch (e3) {} }
+    await supabase.from('mml_roles').delete().eq('email', email);
+    res.json({ ok: true, email });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 const ML_CLIENT_ID     = process.env.ML_CLIENT_ID;
@@ -1608,6 +1683,6 @@ app.get('/api/envio/diag', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`MargenML backend v13 (roles) corriendo en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`MargenML backend v14 (usuarios) corriendo en puerto ${PORT}`));
 
 module.exports = app;
