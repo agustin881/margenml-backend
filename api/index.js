@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v20-detalle', costo_congelado: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v21-porcentajes', costo_congelado: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -421,7 +421,7 @@ Tu unico trabajo es interpretar el pedido del usuario y responder SOLO un JSON v
 
 Acciones disponibles:
 - "quitar_descuento": parametros {"sku":"..."} o {"item_id":"MLA..."} -> saca los descuentos de las publicaciones de ese SKU
-- "aplicar_descuento": parametros {"sku" o "item_id", "precio": numero} -> aplica descuento individual dejando ese precio final
+- "aplicar_descuento": parametros {"sku" o "item_id"} mas UNO de estos dos: {"precio": numero} (precio final deseado) o {"porcentaje": numero} (ej "10% de descuento" -> {"porcentaje":10}) -> aplica descuento individual
 - "ver_promos": parametros {"sku" o "item_id"} -> lista las promociones activas
 - "buscar": parametros {"sku":"..."} -> lista las publicaciones de un SKU con precio
 - "multi": parametros {"acciones":[{"accion":"quitar_descuento","parametros":{...}},{"accion":"aplicar_descuento","parametros":{...}}]} -> cuando el usuario pide VARIAS cosas en un mismo mensaje (solo combina quitar_descuento y aplicar_descuento)
@@ -429,7 +429,8 @@ Acciones disponibles:
 
 Reglas:
 - Los SKU de Pontec son codigos tipo OFI210-BL o AIR010-NE: letras+numeros y a veces sufijo de color (NE=negro, BL=blanco, AZ=azul, RO=rojo, GR=gris, VE=verde, MA=marron, CO=cobre). Si el usuario dice "la silla ofi 210 blanca", el SKU es OFI210-BL.
-- Si para aplicar_descuento falta el precio, usa "charla" y pedilo.
+- Si el usuario dice un porcentaje de descuento, mandalo como "porcentaje"; NO le pidas el precio final.
+- Si para aplicar_descuento no hay ni precio ni porcentaje, usa "charla" y pedi uno de los dos.
 - Nunca inventes precios ni SKUs que el usuario no dijo.
 - "respuesta" siempre en espanol rioplatense informal y corta.`;
 
@@ -504,7 +505,8 @@ async function asistenteEjecutar(acc, userId, token) {
           lineas.push((fallo ? 'PARCIAL - ' : 'OK - ') + t + ' (' + partes.join('; ') + ')');
         }
       } else if (acc.accion === 'aplicar_descuento') {
-        const body = { deal_price: Number(p.precio), promotion_type: 'PRICE_DISCOUNT' };
+        const precioFinal = (acc.precios && acc.precios[id] != null) ? Number(acc.precios[id]) : Number(p.precio);
+        const body = { deal_price: precioFinal, promotion_type: 'PRICE_DISCOUNT' };
         const url = `https://api.mercadolibre.com/seller-promotions/items/${id}?app_version=v2`;
         const hdr = { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' };
         let r = await fetch(url, { method: 'POST', headers: hdr, body: JSON.stringify(body) });
@@ -514,7 +516,7 @@ async function asistenteEjecutar(acc, userId, token) {
           try { d1 = await r.json(); } catch (e6) { d1 = {}; }
         }
         lineas.push((r.ok ? 'OK - ' : 'ERROR - ') + t + (r.ok
-          ? ' -> $' + Math.round(Number(p.precio)).toLocaleString()
+          ? ' -> $' + Math.round(precioFinal).toLocaleString()
           : ' (' + ((d1 && (d1.message || d1.error)) || 'ML lo rechazo sin detalle') + ')'));
       } else {
         lineas.push('Accion desconocida: ' + acc.accion);
@@ -582,15 +584,29 @@ app.post('/api/asistente', requireAuth, soloRoles('admin'), async (req, res) => 
       const lineas = []; const listos = [];
       for (const s of subs) {
         const sp = s.parametros || {};
-        if (s.accion === 'aplicar_descuento' && !(Number(sp.precio) > 0)) {
-          return res.json({ respuesta: 'Me falta el precio para "' + (sp.sku || sp.item_id || '?') + '". Pasamelo y armo el plan completo.' });
+        const spct = Number(sp.porcentaje);
+        const sTienePct = spct > 0 && spct < 95;
+        if (s.accion === 'aplicar_descuento' && !(Number(sp.precio) > 0) && !sTienePct) {
+          return res.json({ respuesta: 'Me falta el precio o el porcentaje para "' + (sp.sku || sp.item_id || '?') + '". Pasamelo y armo el plan completo.' });
         }
         const ids = await asistenteResolverItems(sp, userId, token);
         if (!ids.length) { lineas.push('- ' + (sp.sku || sp.item_id || '?') + ': no encontre publicaciones (la salteo)'); continue; }
         const mini = await itemsMini(ids, token);
-        const tt = ids.map(id => (mini[id] && mini[id].title) ? mini[id].title.slice(0, 38) : id).join(' | ');
-        lineas.push('- ' + (s.accion === 'quitar_descuento' ? 'QUITAR descuentos' : 'Descuento a $' + Math.round(Number(sp.precio)).toLocaleString()) + ' en ' + ids.length + ' pub: ' + tt);
-        listos.push({ accion: s.accion, parametros: sp, items: ids });
+        let sPrecios = null;
+        let idsUsar = ids;
+        if (s.accion === 'aplicar_descuento' && sTienePct) {
+          sPrecios = {}; idsUsar = [];
+          for (const id of ids) {
+            const base = (mini[id] && mini[id].price) || 0;
+            if (base > 0) { sPrecios[id] = Math.round(base * (1 - spct / 100)); idsUsar.push(id); }
+          }
+          if (!idsUsar.length) { lineas.push('- ' + (sp.sku || '?') + ': sin precios visibles (la salteo)'); continue; }
+        }
+        const tt = idsUsar.map(id => (mini[id] && mini[id].title) ? mini[id].title.slice(0, 38) : id).join(' | ');
+        lineas.push('- ' + (s.accion === 'quitar_descuento' ? 'QUITAR descuentos'
+          : (sTienePct ? 'Descuento ' + spct + '%' : 'Descuento a $' + Math.round(Number(sp.precio)).toLocaleString()))
+          + ' en ' + idsUsar.length + ' pub: ' + tt);
+        listos.push({ accion: s.accion, parametros: sp, items: idsUsar, precios: sPrecios });
       }
       if (!listos.length) return res.json({ respuesta: 'No encontre publicaciones para ninguna de las ordenes:\n' + lineas.join('\n') });
       return res.json({
@@ -599,12 +615,35 @@ app.post('/api/asistente', requireAuth, soloRoles('admin'), async (req, res) => 
       });
     }
     if (j.accion === 'quitar_descuento' || j.accion === 'aplicar_descuento') {
-      if (j.accion === 'aplicar_descuento' && !(Number(p.precio) > 0)) {
-        return res.json({ respuesta: j.respuesta || 'A que precio lo dejo? Pasame el numero.' });
+      const pct = Number(p.porcentaje);
+      const tienePct = pct > 0 && pct < 95;
+      if (j.accion === 'aplicar_descuento' && !(Number(p.precio) > 0) && !tienePct) {
+        return res.json({ respuesta: j.respuesta || 'Decime el precio final o el porcentaje de descuento.' });
       }
       const ids = await asistenteResolverItems(p, userId, token);
       if (!ids.length) return res.json({ respuesta: 'No encontre publicaciones activas para "' + (p.sku || p.item_id || '?') + '". Revisa el SKU.' });
       const mini = await itemsMini(ids, token);
+
+      if (j.accion === 'aplicar_descuento' && tienePct) {
+        const precios = {};
+        const okIds = [];
+        const lineasP = [];
+        for (const id of ids) {
+          const base = (mini[id] && mini[id].price) || 0;
+          const tt = (mini[id] && mini[id].title) ? mini[id].title.slice(0, 42) : id;
+          if (!(base > 0)) { lineasP.push('- ' + tt + ': sin precio visible, la salteo'); continue; }
+          const fin = Math.round(base * (1 - pct / 100));
+          precios[id] = fin;
+          okIds.push(id);
+          lineasP.push('- ' + tt + ': $' + Math.round(base).toLocaleString() + ' -> $' + fin.toLocaleString());
+        }
+        if (!okIds.length) return res.json({ respuesta: 'No pude leer los precios actuales para calcular el ' + pct + '%.' });
+        return res.json({
+          respuesta: 'Voy a aplicar ' + pct + '% de descuento en ' + okIds.length + ' publicacion(es):\n' + lineasP.join('\n'),
+          pendiente: { accion: j.accion, parametros: p, items: okIds, precios }
+        });
+      }
+
       const lista = ids.map(id => '- ' + ((mini[id] && mini[id].title) ? mini[id].title.slice(0, 48) : id)).join('\n');
       const desc = j.accion === 'quitar_descuento'
         ? 'Voy a QUITAR los descuentos de ' + ids.length + ' publicacion(es):'
@@ -2179,6 +2218,6 @@ app.get('/api/envio/diag', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`MargenML backend v20 (detalle) corriendo en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`MargenML backend v21 (porcentajes) corriendo en puerto ${PORT}`));
 
 module.exports = app;
