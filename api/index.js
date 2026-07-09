@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v14-usuarios', costo_congelado: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v15-promos', costo_congelado: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -63,7 +63,7 @@ app.get('/api/mi-rol', requireAuth, (req, res) => {
 app.get('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) => {
   try {
     const { data, error } = await supabase.from('mml_roles')
-      .select('email,rol,user_id,creado').order('creado', { ascending: true });
+      .select('email,rol,pestanas,user_id,creado').order('creado', { ascending: true });
     if (error) return res.status(500).json({ error: error.message });
     res.json({ usuarios: data || [] });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -102,7 +102,15 @@ app.put('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) => {
     if (email === String(req.authUser.email || '').toLowerCase() && rol !== 'admin') {
       return res.status(400).json({ error: 'No podes sacarte el rol admin a vos mismo' });
     }
-    const { error } = await supabase.from('mml_roles').upsert({ email, rol }, { onConflict: 'email' });
+    const upd = { email, rol };
+    if (req.body && ('pestanas' in req.body)) {
+      const p = req.body.pestanas;
+      const permitidas = ['resumen','ventas','graficos','top','alertas','reclamo','promos','config','usuarios'];
+      if (p === null) upd.pestanas = null;
+      else if (Array.isArray(p)) upd.pestanas = p.filter(x => permitidas.indexOf(String(x)) > -1);
+      else return res.status(400).json({ error: 'pestanas debe ser lista o null' });
+    }
+    const { error } = await supabase.from('mml_roles').upsert(upd, { onConflict: 'email' });
     if (error) return res.status(500).json({ error: error.message });
     res.json({ ok: true, email, rol });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -128,6 +136,136 @@ app.delete('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) =>
     if (uid) { try { await supabase.auth.admin.deleteUser(uid); } catch (e3) {} }
     await supabase.from('mml_roles').delete().eq('email', email);
     res.json({ ok: true, email });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══ PROMOCIONES v15: central de descuentos de ML ═══════════════════
+// Lectura: admin y encargado. Aplicar/quitar: SOLO admin.
+
+// Campañas y promos disponibles del vendedor
+app.get('/api/promos', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
+  try {
+    const userId = req.query.user_id || '67619515';
+    const token = await getValidToken(userId);
+    if (!token) return res.status(400).json({ error: 'Sin token ML' });
+    const r = await fetch(`https://api.mercadolibre.com/seller-promotions/users/${userId}?app_version=v2`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    const d = await r.json();
+    res.status(r.status).json(d);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Items de una promo (candidatos + activos)
+app.get('/api/promos/items', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
+  try {
+    const userId = req.query.user_id || '67619515';
+    const { promotion_id, promotion_type } = req.query;
+    if (!promotion_id || !promotion_type) return res.status(400).json({ error: 'Faltan promotion_id y promotion_type' });
+    const token = await getValidToken(userId);
+    if (!token) return res.status(400).json({ error: 'Sin token ML' });
+    let url = `https://api.mercadolibre.com/seller-promotions/promotions/${encodeURIComponent(promotion_id)}/items`
+      + `?promotion_type=${encodeURIComponent(promotion_type)}&app_version=v2&limit=${Math.min(parseInt(req.query.limit) || 50, 50)}`;
+    if (req.query.offset)       url += `&offset=${encodeURIComponent(req.query.offset)}`;
+    if (req.query.search_after) url += `&search_after=${encodeURIComponent(req.query.search_after)}`;
+    if (req.query.status_item)  url += `&status_item=${encodeURIComponent(req.query.status_item)}`;
+    const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    const d = await r.json();
+    res.status(r.status).json(d);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Titulos + SKU + precio de items (para mostrar lindo y cruzar con costos)
+app.get('/api/promos/titulos', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
+  try {
+    const userId = req.query.user_id || '67619515';
+    const ids = String(req.query.ids || '').split(',').map(s => s.trim()).filter(Boolean);
+    if (!ids.length) return res.json({});
+    const token = await getValidToken(userId);
+    if (!token) return res.status(400).json({ error: 'Sin token ML' });
+    const out = {};
+    for (let i = 0; i < ids.length; i += 20) {
+      const chunk = ids.slice(i, i + 20);
+      const url = 'https://api.mercadolibre.com/items?ids=' + chunk.join(',')
+        + '&attributes=id,title,price,seller_sku,seller_custom_field,available_quantity';
+      try {
+        const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+        const arr = await r.json();
+        (Array.isArray(arr) ? arr : []).forEach(row => {
+          const b = row && row.body;
+          if (b && b.id) out[b.id] = {
+            title: b.title || '',
+            sku: String(b.seller_sku || b.seller_custom_field || '').trim().toUpperCase(),
+            price: b.price || 0,
+            stock: b.available_quantity != null ? b.available_quantity : null
+          };
+        });
+      } catch (e2) {}
+    }
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Promos activas de UN item
+app.get('/api/promos/item/:item_id', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
+  try {
+    const userId = req.query.user_id || '67619515';
+    const token = await getValidToken(userId);
+    if (!token) return res.status(400).json({ error: 'Sin token ML' });
+    const r = await fetch(`https://api.mercadolibre.com/seller-promotions/items/${encodeURIComponent(req.params.item_id)}?app_version=v2`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    const d = await r.json();
+    res.status(r.status).json(d);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Aplicar oferta a un item (campaña o descuento individual PRICE_DISCOUNT)
+app.post('/api/promos/aplicar', requireAuth, soloRoles('admin'), async (req, res) => {
+  try {
+    const userId = (req.body && req.body.user_id) || '67619515';
+    const itemId = req.body && req.body.item_id;
+    if (!itemId) return res.status(400).json({ error: 'Falta item_id' });
+    const token = await getValidToken(userId);
+    if (!token) return res.status(400).json({ error: 'Sin token ML' });
+
+    const body = {};
+    if (req.body.deal_price != null)     body.deal_price = Number(req.body.deal_price);
+    if (req.body.top_deal_price != null) body.top_deal_price = Number(req.body.top_deal_price);
+    if (req.body.promotion_id)           body.promotion_id = String(req.body.promotion_id);
+    if (req.body.promotion_type)         body.promotion_type = String(req.body.promotion_type);
+
+    const url = `https://api.mercadolibre.com/seller-promotions/items/${encodeURIComponent(itemId)}?app_version=v2`;
+    const hdr = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+
+    // POST crea la oferta; si ya existia, ML devuelve error -> probamos PUT (editar)
+    let r = await fetch(url, { method: 'POST', headers: hdr, body: JSON.stringify(body) });
+    let d; try { d = await r.json(); } catch (e2) { d = {}; }
+    if (!r.ok) {
+      const r2 = await fetch(url, { method: 'PUT', headers: hdr, body: JSON.stringify(body) });
+      let d2; try { d2 = await r2.json(); } catch (e3) { d2 = {}; }
+      if (r2.ok) return res.status(r2.status).json(d2);
+      return res.status(r.status).json({ error: (d && (d.message || d.error)) || 'ML rechazo la oferta', detalle: d, detalle_put: d2 });
+    }
+    res.status(r.status).json(d);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Quitar oferta(s) de un item. Con promotion_type+promotion_id saca ESA;
+// sin parametros saca TODAS las que se puedan (delete masivo de ML).
+app.delete('/api/promos/quitar', requireAuth, soloRoles('admin'), async (req, res) => {
+  try {
+    const userId = req.query.user_id || '67619515';
+    const itemId = req.query.item_id;
+    if (!itemId) return res.status(400).json({ error: 'Falta item_id' });
+    const token = await getValidToken(userId);
+    if (!token) return res.status(400).json({ error: 'Sin token ML' });
+    let url = `https://api.mercadolibre.com/seller-promotions/items/${encodeURIComponent(itemId)}?app_version=v2`;
+    if (req.query.promotion_type) url += `&promotion_type=${encodeURIComponent(req.query.promotion_type)}`;
+    if (req.query.promotion_id)   url += `&promotion_id=${encodeURIComponent(req.query.promotion_id)}`;
+    const r = await fetch(url, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
+    let d; try { d = await r.json(); } catch (e2) { d = { ok: r.ok }; }
+    res.status(r.status).json(d);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1683,6 +1821,6 @@ app.get('/api/envio/diag', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`MargenML backend v14 (usuarios) corriendo en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`MargenML backend v15 (promos) corriendo en puerto ${PORT}`));
 
 module.exports = app;
