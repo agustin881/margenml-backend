@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v18-asistente', costo_congelado: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v19-multi', costo_congelado: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -424,6 +424,7 @@ Acciones disponibles:
 - "aplicar_descuento": parametros {"sku" o "item_id", "precio": numero} -> aplica descuento individual dejando ese precio final
 - "ver_promos": parametros {"sku" o "item_id"} -> lista las promociones activas
 - "buscar": parametros {"sku":"..."} -> lista las publicaciones de un SKU con precio
+- "multi": parametros {"acciones":[{"accion":"quitar_descuento","parametros":{...}},{"accion":"aplicar_descuento","parametros":{...}}]} -> cuando el usuario pide VARIAS cosas en un mismo mensaje (solo combina quitar_descuento y aplicar_descuento)
 - "charla": sin parametros -> saludos, dudas, o cuando falta un dato; lo que quieras decir va en "respuesta"
 
 Reglas:
@@ -512,8 +513,10 @@ async function asistenteVerPromos(p, userId, token) {
       });
       const d = await r.json();
       const arr = Array.isArray(d) ? d : (d.results || []);
+      const activas = arr.filter(x => x.status === 'started' || x.status === 'active');
+      const cand = arr.length - activas.length;
       if (!arr.length) lineas.push(t + ': sin promociones');
-      else lineas.push(t + ': ' + arr.map(x => (x.type || '?') + (x.status ? ' (' + x.status + ')' : '')).join(', '));
+      else lineas.push(t + ': ' + (activas.length ? 'ACTIVA: ' + activas.map(x => x.type).join(', ') : 'sin promos activas') + (cand ? ' (+' + cand + ' campana/s disponibles sin aplicar)' : ''));
     } catch (e) { lineas.push(t + ': error al consultar'); }
   }
   return lineas.join('\n');
@@ -528,6 +531,14 @@ app.post('/api/asistente', requireAuth, soloRoles('admin'), async (req, res) => 
     // Boton Confirmar: ejecuta la accion pendiente tal cual se mostro
     const conf = req.body && req.body.confirmar;
     if (conf && conf.accion) {
+      if (conf.accion === 'multi' && Array.isArray(conf.acciones)) {
+        const partes = [];
+        for (const sub of conf.acciones) {
+          const out = await asistenteEjecutar(sub, userId, token);
+          partes.push(out.texto);
+        }
+        return res.json({ respuesta: partes.join('\n') });
+      }
       const out = await asistenteEjecutar(conf, userId, token);
       return res.json({ respuesta: out.texto });
     }
@@ -540,6 +551,28 @@ app.post('/api/asistente', requireAuth, soloRoles('admin'), async (req, res) => 
     const j = llm.json || {};
     const p = j.parametros || {};
 
+    if (j.accion === 'multi') {
+      const subs = ((p.acciones || j.acciones || [])).filter(s => s && (s.accion === 'quitar_descuento' || s.accion === 'aplicar_descuento'));
+      if (!subs.length) return res.json({ respuesta: j.respuesta || 'No entendi la lista de ordenes, proba de a una.' });
+      const lineas = []; const listos = [];
+      for (const s of subs) {
+        const sp = s.parametros || {};
+        if (s.accion === 'aplicar_descuento' && !(Number(sp.precio) > 0)) {
+          return res.json({ respuesta: 'Me falta el precio para "' + (sp.sku || sp.item_id || '?') + '". Pasamelo y armo el plan completo.' });
+        }
+        const ids = await asistenteResolverItems(sp, userId, token);
+        if (!ids.length) { lineas.push('- ' + (sp.sku || sp.item_id || '?') + ': no encontre publicaciones (la salteo)'); continue; }
+        const mini = await itemsMini(ids, token);
+        const tt = ids.map(id => (mini[id] && mini[id].title) ? mini[id].title.slice(0, 38) : id).join(' | ');
+        lineas.push('- ' + (s.accion === 'quitar_descuento' ? 'QUITAR descuentos' : 'Descuento a $' + Math.round(Number(sp.precio)).toLocaleString()) + ' en ' + ids.length + ' pub: ' + tt);
+        listos.push({ accion: s.accion, parametros: sp, items: ids });
+      }
+      if (!listos.length) return res.json({ respuesta: 'No encontre publicaciones para ninguna de las ordenes:\n' + lineas.join('\n') });
+      return res.json({
+        respuesta: 'Plan (' + listos.length + ' orden/es):\n' + lineas.join('\n'),
+        pendiente: { accion: 'multi', acciones: listos }
+      });
+    }
     if (j.accion === 'quitar_descuento' || j.accion === 'aplicar_descuento') {
       if (j.accion === 'aplicar_descuento' && !(Number(p.precio) > 0)) {
         return res.json({ respuesta: j.respuesta || 'A que precio lo dejo? Pasame el numero.' });
@@ -2121,6 +2154,6 @@ app.get('/api/envio/diag', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`MargenML backend v18 (asistente) corriendo en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`MargenML backend v19 (multi) corriendo en puerto ${PORT}`));
 
 module.exports = app;
