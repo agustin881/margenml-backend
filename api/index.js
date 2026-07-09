@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v22-fechas', costo_congelado: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v23-respondia', costo_congelado: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -114,7 +114,7 @@ app.put('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) => {
     }
     if (req.body && ('apps' in req.body)) {
       const a = req.body.apps;
-      const appsOk = ['rentabilidad','logistica','promos','asistente'];
+      const appsOk = ['rentabilidad','logistica','promos','respondia','asistente'];
       if (a === null) upd.apps = null;
       else if (Array.isArray(a)) upd.apps = a.filter(x => appsOk.indexOf(String(x)) > -1);
       else return res.status(400).json({ error: 'apps debe ser lista o null' });
@@ -2230,6 +2230,6 @@ app.get('/api/envio/diag', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`MargenML backend v22 (fechas) corriendo en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`MargenML backend v23 (respondia) corriendo en puerto ${PORT}`));
 
 module.exports = app;
