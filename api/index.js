@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v16-hub', costo_congelado: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v18-asistente', costo_congelado: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -275,6 +275,297 @@ app.delete('/api/promos/quitar', requireAuth, soloRoles('admin'), async (req, re
     const r = await fetch(url, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
     let d; try { d = await r.json(); } catch (e2) { d = { ok: r.ok }; }
     res.status(r.status).json(d);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══ ANALIZADOR v17: cruza campañas de ML contra costos Contabilium ══
+// Cache de costos en memoria (6 hs): la primera corrida tarda ~1 min
+// porque recorre todo Contabilium; las siguientes son instantaneas.
+var _contaMapaCache = { ts: 0, mapa: null };
+async function contabiliumMapaCostos() {
+  const ahora = Date.now();
+  if (_contaMapaCache.mapa && (ahora - _contaMapaCache.ts) < 6 * 60 * 60 * 1000) return _contaMapaCache.mapa;
+  const token = await getContabiliumToken();
+  const pageSize = 50;
+  const base = 'https://rest.contabilium.com/api/conceptos/search';
+  const PAUSA = 500;
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const getPage = async (param, n) => {
+    const r = await fetch(`${base}?pageSize=${pageSize}&${param}=${n}`, { headers: { Authorization: `Bearer ${token}` } });
+    return r.json();
+  };
+  const primerCod = d => { const it = (d && (d.Items || d.items)) || []; return it.length ? String(it[0].Codigo || it[0].codigo || '').toUpperCase().trim() : ''; };
+  const mapa = {};
+  const add = d => {
+    const it = (d && (d.Items || d.items)) || [];
+    let n = 0;
+    for (const x of it) {
+      const c = String(x.Codigo || x.codigo || '').toUpperCase().trim();
+      if (c && !(c in mapa)) { mapa[c] = Number(x.CostoInterno || x.costoInterno || 0); n++; }
+    }
+    return { n, len: it.length };
+  };
+  const d1 = await getPage('pageNumber', 1);
+  const cod1 = primerCod(d1);
+  add(d1);
+  let pageParam = null;
+  for (const cand of ['pageNumber', 'page', 'nroPagina', 'pagina', 'nroPag', 'pageIndex']) {
+    await sleep(PAUSA);
+    const d2 = await getPage(cand, 2);
+    const cod2 = primerCod(d2);
+    if (cod2 && cod2 !== cod1) { pageParam = cand; add(d2); break; }
+  }
+  if (pageParam) {
+    let page = 3;
+    while (true) {
+      await sleep(PAUSA);
+      const d = await getPage(pageParam, page);
+      const { n, len } = add(d);
+      if (len === 0 || n === 0 || len < pageSize) break;
+      page++;
+      if (page > 500) break;
+    }
+  }
+  _contaMapaCache = { ts: Date.now(), mapa };
+  console.log('[ANALISIS] costos Contabilium en cache:', Object.keys(mapa).length);
+  return mapa;
+}
+
+// Titulo + SKU de items en lotes de 20
+async function itemsMini(ids, token) {
+  const out = {};
+  for (let i = 0; i < ids.length; i += 20) {
+    const chunk = ids.slice(i, i + 20);
+    try {
+      const r = await fetch('https://api.mercadolibre.com/items?ids=' + chunk.join(',') + '&attributes=id,title,price,seller_sku,seller_custom_field', {
+        headers: { Authorization: 'Bearer ' + token }
+      });
+      const arr = await r.json();
+      (Array.isArray(arr) ? arr : []).forEach(row => {
+        const b = row && row.body;
+        if (b && b.id) out[b.id] = { title: b.title || '', price: b.price || 0, sku: String(b.seller_sku || b.seller_custom_field || '').trim().toUpperCase() };
+      });
+    } catch (e) {}
+    await new Promise(r => setTimeout(r, 120));
+  }
+  return out;
+}
+
+// GET /api/promos/analisis -> recorre TODAS las campañas y devuelve
+// cada item con precio actual, sugerido de ML y costo de Contabilium.
+app.get('/api/promos/analisis', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
+  try {
+    const userId = req.query.user_id || '67619515';
+    const maxPag = Math.min(parseInt(req.query.max_paginas) || 4, 10);
+    const token = await getValidToken(userId);
+    if (!token) return res.status(400).json({ error: 'Sin token ML' });
+
+    const rc = await fetch(`https://api.mercadolibre.com/seller-promotions/users/${userId}?app_version=v2`, {
+      headers: { Authorization: 'Bearer ' + token }
+    });
+    const dc = await rc.json();
+    const campanas = (dc.results || []).filter(p => p && p.id && p.type);
+
+    const filas = [];
+    let campOk = 0;
+    for (const p of campanas) {
+      try {
+        for (let pag = 0; pag < maxPag; pag++) {
+          const url = `https://api.mercadolibre.com/seller-promotions/promotions/${encodeURIComponent(p.id)}/items`
+            + `?promotion_type=${encodeURIComponent(p.type)}&app_version=v2&limit=50&offset=${pag * 50}`;
+          const r = await fetch(url, { headers: { Authorization: 'Bearer ' + token } });
+          const d = await r.json();
+          const items = d.results || d.items || [];
+          for (const it of items) {
+            filas.push({
+              item_id: it.id, campana: p.name || p.id, tipo: p.type, promo_id: p.id,
+              estado: it.status || '',
+              precio_actual: it.original_price || it.price || 0,
+              sugerido: it.suggested_discounted_price || null,
+              minimo: it.min_discounted_price || null,
+              maximo: it.max_discounted_price || null
+            });
+            if (filas.length >= 1500) break;
+          }
+          if (items.length < 50 || filas.length >= 1500) break;
+          await new Promise(r => setTimeout(r, 150));
+        }
+        campOk++;
+      } catch (e) { console.error('[ANALISIS] campana', p.id, e.message); }
+      if (filas.length >= 1500) break;
+    }
+
+    const ids = [...new Set(filas.map(f => f.item_id).filter(Boolean))];
+    const mini = await itemsMini(ids, token);
+    const mapa = await contabiliumMapaCostos();
+    let sinCosto = 0;
+    for (const f of filas) {
+      const m = mini[f.item_id] || {};
+      f.titulo = m.title || '';
+      f.sku = m.sku || '';
+      f.costo = (f.sku && (f.sku in mapa) && mapa[f.sku] > 0) ? mapa[f.sku] : null;
+      if (f.costo == null) sinCosto++;
+    }
+
+    console.log(`[ANALISIS] ${campOk} campanas, ${filas.length} items, ${sinCosto} sin costo`);
+    res.json({ filas, campanas: campOk, items: filas.length, sin_costo: sinCosto });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══ ASISTENTE v18: ordenes en lenguaje natural ═════════════════════
+// Interpreta con Claude (ANTHROPIC_API_KEY en Railway), muestra que va
+// a tocar, y SOLO ejecuta cuando el usuario confirma con el boton.
+const ASISTENTE_SYS = `Sos el Asistente de Pontec OS, el sistema interno de PONTEC SA (vendedor grande de MercadoLibre Argentina).
+Tu unico trabajo es interpretar el pedido del usuario y responder SOLO un JSON valido, sin markdown ni texto extra, con esta forma:
+{"accion":"...","parametros":{...},"respuesta":"texto corto para el usuario"}
+
+Acciones disponibles:
+- "quitar_descuento": parametros {"sku":"..."} o {"item_id":"MLA..."} -> saca los descuentos de las publicaciones de ese SKU
+- "aplicar_descuento": parametros {"sku" o "item_id", "precio": numero} -> aplica descuento individual dejando ese precio final
+- "ver_promos": parametros {"sku" o "item_id"} -> lista las promociones activas
+- "buscar": parametros {"sku":"..."} -> lista las publicaciones de un SKU con precio
+- "charla": sin parametros -> saludos, dudas, o cuando falta un dato; lo que quieras decir va en "respuesta"
+
+Reglas:
+- Los SKU de Pontec son codigos tipo OFI210-BL o AIR010-NE: letras+numeros y a veces sufijo de color (NE=negro, BL=blanco, AZ=azul, RO=rojo, GR=gris, VE=verde, MA=marron, CO=cobre). Si el usuario dice "la silla ofi 210 blanca", el SKU es OFI210-BL.
+- Si para aplicar_descuento falta el precio, usa "charla" y pedilo.
+- Nunca inventes precios ni SKUs que el usuario no dijo.
+- "respuesta" siempre en espanol rioplatense informal y corta.`;
+
+async function asistenteLLM(mensajes) {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) return { error: 'Falta la variable ANTHROPIC_API_KEY en Railway' };
+  const model = process.env.ASISTENTE_MODEL || 'claude-sonnet-4-6';
+  const r = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model, max_tokens: 700, system: ASISTENTE_SYS,
+      messages: mensajes.map(m => ({ role: m.rol === 'user' ? 'user' : 'assistant', content: String(m.texto || '').slice(0, 2000) }))
+    })
+  });
+  const d = await r.json();
+  if (d.error) return { error: 'Anthropic: ' + (d.error.message || JSON.stringify(d.error)) };
+  const txt = (d.content || []).map(c => c.text || '').join('').replace(/```json|```/g, '').trim();
+  try { return { json: JSON.parse(txt) }; }
+  catch (e) { return { json: { accion: 'charla', respuesta: txt || 'No te entendi, proba de nuevo.' } }; }
+}
+
+async function asistenteResolverItems(p, userId, token) {
+  if (p.item_id) return [String(p.item_id).toUpperCase().trim()];
+  const sku = String(p.sku || '').toUpperCase().trim();
+  if (!sku) return [];
+  for (const param of ['seller_sku', 'sku']) {
+    try {
+      const r = await fetch(`https://api.mercadolibre.com/users/${userId}/items/search?${param}=${encodeURIComponent(sku)}&status=active`, {
+        headers: { Authorization: 'Bearer ' + token }
+      });
+      const d = await r.json();
+      if (Array.isArray(d.results) && d.results.length) return d.results.slice(0, 20);
+    } catch (e) {}
+  }
+  return [];
+}
+
+async function asistenteEjecutar(acc, userId, token) {
+  const p = acc.parametros || {};
+  const ids = Array.isArray(acc.items) && acc.items.length ? acc.items : await asistenteResolverItems(p, userId, token);
+  if (!ids.length) return { texto: 'No encontre publicaciones para ese SKU/item.' };
+  const mini = await itemsMini(ids, token);
+  const lineas = [];
+  for (const id of ids) {
+    const t = (mini[id] && mini[id].title) ? mini[id].title.slice(0, 42) : id;
+    try {
+      if (acc.accion === 'quitar_descuento') {
+        const r = await fetch(`https://api.mercadolibre.com/seller-promotions/items/${id}?app_version=v2`, {
+          method: 'DELETE', headers: { Authorization: 'Bearer ' + token }
+        });
+        let d; try { d = await r.json(); } catch (e2) { d = {}; }
+        const oks = (d.successful_ids || []).length;
+        lineas.push((r.ok ? 'OK - ' : 'ERROR - ') + t + (oks ? ' (' + oks + ' oferta/s quitada/s)' : (r.ok ? ' (no tenia ofertas activas)' : '')));
+      } else if (acc.accion === 'aplicar_descuento') {
+        const body = { deal_price: Number(p.precio), promotion_type: 'PRICE_DISCOUNT' };
+        const url = `https://api.mercadolibre.com/seller-promotions/items/${id}?app_version=v2`;
+        const hdr = { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' };
+        let r = await fetch(url, { method: 'POST', headers: hdr, body: JSON.stringify(body) });
+        if (!r.ok) r = await fetch(url, { method: 'PUT', headers: hdr, body: JSON.stringify(body) });
+        lineas.push((r.ok ? 'OK - ' : 'ERROR - ') + t + (r.ok ? ' -> $' + Math.round(Number(p.precio)).toLocaleString() : ''));
+      } else {
+        lineas.push('Accion desconocida: ' + acc.accion);
+      }
+    } catch (e) { lineas.push('ERROR - ' + t + ': ' + e.message); }
+    await new Promise(rs => setTimeout(rs, 200));
+  }
+  return { texto: lineas.join('\n') };
+}
+
+async function asistenteVerPromos(p, userId, token) {
+  const ids = await asistenteResolverItems(p, userId, token);
+  if (!ids.length) return 'No encontre publicaciones para ese SKU/item.';
+  const mini = await itemsMini(ids, token);
+  const lineas = [];
+  for (const id of ids.slice(0, 10)) {
+    const t = (mini[id] && mini[id].title) ? mini[id].title.slice(0, 42) : id;
+    try {
+      const r = await fetch(`https://api.mercadolibre.com/seller-promotions/items/${id}?app_version=v2`, {
+        headers: { Authorization: 'Bearer ' + token }
+      });
+      const d = await r.json();
+      const arr = Array.isArray(d) ? d : (d.results || []);
+      if (!arr.length) lineas.push(t + ': sin promociones');
+      else lineas.push(t + ': ' + arr.map(x => (x.type || '?') + (x.status ? ' (' + x.status + ')' : '')).join(', '));
+    } catch (e) { lineas.push(t + ': error al consultar'); }
+  }
+  return lineas.join('\n');
+}
+
+app.post('/api/asistente', requireAuth, soloRoles('admin'), async (req, res) => {
+  try {
+    const userId = (req.body && req.body.user_id) || '67619515';
+    const token = await getValidToken(userId);
+    if (!token) return res.status(400).json({ error: 'Sin token ML' });
+
+    // Boton Confirmar: ejecuta la accion pendiente tal cual se mostro
+    const conf = req.body && req.body.confirmar;
+    if (conf && conf.accion) {
+      const out = await asistenteEjecutar(conf, userId, token);
+      return res.json({ respuesta: out.texto });
+    }
+
+    const mensajes = (req.body && req.body.mensajes) || [];
+    if (!mensajes.length) return res.status(400).json({ error: 'Faltan mensajes' });
+
+    const llm = await asistenteLLM(mensajes.slice(-12));
+    if (llm.error) return res.status(500).json({ error: llm.error });
+    const j = llm.json || {};
+    const p = j.parametros || {};
+
+    if (j.accion === 'quitar_descuento' || j.accion === 'aplicar_descuento') {
+      if (j.accion === 'aplicar_descuento' && !(Number(p.precio) > 0)) {
+        return res.json({ respuesta: j.respuesta || 'A que precio lo dejo? Pasame el numero.' });
+      }
+      const ids = await asistenteResolverItems(p, userId, token);
+      if (!ids.length) return res.json({ respuesta: 'No encontre publicaciones activas para "' + (p.sku || p.item_id || '?') + '". Revisa el SKU.' });
+      const mini = await itemsMini(ids, token);
+      const lista = ids.map(id => '- ' + ((mini[id] && mini[id].title) ? mini[id].title.slice(0, 48) : id)).join('\n');
+      const desc = j.accion === 'quitar_descuento'
+        ? 'Voy a QUITAR los descuentos de ' + ids.length + ' publicacion(es):'
+        : 'Voy a aplicar descuento dejando el precio en $' + Math.round(Number(p.precio)).toLocaleString() + ' en ' + ids.length + ' publicacion(es):';
+      return res.json({
+        respuesta: desc + '\n' + lista,
+        pendiente: { accion: j.accion, parametros: p, items: ids }
+      });
+    }
+    if (j.accion === 'ver_promos') {
+      return res.json({ respuesta: await asistenteVerPromos(p, userId, token) });
+    }
+    if (j.accion === 'buscar') {
+      const ids = await asistenteResolverItems(p, userId, token);
+      if (!ids.length) return res.json({ respuesta: 'No encontre publicaciones para ese SKU.' });
+      const mini = await itemsMini(ids, token);
+      return res.json({ respuesta: ids.map(id => '- ' + id + ': ' + (((mini[id] && mini[id].title) || '').slice(0, 50)) + ((mini[id] && mini[id].price) ? ' ($' + Math.round(mini[id].price).toLocaleString() + ')' : '')).join('\n') });
+    }
+    return res.json({ respuesta: j.respuesta || 'Decime que necesitas hacer.' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1830,6 +2121,6 @@ app.get('/api/envio/diag', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`MargenML backend v16 (hub) corriendo en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`MargenML backend v18 (asistente) corriendo en puerto ${PORT}`));
 
 module.exports = app;
