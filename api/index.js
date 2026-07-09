@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v19-multi', costo_congelado: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v20-detalle', costo_congelado: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -478,19 +478,44 @@ async function asistenteEjecutar(acc, userId, token) {
     const t = (mini[id] && mini[id].title) ? mini[id].title.slice(0, 42) : id;
     try {
       if (acc.accion === 'quitar_descuento') {
-        const r = await fetch(`https://api.mercadolibre.com/seller-promotions/items/${id}?app_version=v2`, {
-          method: 'DELETE', headers: { Authorization: 'Bearer ' + token }
+        // Mira que promos activas tiene y las baja UNA POR UNA por tipo+campana
+        const rp = await fetch(`https://api.mercadolibre.com/seller-promotions/items/${id}?app_version=v2`, {
+          headers: { Authorization: 'Bearer ' + token }
         });
-        let d; try { d = await r.json(); } catch (e2) { d = {}; }
-        const oks = (d.successful_ids || []).length;
-        lineas.push((r.ok ? 'OK - ' : 'ERROR - ') + t + (oks ? ' (' + oks + ' oferta/s quitada/s)' : (r.ok ? ' (no tenia ofertas activas)' : '')));
+        let dp; try { dp = await rp.json(); } catch (e2) { dp = []; }
+        const todasP = Array.isArray(dp) ? dp : (dp.results || []);
+        const activas = todasP.filter(x => ['started', 'active', 'pending', 'programmed', 'scheduled'].indexOf(x.status) > -1);
+        if (!activas.length) {
+          lineas.push('OK - ' + t + ' (no tenia ofertas activas)');
+        } else {
+          const partes = [];
+          for (const pr of activas) {
+            let urlDel = `https://api.mercadolibre.com/seller-promotions/items/${id}?app_version=v2&promotion_type=${encodeURIComponent(pr.type)}`;
+            if (pr.id) urlDel += `&promotion_id=${encodeURIComponent(pr.id)}`;
+            try {
+              const rd = await fetch(urlDel, { method: 'DELETE', headers: { Authorization: 'Bearer ' + token } });
+              let dd; try { dd = await rd.json(); } catch (e3) { dd = {}; }
+              if (rd.ok) partes.push('quite ' + pr.type);
+              else partes.push(pr.type + ' NO: ' + ((dd && (dd.message || dd.error)) || ('HTTP ' + rd.status)));
+            } catch (e4) { partes.push(pr.type + ' NO: ' + e4.message); }
+            await new Promise(rs => setTimeout(rs, 150));
+          }
+          const fallo = partes.some(x => x.indexOf(' NO: ') > -1);
+          lineas.push((fallo ? 'PARCIAL - ' : 'OK - ') + t + ' (' + partes.join('; ') + ')');
+        }
       } else if (acc.accion === 'aplicar_descuento') {
         const body = { deal_price: Number(p.precio), promotion_type: 'PRICE_DISCOUNT' };
         const url = `https://api.mercadolibre.com/seller-promotions/items/${id}?app_version=v2`;
         const hdr = { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' };
         let r = await fetch(url, { method: 'POST', headers: hdr, body: JSON.stringify(body) });
-        if (!r.ok) r = await fetch(url, { method: 'PUT', headers: hdr, body: JSON.stringify(body) });
-        lineas.push((r.ok ? 'OK - ' : 'ERROR - ') + t + (r.ok ? ' -> $' + Math.round(Number(p.precio)).toLocaleString() : ''));
+        let d1; try { d1 = await r.json(); } catch (e5) { d1 = {}; }
+        if (!r.ok) {
+          r = await fetch(url, { method: 'PUT', headers: hdr, body: JSON.stringify(body) });
+          try { d1 = await r.json(); } catch (e6) { d1 = {}; }
+        }
+        lineas.push((r.ok ? 'OK - ' : 'ERROR - ') + t + (r.ok
+          ? ' -> $' + Math.round(Number(p.precio)).toLocaleString()
+          : ' (' + ((d1 && (d1.message || d1.error)) || 'ML lo rechazo sin detalle') + ')'));
       } else {
         lineas.push('Accion desconocida: ' + acc.accion);
       }
@@ -2154,6 +2179,6 @@ app.get('/api/envio/diag', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`MargenML backend v19 (multi) corriendo en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`MargenML backend v20 (detalle) corriendo en puerto ${PORT}`));
 
 module.exports = app;
