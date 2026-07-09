@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v15-promos', costo_congelado: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v16-hub', costo_congelado: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -29,12 +29,14 @@ async function requireAuth(req, res, next) {
     try {
       const email = String(data.user.email || '').toLowerCase().trim();
       const { data: rolRow } = await supabase.from('mml_roles')
-        .select('rol,pestanas').eq('email', email).single();
+        .select('rol,pestanas,apps').eq('email', email).single();
       req.rol      = (rolRow && rolRow.rol) || 'operador';
       req.pestanas = (rolRow && rolRow.pestanas) || null;
+      req.apps     = (rolRow && rolRow.apps) || null;
     } catch (e) {
       req.rol = 'operador';
       req.pestanas = null;
+      req.apps = null;
     }
     next();
   } catch (e) {
@@ -53,7 +55,7 @@ function soloRoles(...roles) {
 
 // ── Quien soy: el frontend pregunta el rol para armar el menu ──────
 app.get('/api/mi-rol', requireAuth, (req, res) => {
-  res.json({ email: req.authUser.email, rol: req.rol, pestanas: req.pestanas });
+  res.json({ email: req.authUser.email, rol: req.rol, pestanas: req.pestanas, apps: req.apps });
 });
 
 // ══ USUARIOS v14 (solo admin): gestion del equipo desde el panel ══
@@ -63,7 +65,7 @@ app.get('/api/mi-rol', requireAuth, (req, res) => {
 app.get('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) => {
   try {
     const { data, error } = await supabase.from('mml_roles')
-      .select('email,rol,pestanas,user_id,creado').order('creado', { ascending: true });
+      .select('email,rol,pestanas,apps,user_id,creado').order('creado', { ascending: true });
     if (error) return res.status(500).json({ error: error.message });
     res.json({ usuarios: data || [] });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -109,6 +111,13 @@ app.put('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) => {
       if (p === null) upd.pestanas = null;
       else if (Array.isArray(p)) upd.pestanas = p.filter(x => permitidas.indexOf(String(x)) > -1);
       else return res.status(400).json({ error: 'pestanas debe ser lista o null' });
+    }
+    if (req.body && ('apps' in req.body)) {
+      const a = req.body.apps;
+      const appsOk = ['rentabilidad','logistica','promos','asistente'];
+      if (a === null) upd.apps = null;
+      else if (Array.isArray(a)) upd.apps = a.filter(x => appsOk.indexOf(String(x)) > -1);
+      else return res.status(400).json({ error: 'apps debe ser lista o null' });
     }
     const { error } = await supabase.from('mml_roles').upsert(upd, { onConflict: 'email' });
     if (error) return res.status(500).json({ error: error.message });
@@ -1821,6 +1830,6 @@ app.get('/api/envio/diag', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`MargenML backend v15 (promos) corriendo en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`MargenML backend v16 (hub) corriendo en puerto ${PORT}`));
 
 module.exports = app;
