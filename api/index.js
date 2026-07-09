@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v23-respondia', costo_congelado: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v24-adopta', costo_congelado: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -84,14 +84,27 @@ app.post('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) => {
     const { data: created, error: eAuth } = await supabase.auth.admin.createUser({
       email, password, email_confirm: true
     });
-    if (eAuth) return res.status(400).json({ error: 'No se pudo crear el login: ' + eAuth.message });
-    const uid = created && created.user && created.user.id;
+    let uid = created && created.user && created.user.id;
+    if (eAuth) {
+      const yaExiste = /already|registered|exists/i.test(eAuth.message || '');
+      if (!yaExiste) return res.status(400).json({ error: 'No se pudo crear el login: ' + eAuth.message });
+      // El login ya existia (quedo de antes): lo adoptamos -> buscamos su id,
+      // le pisamos la contrasena con la nueva y le asignamos el rol.
+      try {
+        const { data: lu } = await supabase.auth.admin.listUsers({ page: 1, perPage: 200 });
+        const u = lu && lu.users && lu.users.find(x => String(x.email || '').toLowerCase() === email);
+        uid = u && u.id;
+      } catch (e2) {}
+      if (!uid) return res.status(400).json({ error: 'Ese email ya tiene login pero no pude ubicarlo para asignarle el rol' });
+      const { error: ePw } = await supabase.auth.admin.updateUserById(uid, { password });
+      if (ePw) return res.status(400).json({ error: 'El login ya existia y no pude actualizarle la contrasena: ' + ePw.message });
+    }
 
     const { error: eRol } = await supabase.from('mml_roles')
       .upsert({ email, rol, user_id: uid || null }, { onConflict: 'email' });
-    if (eRol) return res.status(500).json({ error: 'Login creado pero fallo el rol: ' + eRol.message });
+    if (eRol) return res.status(500).json({ error: 'Login listo pero fallo el rol: ' + eRol.message });
 
-    res.json({ ok: true, email, rol });
+    res.json({ ok: true, email, rol, adoptado: !!eAuth });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -2230,6 +2243,6 @@ app.get('/api/envio/diag', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`MargenML backend v23 (respondia) corriendo en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`MargenML backend v24 (adopta) corriendo en puerto ${PORT}`));
 
 module.exports = app;
