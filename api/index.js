@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v27-manos', costo_congelado: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v29-limpio', costo_congelado: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -440,6 +440,7 @@ Acciones disponibles:
 - "ventas": parametros {"sku": opcional, "dias": numero opcional (default 30)} -> resumen de MIS ventas: cantidad, unidades, facturacion y ganancia aprox. "cuanto vendi del X este mes" -> {"sku":"X","dias":30}
 - "medidas": parametros {"sku":"..."} -> declara en ML las medidas de embalaje (largo/ancho/alto/peso) que figuran en la planilla de medidas de Pontec
 - "clonar_fotos": parametros {"origen":"MLA... (publicacion de la que copiar)"} y destino {"sku":"..."} (o {"item_id":"MLA..."}) -> copia las fotos de una publicacion a las demas del SKU
+- "smart": parametros {"max_mi_parte": numero} -> busca en las campanas co-participadas (SMART y similares) las propuestas donde TU parte del descuento es hasta ese % y MercadoLibre aporta el resto. "mandame los que me piden hasta 13% de mi parte" -> {"max_mi_parte":13}
 - "quitar_todo": sin parametros -> SOLO cuando el usuario pide explicitamente sacar TODOS los descuentos de TODOS los productos del catalogo
 - "multi": parametros {"acciones":[{"accion":"quitar_descuento","parametros":{...}},{"accion":"aplicar_descuento","parametros":{...}}]} -> cuando el usuario pide VARIAS cosas en un mismo mensaje (solo combina quitar_descuento y aplicar_descuento)
 - "charla": sin parametros -> saludos, dudas, o cuando falta un dato; lo que quieras decir va en "respuesta"
@@ -659,6 +660,30 @@ app.post('/api/asistente', requireAuth, soloRoles('admin', 'encargado'), async (
     const conf = req.body && req.body.confirmar;
     if (conf && conf.accion) {
       if (!esAdmin) return res.json({ respuesta: 'Solo un admin puede confirmar cambios.' });
+      if (conf.accion === 'smart_aplicar' && Array.isArray(conf.objetivos)) {
+        let okS = 0, errS = 0;
+        const erroresS = [];
+        for (const o of conf.objetivos) {
+          try {
+            const bodyS = { promotion_id: String(o.promo_id), promotion_type: String(o.type) };
+            if (o.sug > 0) bodyS.deal_price = Number(o.sug);
+            const rA = await fetch(`https://api.mercadolibre.com/seller-promotions/items/${encodeURIComponent(o.item)}?app_version=v2`, {
+              method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify(bodyS)
+            });
+            if (rA.ok) okS++;
+            else {
+              errS++;
+              if (erroresS.length < 5) {
+                let dA; try { dA = await rA.json(); } catch (e9) { dA = {}; }
+                erroresS.push(o.item + ': ' + ((dA && (dA.message || dA.error)) || ('HTTP ' + rA.status)));
+              }
+            }
+          } catch (eA) { errS++; if (erroresS.length < 5) erroresS.push(o.item + ': ' + eA.message); }
+          await new Promise(rs => setTimeout(rs, 200));
+        }
+        return res.json({ respuesta: 'Listo: ' + okS + ' producto(s) sumado(s) a sus campanas' + (errS ? ', ' + errS + ' con error' : '') + '.'
+          + (erroresS.length ? '\nPrimeros errores:\n- ' + erroresS.join('\n- ') : '') });
+      }
       if (conf.accion === 'quitar_todo' && Array.isArray(conf.objetivos)) {
         let ok = 0, err = 0;
         const errores = [];
@@ -759,6 +784,60 @@ app.post('/api/asistente', requireAuth, soloRoles('admin', 'encargado'), async (
         respuesta: 'Voy a copiar ' + fotos.length + ' foto(s) de "' + String(dO.title || origen).slice(0, 40) + '" a ' + sinVar.length + ' publicacion(es):\n' + listaF + (nVar ? '\n(' + nVar + ' con variantes: las salteo por ahora)' : ''),
         pendiente: { accion: 'clonar_fotos', parametros: p, items: sinVar, fotos }
       });
+    }
+
+    if (j.accion === 'smart') {
+      const maxMi = Number(p.max_mi_parte);
+      if (!(maxMi > 0 && maxMi <= 100)) return res.json({ respuesta: 'Hasta que porcentaje pones vos? Ej: "hasta 13% de mi parte".' });
+      const rcS = await fetch(`https://api.mercadolibre.com/seller-promotions/users/${userId}?app_version=v2`, {
+        headers: { Authorization: 'Bearer ' + token }
+      });
+      const dcS = await rcS.json();
+      const promosS = (dcS.results || []).filter(x => x && x.id && x.type);
+      const props = [];
+      let masHayS = false;
+      for (const pr of promosS) {
+        for (let pag = 0; pag < 8; pag++) {
+          if (props.length >= 60) { masHayS = true; break; }
+          let itemsS = [];
+          try {
+            const rS = await fetch(`https://api.mercadolibre.com/seller-promotions/promotions/${encodeURIComponent(pr.id)}/items`
+              + `?promotion_type=${encodeURIComponent(pr.type)}&app_version=v2&limit=50&offset=${pag * 50}`, {
+              headers: { Authorization: 'Bearer ' + token }
+            });
+            const dS = await rS.json();
+            itemsS = dS.results || dS.items || [];
+          } catch (eS) { break; }
+          for (const it of itemsS) {
+            if (it.status !== 'candidate') continue;
+            const ben = it.benefits || {};
+            const mi = (ben.seller_percent != null) ? Number(ben.seller_percent)
+              : (it.seller_percentage != null ? Number(it.seller_percentage) : null);
+            const ml = (ben.meli_percent != null) ? Number(ben.meli_percent)
+              : (it.meli_percentage != null ? Number(it.meli_percentage) : null);
+            if (mi == null || !(ml > 0)) continue;
+            if (mi > maxMi) continue;
+            props.push({ item: it.id, promo_id: pr.id, type: pr.type, campana: String(pr.name || pr.id).slice(0, 25),
+              price: it.original_price || it.price || 0, sug: it.suggested_discounted_price || null, mi, ml });
+            if (props.length >= 60) { masHayS = true; break; }
+          }
+          if (itemsS.length < 50) break;
+          await new Promise(rs => setTimeout(rs, 150));
+        }
+        if (props.length >= 60) break;
+      }
+      if (!props.length) return res.json({ respuesta: 'No encontre propuestas co-participadas donde tu parte sea hasta ' + maxMi + '% con aporte de ML.' });
+      const miniS = await itemsMini(props.map(x => x.item), token);
+      const lineasS = props.map(x => {
+        const t = (miniS[x.item] && (miniS[x.item].sku ? miniS[x.item].sku + ' - ' : '') + (miniS[x.item].title || '').slice(0, 34)) || x.item;
+        return '- ' + t + ': vos ' + x.mi + '% + ML ' + x.ml + '%' + (x.sug ? ' -> $' + Math.round(x.sug).toLocaleString() : '') + (x.price ? ' (de $' + Math.round(x.price).toLocaleString() + ')' : '') + ' [' + x.campana + ']';
+      }).join('\n');
+      const resp = 'Encontre ' + props.length + ' propuesta(s) donde pones hasta ' + maxMi + '% y ML aporta el resto:\n' + lineasS
+        + (masHayS ? '\n(Hay mas: proceso estas primero.)' : '')
+        + (esAdmin ? '\nConfirmas para sumarlas TODAS a sus campanas?' : '\n(Solo lectura: aplicar es de admin.)');
+      const out = { respuesta: resp };
+      if (esAdmin) out.pendiente = { accion: 'smart_aplicar', objetivos: props.map(x => ({ item: x.item, promo_id: x.promo_id, type: x.type, sug: x.sug })) };
+      return res.json(out);
     }
 
     if (j.accion === 'quitar_todo') {
@@ -896,6 +975,44 @@ app.post('/api/asistente', requireAuth, soloRoles('admin', 'encargado'), async (
       return res.json({ respuesta: ids.map(id => '- ' + id + ': ' + (((mini[id] && mini[id].title) || '').slice(0, 50)) + ((mini[id] && mini[id].price) ? ' ($' + Math.round(mini[id].price).toLocaleString() + ')' : '')).join('\n') });
     }
     return res.json({ respuesta: j.respuesta || 'Decime que necesitas hacer.' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Numeros reales por SKU: comision % y envio neto promedio de ventas recientes
+// (para calcular el "limpio" en la app Promociones con datos propios)
+app.get('/api/promos/reales', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
+  try {
+    const userId = req.query.user_id || '67619515';
+    const skus = String(req.query.skus || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean).slice(0, 120);
+    if (!skus.length) return res.json({});
+    const desde = new Date(Date.now() - 60 * 864e5).toISOString();
+    let rows = [], off = 0;
+    while (off < 6000) {
+      const { data: d, error } = await supabase.from('ventas')
+        .select('sku,precio,comision,costo_envio,precio_comprador_envio,estado')
+        .eq('user_id', String(userId)).gte('fecha', desde).in('sku', skus).range(off, off + 999);
+      if (error) return res.status(500).json({ error: error.message });
+      rows = rows.concat(d || []);
+      if (!d || d.length < 1000) break;
+      off += 1000;
+    }
+    const agg = {};
+    for (const v2 of rows) {
+      if (v2.estado === 'cancelled') continue;
+      const s = String(v2.sku || '').toUpperCase();
+      const a = agg[s] || (agg[s] = { fact: 0, com: 0, env: 0, n: 0 });
+      a.fact += Number(v2.precio) || 0;
+      a.com += Number(v2.comision) || 0;
+      a.env += (Number(v2.costo_envio) || 0) - (Number(v2.precio_comprador_envio) || 0);
+      a.n++;
+    }
+    const out = {};
+    for (const s in agg) {
+      const a = agg[s];
+      if (a.n < 1 || a.fact <= 0) continue;
+      out[s] = { com_pct: a.com / a.fact, envio: a.env / a.n, ventas: a.n };
+    }
+    res.json(out);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -2451,6 +2568,6 @@ app.get('/api/envio/diag', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`MargenML backend v27 (manos nuevas) corriendo en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`MargenML backend v29 (limpio) corriendo en puerto ${PORT}`));
 
 module.exports = app;
