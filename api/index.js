@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v25-listas', costo_congelado: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v26-quitar-todo', costo_congelado: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -437,6 +437,7 @@ Acciones disponibles:
 - "aplicar_descuento": parametros {"sku" o "item_id"} mas UNO de estos dos: {"precio": numero} (precio final deseado) o {"porcentaje": numero} (ej "10% de descuento" -> {"porcentaje":10}) -> aplica descuento individual; opcional {"dias": numero} si el usuario dice por cuantos dias
 - "ver_promos": parametros {"sku" o "item_id"} -> lista las promociones activas
 - "buscar": parametros {"sku":"..."} -> lista las publicaciones de un SKU con precio
+- "quitar_todo": sin parametros -> SOLO cuando el usuario pide explicitamente sacar TODOS los descuentos de TODOS los productos del catalogo
 - "multi": parametros {"acciones":[{"accion":"quitar_descuento","parametros":{...}},{"accion":"aplicar_descuento","parametros":{...}}]} -> cuando el usuario pide VARIAS cosas en un mismo mensaje (solo combina quitar_descuento y aplicar_descuento)
 - "charla": sin parametros -> saludos, dudas, o cuando falta un dato; lo que quieras decir va en "respuesta"
 
@@ -581,6 +582,29 @@ app.post('/api/asistente', requireAuth, soloRoles('admin'), async (req, res) => 
     // Boton Confirmar: ejecuta la accion pendiente tal cual se mostro
     const conf = req.body && req.body.confirmar;
     if (conf && conf.accion) {
+      if (conf.accion === 'quitar_todo' && Array.isArray(conf.objetivos)) {
+        let ok = 0, err = 0;
+        const errores = [];
+        for (const o of conf.objetivos) {
+          try {
+            let urlD = `https://api.mercadolibre.com/seller-promotions/items/${encodeURIComponent(o.item)}?app_version=v2&promotion_type=${encodeURIComponent(o.type)}`;
+            if (o.promo_id) urlD += `&promotion_id=${encodeURIComponent(o.promo_id)}`;
+            const rD = await fetch(urlD, { method: 'DELETE', headers: { Authorization: 'Bearer ' + token } });
+            if (rD.ok) ok++;
+            else {
+              err++;
+              if (errores.length < 5) {
+                let dD; try { dD = await rD.json(); } catch (e5) { dD = {}; }
+                errores.push(o.item + ' (' + o.type + '): ' + ((dD && (dD.message || dD.error)) || ('HTTP ' + rD.status)));
+              }
+            }
+          } catch (e6) { err++; if (errores.length < 5) errores.push(o.item + ': ' + e6.message); }
+          await new Promise(rs => setTimeout(rs, 150));
+        }
+        return res.json({ respuesta: 'Listo: ' + ok + ' promocion(es) quitada(s)' + (err ? ', ' + err + ' con error' : '') + '.'
+          + (errores.length ? '\nPrimeros errores:\n- ' + errores.join('\n- ') : '')
+          + '\nSi habia mas tandas, repeti la orden para seguir.' });
+      }
       if (conf.accion === 'multi' && Array.isArray(conf.acciones)) {
         const partes = [];
         for (const sub of conf.acciones) {
@@ -601,6 +625,52 @@ app.post('/api/asistente', requireAuth, soloRoles('admin'), async (req, res) => 
     const j = llm.json || {};
     const p = j.parametros || {};
 
+    if (j.accion === 'quitar_todo') {
+      const rc2 = await fetch(`https://api.mercadolibre.com/seller-promotions/users/${userId}?app_version=v2`, {
+        headers: { Authorization: 'Bearer ' + token }
+      });
+      const dc2 = await rc2.json();
+      const promos = (dc2.results || []).filter(x => x && x.id && x.type);
+      const objetivos = [];
+      const porCampana = {};
+      const vistos = {};
+      let masHay = false;
+      for (const pr of promos) {
+        for (let pag = 0; pag < 10; pag++) {
+          if (objetivos.length >= 400) { masHay = true; break; }
+          let url2 = `https://api.mercadolibre.com/seller-promotions/promotions/${encodeURIComponent(pr.id)}/items`
+            + `?promotion_type=${encodeURIComponent(pr.type)}&app_version=v2&limit=50&offset=${pag * 50}&status_item=started`;
+          let items2 = [];
+          try {
+            const r2 = await fetch(url2, { headers: { Authorization: 'Bearer ' + token } });
+            const d2 = await r2.json();
+            items2 = d2.results || d2.items || [];
+          } catch (e2) { break; }
+          for (const it2 of items2) {
+            if (!(it2.status === 'started' || it2.status === 'active')) continue;
+            const k = it2.id + '|' + pr.type + '|' + pr.id;
+            if (vistos[k]) continue;
+            vistos[k] = 1;
+            objetivos.push({ item: it2.id, type: pr.type, promo_id: pr.id });
+            const nom = String(pr.name || pr.id);
+            porCampana[nom] = (porCampana[nom] || 0) + 1;
+            if (objetivos.length >= 400) { masHay = true; break; }
+          }
+          if (items2.length < 50) break;
+          await new Promise(rs => setTimeout(rs, 150));
+        }
+        if (objetivos.length >= 400) break;
+      }
+      if (!objetivos.length) return res.json({ respuesta: 'No encontre promociones activas en el catalogo. Nada para sacar.' });
+      const desglose = Object.keys(porCampana).map(n => '- ' + n.slice(0, 35) + ': ' + porCampana[n] + ' publicacion(es)').join('\n');
+      return res.json({
+        respuesta: 'ATENCION: esto va a QUITAR las promociones activas de ' + objetivos.length + ' participacion(es) en todo el catalogo:\n'
+          + desglose
+          + (masHay ? '\n(Hay mas: proceso estas primero; cuando termine, repeti la orden para la siguiente tanda.)' : '')
+          + '\nEs una operacion grande y con impacto en las ventas. Segura/o?',
+        pendiente: { accion: 'quitar_todo', objetivos }
+      });
+    }
     if (j.accion === 'multi') {
       let subs = ((p.acciones || j.acciones || [])).filter(s => s && (s.accion === 'quitar_descuento' || s.accion === 'aplicar_descuento'));
       let recorte = '';
@@ -2245,6 +2315,6 @@ app.get('/api/envio/diag', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`MargenML backend v25 (listas) corriendo en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`MargenML backend v26 (quitar todo) corriendo en puerto ${PORT}`));
 
 module.exports = app;
