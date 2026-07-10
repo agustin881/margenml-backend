@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v32-peso', costo_congelado: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v34-verificados', costo_congelado: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -629,7 +629,26 @@ async function asistenteEjecutar(acc, userId, token) {
           method: 'PUT', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify(bodyM)
         });
         let dM; try { dM = await rM.json(); } catch (e7) { dM = {}; }
-        lineas.push((rM.ok ? 'OK - ' : 'ERROR - ') + t + (rM.ok ? ' (medidas declaradas)' : ' (' + mlErrDetalle(dM) + ')'));
+        let extraM = '';
+        if (!rM.ok && /too small/i.test(mlErrDetalle(dM))) {
+          // ML dice que el paquete es mas chico que el PRODUCTO: mostrar que declara la ficha
+          try {
+            const rA = await fetch('https://api.mercadolibre.com/items/' + id + '?attributes=attributes', {
+              headers: { Authorization: 'Bearer ' + token }
+            });
+            const dA = await rA.json();
+            const attrsA = dA.attributes || [];
+            const paq = attrsA.filter(a => a && /^SELLER_PACKAGE_/i.test(a.id || ''))
+              .map(a => String(a.id).replace('SELLER_PACKAGE_', '') + '=' + (a.value_name || '?'));
+            const prod = attrsA.filter(a => a && /LENGTH|WIDTH|HEIGHT|WEIGHT|DEPTH|DIAMETER/i.test(a.id || '') && !/^SELLER_PACKAGE/i.test(a.id || ''))
+              .slice(0, 5).map(a => a.id + '=' + (a.value_name || '?'));
+            const partes = [];
+            if (paq.length) partes.push('ML ya registra el paquete: ' + paq.join(', ') + ' (si en la web figura "verificado", ML lo midio y esta BLOQUEADO: no se puede cambiar)');
+            if (prod.length) partes.push('Ficha del producto: ' + prod.join(', '));
+            if (partes.length) extraM = '\n   ' + partes.join('\n   ');
+          } catch (eX) {}
+        }
+        lineas.push((rM.ok ? 'OK - ' : 'ERROR - ') + t + (rM.ok ? ' (medidas declaradas)' : ' (' + mlErrDetalle(dM) + ')') + extraM);
       } else if (acc.accion === 'clonar_fotos') {
         const rF = await fetch('https://api.mercadolibre.com/items/' + id, {
           method: 'PUT', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify({ pictures: acc.fotos || [] })
@@ -2588,6 +2607,6 @@ app.get('/api/envio/diag', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`MargenML backend v32 (peso) corriendo en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`MargenML backend v34 (verificados) corriendo en puerto ${PORT}`));
 
 module.exports = app;
