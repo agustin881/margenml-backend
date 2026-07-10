@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v31-causas', costo_congelado: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v32-peso', costo_congelado: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -760,7 +760,9 @@ app.post('/api/asistente', requireAuth, soloRoles('admin', 'encargado'), async (
       const m = await medidasDeSku(skuM);
       if (!m) return res.json({ respuesta: 'No encontre a ' + skuM + ' en la planilla de medidas.' });
       const L = Math.ceil(m.largo), A = Math.ceil(m.ancho), H = Math.ceil(m.alto);
-      const G = Math.ceil(((m.peso || m.kgEnvio) || 0) * 1000);
+      const pesoCrudo = (m.peso || m.kgEnvio) || 0;
+      // La planilla mezcla unidades: <=100 se toma como KG, >100 como gramos ya expresados
+      const G = Math.ceil(pesoCrudo > 100 ? pesoCrudo : pesoCrudo * 1000);
       if (!(L > 0 && A > 0 && H > 0 && G > 0)) return res.json({ respuesta: 'Las medidas de ' + skuM + ' estan incompletas en la planilla (largo/ancho/alto/peso).' });
       const idsM = await asistenteResolverItems({ sku: skuM }, userId, token);
       if (!idsM.length) return res.json({ respuesta: 'No encontre publicaciones activas de ' + skuM + '.' });
@@ -2586,6 +2588,6 @@ app.get('/api/envio/diag', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`MargenML backend v31 (causas) corriendo en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`MargenML backend v32 (peso) corriendo en puerto ${PORT}`));
 
 module.exports = app;
