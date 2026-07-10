@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v29-limpio', costo_congelado: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v30-sku', costo_congelado: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -350,13 +350,20 @@ async function itemsMini(ids, token) {
   for (let i = 0; i < ids.length; i += 20) {
     const chunk = ids.slice(i, i + 20);
     try {
-      const r = await fetch('https://api.mercadolibre.com/items?ids=' + chunk.join(',') + '&attributes=id,title,price,seller_sku,seller_custom_field', {
+      const r = await fetch('https://api.mercadolibre.com/items?ids=' + chunk.join(',') + '&attributes=id,title,price,seller_sku,seller_custom_field,attributes', {
         headers: { Authorization: 'Bearer ' + token }
       });
       const arr = await r.json();
       (Array.isArray(arr) ? arr : []).forEach(row => {
         const b = row && row.body;
-        if (b && b.id) out[b.id] = { title: b.title || '', price: b.price || 0, sku: String(b.seller_sku || b.seller_custom_field || '').trim().toUpperCase() };
+        if (b && b.id) {
+          let sku = String(b.seller_sku || b.seller_custom_field || '').trim().toUpperCase();
+          if (!sku && Array.isArray(b.attributes)) {
+            const at = b.attributes.find(a => a && a.id === 'SELLER_SKU');
+            if (at) sku = String(at.value_name || at.value_id || '').trim().toUpperCase();
+          }
+          out[b.id] = { title: b.title || '', price: b.price || 0, sku };
+        }
       });
     } catch (e) {}
     await new Promise(r => setTimeout(r, 120));
@@ -2568,6 +2575,6 @@ app.get('/api/envio/diag', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`MargenML backend v29 (limpio) corriendo en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`MargenML backend v30 (sku) corriendo en puerto ${PORT}`));
 
 module.exports = app;
