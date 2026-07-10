@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v26-quitar-todo', costo_congelado: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v27-manos', costo_congelado: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -437,13 +437,16 @@ Acciones disponibles:
 - "aplicar_descuento": parametros {"sku" o "item_id"} mas UNO de estos dos: {"precio": numero} (precio final deseado) o {"porcentaje": numero} (ej "10% de descuento" -> {"porcentaje":10}) -> aplica descuento individual; opcional {"dias": numero} si el usuario dice por cuantos dias
 - "ver_promos": parametros {"sku" o "item_id"} -> lista las promociones activas
 - "buscar": parametros {"sku":"..."} -> lista las publicaciones de un SKU con precio
+- "ventas": parametros {"sku": opcional, "dias": numero opcional (default 30)} -> resumen de MIS ventas: cantidad, unidades, facturacion y ganancia aprox. "cuanto vendi del X este mes" -> {"sku":"X","dias":30}
+- "medidas": parametros {"sku":"..."} -> declara en ML las medidas de embalaje (largo/ancho/alto/peso) que figuran en la planilla de medidas de Pontec
+- "clonar_fotos": parametros {"origen":"MLA... (publicacion de la que copiar)"} y destino {"sku":"..."} (o {"item_id":"MLA..."}) -> copia las fotos de una publicacion a las demas del SKU
 - "quitar_todo": sin parametros -> SOLO cuando el usuario pide explicitamente sacar TODOS los descuentos de TODOS los productos del catalogo
 - "multi": parametros {"acciones":[{"accion":"quitar_descuento","parametros":{...}},{"accion":"aplicar_descuento","parametros":{...}}]} -> cuando el usuario pide VARIAS cosas en un mismo mensaje (solo combina quitar_descuento y aplicar_descuento)
 - "charla": sin parametros -> saludos, dudas, o cuando falta un dato; lo que quieras decir va en "respuesta"
 
 Reglas:
 - Los SKU de Pontec son codigos tipo OFI210-BL o AIR010-NE: letras+numeros y a veces sufijo de color (NE=negro, BL=blanco, AZ=azul, RO=rojo, GR=gris, VE=verde, MA=marron, CO=cobre). Si el usuario dice "la silla ofi 210 blanca", el SKU es OFI210-BL.
-- Si el usuario dice un porcentaje de descuento, mandalo como "porcentaje"; NO le pidas el precio final.
+- Si el usuario dice un porcentaje de descuento, mandalo como "porcentaje"; NO le pidas el precio final.\n- Para clonar_fotos hace falta saber DE QUE publicacion copiar (un codigo MLA...). Si el usuario no lo dijo, pedilo con "charla".
 - El descuento individual dura maximo 14 dias (limite de ML); si piden mas, avisalo en "respuesta" y usa dias=14.
 - Si para aplicar_descuento no hay ni precio ni porcentaje, usa "charla" y pedi uno de los dos.
 - Nunca inventes precios ni SKUs que el usuario no dijo.
@@ -482,6 +485,59 @@ async function asistenteResolverItems(p, userId, token) {
     } catch (e) {}
   }
   return [];
+}
+
+// Consulta de ventas propias (solo lectura, desde la base de MargenML)
+async function asistenteVentas(p, userId) {
+  try {
+    const dias = Math.min(Math.max(parseInt(p.dias) || 30, 1), 365);
+    const desde = new Date(Date.now() - dias * 864e5).toISOString();
+    const sku = p.sku ? String(p.sku).toUpperCase().trim() : null;
+    let rows = [], off = 0;
+    while (off < 6000) {
+      let q = supabase.from('ventas')
+        .select('sku,unidades,precio,comision,costo_envio,precio_comprador_envio,costo_congelado,costo_financiero,estado')
+        .eq('user_id', String(userId)).gte('fecha', desde).range(off, off + 999);
+      if (sku) q = q.ilike('sku', sku);
+      const { data: d, error } = await q;
+      if (error) return 'Error consultando ventas: ' + error.message;
+      rows = rows.concat(d || []);
+      if (!d || d.length < 1000) break;
+      off += 1000;
+    }
+    const validas = rows.filter(x => x.estado !== 'cancelled');
+    if (!validas.length) return 'No encontre ventas' + (sku ? ' de ' + sku : '') + ' en los ultimos ' + dias + ' dias.';
+    let un = 0, fact = 0, gan = 0, conCosto = 0;
+    for (const x of validas) {
+      un += Number(x.unidades) || 0;
+      fact += Number(x.precio) || 0;
+      if (x.costo_congelado != null) {
+        gan += (Number(x.precio) || 0) - (Number(x.comision) || 0)
+          - ((Number(x.costo_envio) || 0) - (Number(x.precio_comprador_envio) || 0))
+          - (Number(x.costo_congelado) || 0) - (Number(x.costo_financiero) || 0);
+        conCosto++;
+      }
+    }
+    const canc = rows.length - validas.length;
+    let txt = 'Ultimos ' + dias + ' dias' + (sku ? ' de ' + sku : '') + ':\n- ' + validas.length + ' venta(s), ' + un + ' unidad(es)\n- Facturacion: $' + Math.round(fact).toLocaleString();
+    if (conCosto) txt += '\n- Ganancia aprox (' + conCosto + ' ventas con costo): $' + Math.round(gan).toLocaleString() + (fact > 0 ? ' (' + (gan / fact * 100).toFixed(1) + '% s/facturacion)' : '');
+    txt += '\n(aprox: no descuenta IIBB ni publicidad' + (canc ? '; ' + canc + ' cancelada(s) excluidas' : '') + ')';
+    return txt;
+  } catch (e) { return 'Error: ' + e.message; }
+}
+
+// Medidas de un SKU desde la planilla publicada (misma fuente que /api/medidas)
+async function medidasDeSku(sku) {
+  try {
+    const ahora = Date.now();
+    if (!_medidasCache || (ahora - _medidasTs) > 5 * 60 * 1000) {
+      const r = await fetch(MEDIDAS_CSV_URL);
+      const text = await r.text();
+      const map = buildMedidas(text);
+      if (Object.keys(map).length > 0) { _medidasCache = map; _medidasTs = ahora; }
+    }
+    return (_medidasCache && _medidasCache[String(sku).toUpperCase().trim()]) || null;
+  } catch (e) { return null; }
 }
 
 // Fecha en formato local de ML (sin zona horaria; solo cuenta el dia)
@@ -542,6 +598,25 @@ async function asistenteEjecutar(acc, userId, token) {
         lineas.push((r.ok ? 'OK - ' : 'ERROR - ') + t + (r.ok
           ? ' -> $' + Math.round(precioFinal).toLocaleString()
           : ' (' + ((d1 && (d1.message || d1.error)) || 'ML lo rechazo sin detalle') + ')'));
+      } else if (acc.accion === 'medidas') {
+        const md = acc.medidas || {};
+        const bodyM = { attributes: [
+          { id: 'SELLER_PACKAGE_LENGTH', value_name: md.L + ' cm' },
+          { id: 'SELLER_PACKAGE_WIDTH',  value_name: md.A + ' cm' },
+          { id: 'SELLER_PACKAGE_HEIGHT', value_name: md.H + ' cm' },
+          { id: 'SELLER_PACKAGE_WEIGHT', value_name: md.G + ' g' }
+        ] };
+        const rM = await fetch('https://api.mercadolibre.com/items/' + id, {
+          method: 'PUT', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify(bodyM)
+        });
+        let dM; try { dM = await rM.json(); } catch (e7) { dM = {}; }
+        lineas.push((rM.ok ? 'OK - ' : 'ERROR - ') + t + (rM.ok ? ' (medidas declaradas)' : ' (' + ((dM && (dM.message || dM.error)) || 'ML lo rechazo') + ')'));
+      } else if (acc.accion === 'clonar_fotos') {
+        const rF = await fetch('https://api.mercadolibre.com/items/' + id, {
+          method: 'PUT', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify({ pictures: acc.fotos || [] })
+        });
+        let dF; try { dF = await rF.json(); } catch (e8) { dF = {}; }
+        lineas.push((rF.ok ? 'OK - ' : 'ERROR - ') + t + (rF.ok ? ' (' + (acc.fotos || []).length + ' fotos)' : ' (' + ((dF && (dF.message || dF.error)) || 'ML lo rechazo') + ')'));
       } else {
         lineas.push('Accion desconocida: ' + acc.accion);
       }
@@ -573,15 +648,17 @@ async function asistenteVerPromos(p, userId, token) {
   return lineas.join('\n');
 }
 
-app.post('/api/asistente', requireAuth, soloRoles('admin'), async (req, res) => {
+app.post('/api/asistente', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
   try {
     const userId = (req.body && req.body.user_id) || '67619515';
     const token = await getValidToken(userId);
     if (!token) return res.status(400).json({ error: 'Sin token ML' });
+    const esAdmin = req.rol === 'admin';
 
     // Boton Confirmar: ejecuta la accion pendiente tal cual se mostro
     const conf = req.body && req.body.confirmar;
     if (conf && conf.accion) {
+      if (!esAdmin) return res.json({ respuesta: 'Solo un admin puede confirmar cambios.' });
       if (conf.accion === 'quitar_todo' && Array.isArray(conf.objetivos)) {
         let ok = 0, err = 0;
         const errores = [];
@@ -624,6 +701,65 @@ app.post('/api/asistente', requireAuth, soloRoles('admin'), async (req, res) => 
     if (llm.error) return res.status(500).json({ error: llm.error });
     const j = llm.json || {};
     const p = j.parametros || {};
+
+    const ESCRITURA = ['quitar_descuento','aplicar_descuento','multi','quitar_todo','clonar_fotos','medidas'];
+    if (ESCRITURA.indexOf(j.accion) > -1 && !esAdmin) {
+      return res.json({ respuesta: 'Tu usuario puede consultar (ventas, promociones, publicaciones) pero los cambios los hace un admin.' });
+    }
+
+    if (j.accion === 'ventas') {
+      return res.json({ respuesta: await asistenteVentas(p, userId) });
+    }
+
+    if (j.accion === 'medidas') {
+      const skuM = String(p.sku || '').toUpperCase().trim();
+      if (!skuM) return res.json({ respuesta: 'De que SKU cargo las medidas?' });
+      const m = await medidasDeSku(skuM);
+      if (!m) return res.json({ respuesta: 'No encontre a ' + skuM + ' en la planilla de medidas.' });
+      const L = Math.ceil(m.largo), A = Math.ceil(m.ancho), H = Math.ceil(m.alto);
+      const G = Math.ceil(((m.peso || m.kgEnvio) || 0) * 1000);
+      if (!(L > 0 && A > 0 && H > 0 && G > 0)) return res.json({ respuesta: 'Las medidas de ' + skuM + ' estan incompletas en la planilla (largo/ancho/alto/peso).' });
+      const idsM = await asistenteResolverItems({ sku: skuM }, userId, token);
+      if (!idsM.length) return res.json({ respuesta: 'No encontre publicaciones activas de ' + skuM + '.' });
+      const miniM = await itemsMini(idsM, token);
+      const listaM = idsM.map(id => '- ' + ((miniM[id] && miniM[id].title) ? miniM[id].title.slice(0, 48) : id)).join('\n');
+      return res.json({
+        respuesta: 'Voy a declarar en ' + idsM.length + ' publicacion(es) de ' + skuM + ': ' + L + 'x' + A + 'x' + H + ' cm, ' + G + ' g:\n' + listaM,
+        pendiente: { accion: 'medidas', parametros: { sku: skuM }, items: idsM, medidas: { L, A, H, G } }
+      });
+    }
+
+    if (j.accion === 'clonar_fotos') {
+      const origen = String(p.origen || '').toUpperCase().trim();
+      if (!/^MLA\d+$/.test(origen)) return res.json({ respuesta: j.respuesta || 'Decime de que publicacion copio las fotos (el codigo MLA...).' });
+      const rO = await fetch('https://api.mercadolibre.com/items/' + origen + '?attributes=id,title,pictures', { headers: { Authorization: 'Bearer ' + token } });
+      const dO = await rO.json();
+      const fotos = (dO.pictures || []).map(x => ({ id: x.id })).filter(x => x.id);
+      if (!fotos.length) return res.json({ respuesta: 'La publicacion ' + origen + ' no tiene fotos para copiar.' });
+      let destinos = p.item_id ? [String(p.item_id).toUpperCase().trim()] : await asistenteResolverItems({ sku: p.sku }, userId, token);
+      destinos = destinos.filter(x => x !== origen);
+      if (!destinos.length) return res.json({ respuesta: 'No encontre otras publicaciones destino (el origen no cuenta).' });
+      const conVar = {}, sinVar = [];
+      for (let i = 0; i < destinos.length; i += 20) {
+        const chunk = destinos.slice(i, i + 20);
+        try {
+          const rV = await fetch('https://api.mercadolibre.com/items?ids=' + chunk.join(',') + '&attributes=id,variations', { headers: { Authorization: 'Bearer ' + token } });
+          const aV = await rV.json();
+          (Array.isArray(aV) ? aV : []).forEach(row => {
+            const b = row && row.body;
+            if (b && b.id) { if (Array.isArray(b.variations) && b.variations.length) conVar[b.id] = 1; else sinVar.push(b.id); }
+          });
+        } catch (eV) {}
+      }
+      if (!sinVar.length) return res.json({ respuesta: 'Las publicaciones destino tienen variantes; el clonado a publicaciones con variantes viene en la proxima version.' });
+      const miniF = await itemsMini(sinVar, token);
+      const listaF = sinVar.map(id => '- ' + ((miniF[id] && miniF[id].title) ? miniF[id].title.slice(0, 48) : id)).join('\n');
+      const nVar = Object.keys(conVar).length;
+      return res.json({
+        respuesta: 'Voy a copiar ' + fotos.length + ' foto(s) de "' + String(dO.title || origen).slice(0, 40) + '" a ' + sinVar.length + ' publicacion(es):\n' + listaF + (nVar ? '\n(' + nVar + ' con variantes: las salteo por ahora)' : ''),
+        pendiente: { accion: 'clonar_fotos', parametros: p, items: sinVar, fotos }
+      });
+    }
 
     if (j.accion === 'quitar_todo') {
       const rc2 = await fetch(`https://api.mercadolibre.com/seller-promotions/users/${userId}?app_version=v2`, {
@@ -2315,6 +2451,6 @@ app.get('/api/envio/diag', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`MargenML backend v26 (quitar todo) corriendo en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`MargenML backend v27 (manos nuevas) corriendo en puerto ${PORT}`));
 
 module.exports = app;
