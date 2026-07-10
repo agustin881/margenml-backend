@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v24-adopta', costo_congelado: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v25-listas', costo_congelado: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -456,8 +456,8 @@ async function asistenteLLM(mensajes) {
     method: 'POST',
     headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
     body: JSON.stringify({
-      model, max_tokens: 700, system: ASISTENTE_SYS,
-      messages: mensajes.map(m => ({ role: m.rol === 'user' ? 'user' : 'assistant', content: String(m.texto || '').slice(0, 2000) }))
+      model, max_tokens: 3000, system: ASISTENTE_SYS,
+      messages: mensajes.map(m => ({ role: m.rol === 'user' ? 'user' : 'assistant', content: String(m.texto || '').slice(0, 8000) }))
     })
   });
   const d = await r.json();
@@ -602,7 +602,9 @@ app.post('/api/asistente', requireAuth, soloRoles('admin'), async (req, res) => 
     const p = j.parametros || {};
 
     if (j.accion === 'multi') {
-      const subs = ((p.acciones || j.acciones || [])).filter(s => s && (s.accion === 'quitar_descuento' || s.accion === 'aplicar_descuento'));
+      let subs = ((p.acciones || j.acciones || [])).filter(s => s && (s.accion === 'quitar_descuento' || s.accion === 'aplicar_descuento'));
+      let recorte = '';
+      if (subs.length > 60) { recorte = '\n(Ojo: eran ' + subs.length + ' ordenes, proceso las primeras 60; mandame el resto en otro mensaje.)'; subs = subs.slice(0, 60); }
       if (!subs.length) return res.json({ respuesta: j.respuesta || 'No entendi la lista de ordenes, proba de a una.' });
       const lineas = []; const listos = [];
       for (const s of subs) {
@@ -634,7 +636,7 @@ app.post('/api/asistente', requireAuth, soloRoles('admin'), async (req, res) => 
       }
       if (!listos.length) return res.json({ respuesta: 'No encontre publicaciones para ninguna de las ordenes:\n' + lineas.join('\n') });
       return res.json({
-        respuesta: 'Plan (' + listos.length + ' orden/es):\n' + lineas.join('\n'),
+        respuesta: 'Plan (' + listos.length + ' orden/es):\n' + lineas.join('\n') + recorte,
         pendiente: { accion: 'multi', acciones: listos }
       });
     }
@@ -2243,6 +2245,6 @@ app.get('/api/envio/diag', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`MargenML backend v24 (adopta) corriendo en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`MargenML backend v25 (listas) corriendo en puerto ${PORT}`));
 
 module.exports = app;
