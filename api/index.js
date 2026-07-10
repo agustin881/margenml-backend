@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v30-sku', costo_congelado: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v31-causas', costo_congelado: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -555,6 +555,17 @@ function fechaLocalAR(masDias) {
   return t.getUTCFullYear() + '-' + p(t.getUTCMonth() + 1) + '-' + p(t.getUTCDate()) + 'T00:00:00';
 }
 
+// Errores de ML: el motivo real viene en el array "cause", no en el mensaje
+function mlErrDetalle(d) {
+  if (!d) return 'ML lo rechazo sin detalle';
+  let t = d.message || d.error || 'ML lo rechazo sin detalle';
+  if (Array.isArray(d.cause) && d.cause.length) {
+    const cs = d.cause.map(c => (c && (c.message || c.code)) || '').filter(Boolean).slice(0, 3);
+    if (cs.length) t += ': ' + cs.join(' | ');
+  }
+  return String(t).slice(0, 240);
+}
+
 async function asistenteEjecutar(acc, userId, token) {
   const p = acc.parametros || {};
   const ids = Array.isArray(acc.items) && acc.items.length ? acc.items : await asistenteResolverItems(p, userId, token);
@@ -605,7 +616,7 @@ async function asistenteEjecutar(acc, userId, token) {
         }
         lineas.push((r.ok ? 'OK - ' : 'ERROR - ') + t + (r.ok
           ? ' -> $' + Math.round(precioFinal).toLocaleString()
-          : ' (' + ((d1 && (d1.message || d1.error)) || 'ML lo rechazo sin detalle') + ')'));
+          : ' (' + mlErrDetalle(d1) + ')'));
       } else if (acc.accion === 'medidas') {
         const md = acc.medidas || {};
         const bodyM = { attributes: [
@@ -618,13 +629,13 @@ async function asistenteEjecutar(acc, userId, token) {
           method: 'PUT', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify(bodyM)
         });
         let dM; try { dM = await rM.json(); } catch (e7) { dM = {}; }
-        lineas.push((rM.ok ? 'OK - ' : 'ERROR - ') + t + (rM.ok ? ' (medidas declaradas)' : ' (' + ((dM && (dM.message || dM.error)) || 'ML lo rechazo') + ')'));
+        lineas.push((rM.ok ? 'OK - ' : 'ERROR - ') + t + (rM.ok ? ' (medidas declaradas)' : ' (' + mlErrDetalle(dM) + ')'));
       } else if (acc.accion === 'clonar_fotos') {
         const rF = await fetch('https://api.mercadolibre.com/items/' + id, {
           method: 'PUT', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify({ pictures: acc.fotos || [] })
         });
         let dF; try { dF = await rF.json(); } catch (e8) { dF = {}; }
-        lineas.push((rF.ok ? 'OK - ' : 'ERROR - ') + t + (rF.ok ? ' (' + (acc.fotos || []).length + ' fotos)' : ' (' + ((dF && (dF.message || dF.error)) || 'ML lo rechazo') + ')'));
+        lineas.push((rF.ok ? 'OK - ' : 'ERROR - ') + t + (rF.ok ? ' (' + (acc.fotos || []).length + ' fotos)' : ' (' + mlErrDetalle(dF) + ')'));
       } else {
         lineas.push('Accion desconocida: ' + acc.accion);
       }
@@ -2575,6 +2586,6 @@ app.get('/api/envio/diag', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`MargenML backend v30 (sku) corriendo en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`MargenML backend v31 (causas) corriendo en puerto ${PORT}`));
 
 module.exports = app;
