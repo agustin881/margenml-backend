@@ -1432,7 +1432,7 @@ app.get('/api/ventas', requireAuth, async (req, res) => {
     const lote = 1000;
 
     while (true) {
-      let query = supabase.from('ventas').select('nro_venta,user_id,fecha,fecha_cierre,sku,titulo,unidades,precio,comision,costo_envio,precio_comprador_envio,logistic_type,provincia,ciudad,estado,con_cuotas,cuotas,costo_financiero,tipo_publicacion,pack_id,item_id,costo_congelado,cancel_code:raw->cancel_detail->>code,ml_tags:raw->tags,dev_return,dev_benef').eq('user_id', user_id);
+      let query = supabase.from('ventas').select('nro_venta,user_id,fecha,fecha_cierre,sku,titulo,unidades,precio,comision,costo_envio,precio_comprador_envio,logistic_type,provincia,ciudad,estado,con_cuotas,cuotas,costo_financiero,tipo_publicacion,pack_id,item_id,costo_congelado,cancel_code:raw->cancel_detail->>code,ml_tags:raw->tags,dev_return,dev_benef,dev_cargo').eq('user_id', user_id);
       if (desde) query = query.gte('fecha', desde);
       if (hasta) query = query.lte('fecha', hasta);
       query = query.order('fecha', { ascending: false }).range(offset, offset + lote - 1);
@@ -1945,6 +1945,77 @@ app.get('/api/devol/probe6', async (req, res) => {
       meta.porPeriodo[key] = meta.porPeriodo[key] || { total, paginas: vueltas };
     }
     res.json({ encontrados, meta, ref: { malacate: '2000017191703550 (espero ~9860+19720)', freidora: '2000017077382238 (espero ~13920)', silla: '2000017080396472 (espero $0 o bonificado)' } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── DEVOLUCIONES: cargos reales desde la facturacion de ML ──
+// GET /api/devol/cargos-sync?user_id=..&period=YYYY-MM-01&offset=0[&reset=1]
+// Escanea una pagina de facturacion por llamada; el frontend lo llama en loop.
+app.get('/api/devol/cargos-sync', async (req, res) => {
+  try {
+    const user_id = req.query.user_id;
+    if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
+    const period = String(req.query.period || '').trim();
+    if (!period) return res.status(400).json({ error: 'period requerido (YYYY-MM-01)' });
+    let offset = parseInt(req.query.offset) || 0;
+    const reset = req.query.reset === '1';
+    const token = await getValidToken(user_id);
+    const H = { Authorization: 'Bearer ' + token };
+
+    if (reset) {
+      await supabase.from('ventas').update({ dev_cargo: null })
+        .eq('user_id', String(user_id)).eq('estado', 'cancelled')
+        .filter('raw->cancel_detail->>code', 'eq', 'mediations');
+    }
+
+    // set de ordenes que son devoluciones (mediations)
+    const devolSet = new Set();
+    let off2 = 0;
+    while (true) {
+      const { data, error } = await supabase.from('ventas').select('nro_venta')
+        .eq('user_id', String(user_id)).eq('estado', 'cancelled')
+        .filter('raw->cancel_detail->>code', 'eq', 'mediations')
+        .range(off2, off2 + 999);
+      if (error || !data || !data.length) break;
+      data.forEach(r => devolSet.add(String(r.nro_venta)));
+      if (data.length < 1000) break;
+      off2 += 1000;
+    }
+
+    const url = 'https://api.mercadolibre.com/billing/integration/periods/key/' + period + '/group/ML/details?document_type=BILL&limit=150&offset=' + offset;
+    let r = null;
+    for (let i = 0; i < 4; i++) {
+      r = await fetch(url, { headers: H });
+      if (r.status !== 429) break;
+      await new Promise(rp => setTimeout(rp, 6000));
+    }
+    if (!r || r.status !== 200) return res.json({ period, offset, http: r ? r.status : null, reintentar: true, done: false });
+    const j = await r.json();
+    const rs = Array.isArray(j.results) ? j.results : [];
+    const total = (j.total != null) ? j.total : null;
+
+    // sumar cargos de envio/devolucion de ordenes que son devoluciones
+    const sumas = {};
+    let hits = 0;
+    for (const d of rs) {
+      const ci = d.charge_info || {};
+      if (ci.detail_type !== 'CHARGE') continue;
+      const concepto = String(ci.transaction_detail || '');
+      if (!/env\u00edo|envio|env\u00edos|envios|devoluci/i.test(concepto.normalize ? concepto.normalize('NFC') : concepto) && !/env|devoluci/i.test(concepto)) continue;
+      const sales = Array.isArray(d.sales_info) ? d.sales_info : [];
+      for (const si of sales) {
+        const oid = si && String(si.order_id);
+        if (oid && devolSet.has(oid)) { sumas[oid] = (sumas[oid] || 0) + (Number(ci.detail_amount) || 0); hits++; break; }
+      }
+    }
+    for (const oid of Object.keys(sumas)) {
+      const { data: cur } = await supabase.from('ventas').select('dev_cargo').eq('user_id', String(user_id)).eq('nro_venta', oid).limit(1);
+      const prev = (cur && cur[0] && Number(cur[0].dev_cargo)) || 0;
+      await supabase.from('ventas').update({ dev_cargo: prev + sumas[oid] }).eq('user_id', String(user_id)).eq('nro_venta', oid);
+    }
+    const nextOffset = offset + rs.length;
+    const done = !rs.length || (total != null && nextOffset >= total);
+    res.json({ period, escaneados: rs.length, total, nextOffset, done, hits, ordenesActualizadas: Object.keys(sumas).length });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
