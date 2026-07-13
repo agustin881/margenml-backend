@@ -1889,6 +1889,59 @@ app.get('/api/devol/probe5', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── PROBE6 (TEMPORAL): lineas de facturacion de ordenes especificas ──
+// GET /api/devol/probe6?user_id=67619515&orders=2000017191703550,2000017077382238,2000017080396472&periods=2026-07-01,2026-06-01
+app.get('/api/devol/probe6', async (req, res) => {
+  try {
+    const user_id = req.query.user_id;
+    if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
+    const orders = new Set(String(req.query.orders || '2000017191703550,2000017077382238,2000017080396472').split(',').map(x => x.trim()).filter(Boolean));
+    const periods = String(req.query.periods || '2026-07-01,2026-06-01').split(',').map(x => x.trim()).filter(Boolean);
+    const token = await getValidToken(user_id);
+    const H = { Authorization: 'Bearer ' + token };
+    const encontrados = [];
+    const meta = { paginas: 0, detallesRecorridos: 0, porPeriodo: {} };
+    for (const key of periods.slice(0, 3)) {
+      let offset = 0; const limit = 1000; let total = null; let vueltas = 0;
+      while (vueltas < 25) {
+        vueltas++;
+        const url = 'https://api.mercadolibre.com/billing/integration/periods/key/' + key + '/group/ML/details?document_type=BILL&limit=' + limit + '&offset=' + offset;
+        const r = await fetch(url, { headers: H });
+        if (r.status !== 200) { meta.porPeriodo[key] = { http: r.status }; break; }
+        const j = await r.json();
+        const rs = Array.isArray(j.results) ? j.results : [];
+        total = j.total;
+        meta.paginas++;
+        meta.detallesRecorridos += rs.length;
+        for (const d of rs) {
+          const sales = Array.isArray(d.sales_info) ? d.sales_info : [];
+          const hit = sales.find(si => si && orders.has(String(si.order_id)));
+          if (hit) {
+            const ci = d.charge_info || {};
+            encontrados.push({
+              period: key,
+              order_id: String(hit.order_id),
+              concepto: ci.transaction_detail,
+              monto: ci.detail_amount,
+              tipo: ci.detail_type,
+              sub_tipo: ci.detail_sub_type,
+              debitado_de_venta: ci.debited_from_operation,
+              bonificado_id: ci.charge_bonified_id,
+              fecha: ci.creation_date_time,
+              descuento: d.discount_info ? { sin_desc: d.discount_info.charge_amount_without_discount, desc: d.discount_info.discount_amount } : null
+            });
+          }
+        }
+        if (!rs.length || offset + rs.length >= (total || 0)) break;
+        offset += limit;
+        await new Promise(rp => setTimeout(rp, 200));
+      }
+      meta.porPeriodo[key] = meta.porPeriodo[key] || { total, paginas: vueltas };
+    }
+    res.json({ encontrados, meta, ref: { malacate: '2000017191703550 (espero ~9860+19720)', freidora: '2000017077382238 (espero ~13920)', silla: '2000017080396472 (espero $0 o bonificado)' } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── SYNC DIARIO: cron job, trae ventas de ayer completas ──────────
 app.get('/api/sync/diario', async (req, res) => {
   const secret = req.headers['x-cron-secret'];
