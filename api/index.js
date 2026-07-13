@@ -1762,6 +1762,44 @@ app.get('/api/venta/inspect', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── PROBE3 (TEMPORAL): donde vive el cargo real por devolucion ──
+// GET /api/devol/probe3?user_id=67619515&claims=5539834073,5533529331,5535841572
+app.get('/api/devol/probe3', async (req, res) => {
+  try {
+    const user_id = req.query.user_id;
+    if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
+    const claims = String(req.query.claims || '5539834073,5533529331,5535841572').split(',').map(x => x.trim()).filter(Boolean);
+    const token = await getValidToken(user_id);
+    const H = { Authorization: 'Bearer ' + token };
+    const out = [];
+    for (const cid of claims.slice(0, 5)) {
+      const caso = { claim: cid, probes: {} };
+      const paths = [
+        ['charges', 'post-purchase/v1/claims/' + cid + '/charges'],
+        ['charges_rsc', 'post-purchase/v1/claims/' + cid + '/charges/return-shipping-costs'],
+        ['returns_v2', 'post-purchase/v2/claims/' + cid + '/returns'],
+        ['returns_v1', 'post-purchase/v1/claims/' + cid + '/returns'],
+        ['detail_returns', 'post-purchase/v1/claims/' + cid + '?with=returns']
+      ];
+      for (const [k, path] of paths) {
+        try {
+          const r = await fetch('https://api.mercadolibre.com/' + path, { headers: H });
+          let j = null; try { j = await r.json(); } catch (e2) {}
+          let resumen = null;
+          if (j) {
+            const txt = JSON.stringify(j);
+            resumen = txt.length > 1200 ? (Array.isArray(j) ? { array: j.length, primer: j[0] } : { keys: Object.keys(j) }) : j;
+          }
+          caso.probes[k] = { http: r.status, body: resumen };
+        } catch (e) { caso.probes[k] = { error: e.message }; }
+        await new Promise(rs => setTimeout(rs, 120));
+      }
+      out.push(caso);
+    }
+    res.json({ casos: out, ref: { malacate: '5539834073 (3 envios cobrados)', freidora: '5533529331 (1 envio)', silla: '5535841572 ($0)' } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── SYNC DIARIO: cron job, trae ventas de ayer completas ──────────
 app.get('/api/sync/diario', async (req, res) => {
   const secret = req.headers['x-cron-secret'];
