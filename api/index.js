@@ -1948,25 +1948,47 @@ app.get('/api/devol/probe6', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── DEVOLUCIONES: cargos reales desde la facturacion de ML ──
-// GET /api/devol/cargos-sync?user_id=..&period=YYYY-MM-01&offset=0[&reset=1]
-// Escanea una pagina de facturacion por llamada; el frontend lo llama en loop.
-app.get('/api/devol/cargos-sync', async (req, res) => {
+// ── DEVOLUCIONES: cargos reales desde la facturacion de ML (incremental con cursor) ──
+// 1) GET /api/devol/cargos-prep?user_id=..&periods=p1,p2  -> prepara cursores (full scan solo la 1ra vez)
+// 2) GET /api/devol/cargos-sync?user_id=..&period=..      -> procesa UNA pagina desde el cursor guardado
+app.get('/api/devol/cargos-prep', async (req, res) => {
   try {
     const user_id = req.query.user_id;
-    if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
-    const period = String(req.query.period || '').trim();
-    if (!period) return res.status(400).json({ error: 'period requerido (YYYY-MM-01)' });
-    let offset = parseInt(req.query.offset) || 0;
-    const reset = req.query.reset === '1';
-    const token = await getValidToken(user_id);
-    const H = { Authorization: 'Bearer ' + token };
-
-    if (reset) {
+    const periods = String(req.query.periods || '').split(',').map(x => x.trim()).filter(Boolean);
+    if (!user_id || !periods.length) return res.status(400).json({ error: 'user_id y periods requeridos' });
+    const { data: cur, error } = await supabase.from('margen_billing_cursor').select('period,next_offset').eq('user_id', String(user_id)).in('period', periods);
+    if (error) return res.status(500).json({ error: error.message, hint: 'falta la tabla margen_billing_cursor?' });
+    const existentes = new Set((cur || []).map(r => r.period));
+    const faltantes = periods.filter(p => !existentes.has(p));
+    let fullScan = false;
+    if (faltantes.length) {
+      fullScan = true;
+      // primera vez: limpiar cargos y arrancar todos los cursores de cero
       await supabase.from('ventas').update({ dev_cargo: null })
         .eq('user_id', String(user_id)).eq('estado', 'cancelled')
         .filter('raw->cancel_detail->>code', 'eq', 'mediations');
+      await supabase.from('margen_billing_cursor').delete().eq('user_id', String(user_id)).in('period', periods);
+      for (const p of periods) {
+        await supabase.from('margen_billing_cursor').insert({ user_id: String(user_id), period: p, next_offset: 0, updated_at: new Date().toISOString() });
+      }
     }
+    const { data: cur2 } = await supabase.from('margen_billing_cursor').select('period,next_offset').eq('user_id', String(user_id)).in('period', periods);
+    res.json({ fullScan, cursores: (cur2 || []) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/devol/cargos-sync', async (req, res) => {
+  try {
+    const user_id = req.query.user_id;
+    const period = String(req.query.period || '').trim();
+    if (!user_id || !period) return res.status(400).json({ error: 'user_id y period requeridos' });
+    const token = await getValidToken(user_id);
+    const H = { Authorization: 'Bearer ' + token };
+
+    // cursor guardado
+    const { data: curRows, error: curErr } = await supabase.from('margen_billing_cursor').select('next_offset').eq('user_id', String(user_id)).eq('period', period).limit(1);
+    if (curErr) return res.status(500).json({ error: curErr.message, hint: 'falta la tabla margen_billing_cursor?' });
+    let offset = (curRows && curRows[0] && curRows[0].next_offset) || 0;
 
     // set de ordenes que son devoluciones (mediations)
     const devolSet = new Set();
@@ -1994,28 +2016,38 @@ app.get('/api/devol/cargos-sync', async (req, res) => {
     const rs = Array.isArray(j.results) ? j.results : [];
     const total = (j.total != null) ? j.total : null;
 
-    // sumar cargos de envio/devolucion de ordenes que son devoluciones
     const sumas = {};
     let hits = 0;
     for (const d of rs) {
       const ci = d.charge_info || {};
-      if (ci.detail_type !== 'CHARGE') continue;
+      const esCargo = ci.detail_type === 'CHARGE';
+      const esCredito = ci.detail_type === 'CREDIT';
+      if (!esCargo && !esCredito) continue;
       const concepto = String(ci.transaction_detail || '');
-      if (!/env\u00edo|envio|env\u00edos|envios|devoluci/i.test(concepto.normalize ? concepto.normalize('NFC') : concepto) && !/env|devoluci/i.test(concepto)) continue;
+      // creditos: bonificaciones/devoluciones de cargos (si reclamaste y ML te lo devolvio)
+      if (!/env|devoluci|bonific/i.test(concepto) && !(esCredito && ci.charge_bonified_id)) continue;
       const sales = Array.isArray(d.sales_info) ? d.sales_info : [];
       for (const si of sales) {
         const oid = si && String(si.order_id);
-        if (oid && devolSet.has(oid)) { sumas[oid] = (sumas[oid] || 0) + (Number(ci.detail_amount) || 0); hits++; break; }
+        if (oid && devolSet.has(oid)) {
+          const monto = Math.abs(Number(ci.detail_amount) || 0);
+          sumas[oid] = (sumas[oid] || 0) + (esCredito ? -monto : monto);
+          hits++; break;
+        }
       }
     }
+    const cambios = [];
     for (const oid of Object.keys(sumas)) {
-      const { data: cur } = await supabase.from('ventas').select('dev_cargo').eq('user_id', String(user_id)).eq('nro_venta', oid).limit(1);
-      const prev = (cur && cur[0] && Number(cur[0].dev_cargo)) || 0;
-      await supabase.from('ventas').update({ dev_cargo: prev + sumas[oid] }).eq('user_id', String(user_id)).eq('nro_venta', oid);
+      const { data: cur } = await supabase.from('ventas').select('dev_cargo,sku').eq('user_id', String(user_id)).eq('nro_venta', oid).limit(1);
+      const prev = (cur && cur[0] && cur[0].dev_cargo != null) ? Number(cur[0].dev_cargo) : null;
+      const nuevo = (prev || 0) + sumas[oid];
+      await supabase.from('ventas').update({ dev_cargo: nuevo }).eq('user_id', String(user_id)).eq('nro_venta', oid);
+      cambios.push({ nro: oid, sku: (cur && cur[0] && cur[0].sku) || '', antes: prev, ahora: nuevo });
     }
     const nextOffset = offset + rs.length;
     const done = !rs.length || (total != null && nextOffset >= total);
-    res.json({ period, escaneados: rs.length, total, nextOffset, done, hits, ordenesActualizadas: Object.keys(sumas).length });
+    await supabase.from('margen_billing_cursor').update({ next_offset: nextOffset, updated_at: new Date().toISOString() }).eq('user_id', String(user_id)).eq('period', period);
+    res.json({ period, escaneados: rs.length, total, nextOffset, done, hits, ordenesActualizadas: Object.keys(sumas).length, cambios });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
