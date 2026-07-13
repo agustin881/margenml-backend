@@ -1901,13 +1901,19 @@ app.get('/api/devol/probe6', async (req, res) => {
     const H = { Authorization: 'Bearer ' + token };
     const encontrados = [];
     const meta = { paginas: 0, detallesRecorridos: 0, porPeriodo: {} };
+    const limit = Math.min(parseInt(req.query.limit) || 300, 1000);
     for (const key of periods.slice(0, 3)) {
-      let offset = 0; const limit = 1000; let total = null; let vueltas = 0;
-      while (vueltas < 25) {
+      let offset = 0; let total = null; let vueltas = 0;
+      while (vueltas < 80) {
         vueltas++;
         const url = 'https://api.mercadolibre.com/billing/integration/periods/key/' + key + '/group/ML/details?document_type=BILL&limit=' + limit + '&offset=' + offset;
-        const r = await fetch(url, { headers: H });
-        if (r.status !== 200) { meta.porPeriodo[key] = { http: r.status }; break; }
+        let r = null;
+        for (let intento = 0; intento < 5; intento++) {
+          r = await fetch(url, { headers: H });
+          if (r.status !== 429) break;
+          await new Promise(rp => setTimeout(rp, 2000 * (intento + 1)));
+        }
+        if (r.status !== 200) { meta.porPeriodo[key] = { http: r.status, offsetAlFallar: offset }; break; }
         const j = await r.json();
         const rs = Array.isArray(j.results) ? j.results : [];
         total = j.total;
@@ -1934,7 +1940,7 @@ app.get('/api/devol/probe6', async (req, res) => {
         }
         if (!rs.length || offset + rs.length >= (total || 0)) break;
         offset += limit;
-        await new Promise(rp => setTimeout(rp, 200));
+        await new Promise(rp => setTimeout(rp, 700));
       }
       meta.porPeriodo[key] = meta.porPeriodo[key] || { total, paginas: vueltas };
     }
