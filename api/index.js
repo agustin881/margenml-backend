@@ -1908,10 +1908,10 @@ app.get('/api/devol/probe6', async (req, res) => {
         vueltas++;
         const url = 'https://api.mercadolibre.com/billing/integration/periods/key/' + key + '/group/ML/details?document_type=BILL&limit=' + limit + '&offset=' + offset;
         let r = null;
-        for (let intento = 0; intento < 5; intento++) {
+        for (let intento = 0; intento < 6; intento++) {
           r = await fetch(url, { headers: H });
           if (r.status !== 429) break;
-          await new Promise(rp => setTimeout(rp, 2000 * (intento + 1)));
+          await new Promise(rp => setTimeout(rp, 15000));
         }
         if (r.status !== 200) { meta.porPeriodo[key] = { http: r.status, offsetAlFallar: offset }; break; }
         const j = await r.json();
