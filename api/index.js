@@ -2019,6 +2019,48 @@ app.get('/api/devol/cargos-sync', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── PROBE7 (TEMPORAL): variantes de filtro por orden en facturacion ──
+// GET /api/devol/probe7?user_id=67619515&order=2000017191703550
+app.get('/api/devol/probe7', async (req, res) => {
+  try {
+    const user_id = req.query.user_id;
+    if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
+    const orderId = String(req.query.order || '2000017191703550').trim();
+    const token = await getValidToken(user_id);
+    const H = { Authorization: 'Bearer ' + token };
+    const out = { order: orderId, variantes: {} };
+    const urls = [
+      ['v1_order_details', 'https://api.mercadolibre.com/billing/integration/group/ML/order/' + orderId + '/details?document_type=BILL'],
+      ['v1_order_details_noDoc', 'https://api.mercadolibre.com/billing/integration/group/ML/order/' + orderId + '/details'],
+      ['v2_order', 'https://api.mercadolibre.com/billing/integration/order/' + orderId + '/details?group=ML'],
+      ['periods_orderparam', 'https://api.mercadolibre.com/billing/integration/periods/key/2026-07-01/group/ML/details?document_type=BILL&limit=10&offset=0&sales_info.order_id=' + orderId]
+    ];
+    for (const [k, url] of urls) {
+      try {
+        let r = null;
+        for (let i = 0; i < 3; i++) {
+          r = await fetch(url, { headers: H });
+          if (r.status !== 429) break;
+          await new Promise(rp => setTimeout(rp, 8000));
+        }
+        let j = null; try { j = await r.json(); } catch (e2) {}
+        let resumen = null;
+        if (j) {
+          const txt = JSON.stringify(j);
+          if (txt.length <= 2500) resumen = j;
+          else {
+            const rs = j.results || [];
+            resumen = { keys: Object.keys(j), total: j.total, resultados: rs.length, lineas: rs.slice(0, 8).map(d => ({ concepto: d.charge_info && d.charge_info.transaction_detail, monto: d.charge_info && d.charge_info.detail_amount, tipo: d.charge_info && d.charge_info.detail_type, orden: d.sales_info && d.sales_info[0] && d.sales_info[0].order_id })) };
+          }
+        }
+        out.variantes[k] = { http: r.status, body: resumen };
+      } catch (e) { out.variantes[k] = { error: e.message }; }
+      await new Promise(rp => setTimeout(rp, 400));
+    }
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── SYNC DIARIO: cron job, trae ventas de ayer completas ──────────
 app.get('/api/sync/diario', async (req, res) => {
   const secret = req.headers['x-cron-secret'];
