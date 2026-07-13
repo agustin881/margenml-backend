@@ -1800,6 +1800,50 @@ app.get('/api/devol/probe3', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── PROBE4 (TEMPORAL): retorno completo + costos de envios de devolucion ──
+// GET /api/devol/probe4?user_id=67619515&claims=5539834073,5535841572
+app.get('/api/devol/probe4', async (req, res) => {
+  try {
+    const user_id = req.query.user_id;
+    if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
+    const claims = String(req.query.claims || '5539834073,5535841572').split(',').map(x => x.trim()).filter(Boolean);
+    const token = await getValidToken(user_id);
+    const H = { Authorization: 'Bearer ' + token };
+    const out = [];
+    for (const cid of claims.slice(0, 4)) {
+      const caso = { claim: cid };
+      try {
+        const r = await fetch('https://api.mercadolibre.com/post-purchase/v2/claims/' + cid + '/returns', { headers: H });
+        const j = await r.json();
+        caso.return_http = r.status;
+        caso.subtype = j.subtype; caso.status = j.status; caso.status_money = j.status_money; caso.refund_at = j.refund_at;
+        caso.intermediate_check = j.intermediate_check;
+        caso.shipments_raw = j.shipments;
+        const shipIds = [];
+        (Array.isArray(j.shipments) ? j.shipments : []).forEach(sh => { const id = sh && (sh.id || sh.shipment_id); if (id) shipIds.push(id); });
+        caso.envios_devolucion = [];
+        for (const sid of shipIds.slice(0, 3)) {
+          const e = { shipment: sid };
+          try {
+            const r2 = await fetch('https://api.mercadolibre.com/shipments/' + sid, { headers: { ...H, 'x-format-new': 'true' } });
+            const js = await r2.json();
+            e.status = js.status; e.substatus = js.substatus; e.logistic = js.logistic && js.logistic.type;
+          } catch (e2) { e.shipErr = e2.message; }
+          try {
+            const r3 = await fetch('https://api.mercadolibre.com/shipments/' + sid + '/costs', { headers: { ...H, 'x-format-new': 'true' } });
+            const jc = await r3.json();
+            e.costs = { gross_amount: jc.gross_amount, receiver: jc.receiver ? { cost: jc.receiver.cost, save: jc.receiver.save } : null, senders: Array.isArray(jc.senders) ? jc.senders.map(x => ({ cost: x.cost, save: x.save, compensation: x.compensation, charges: x.charges })) : jc.senders };
+          } catch (e3) { e.costErr = e3.message; }
+          caso.envios_devolucion.push(e);
+          await new Promise(rs => setTimeout(rs, 120));
+        }
+      } catch (e) { caso.error = e.message; }
+      out.push(caso);
+    }
+    res.json({ casos: out, ref: { malacate: '5539834073 (cargo devolucion $19.720 + ida $9.860)', silla: '5535841572 ($0)' } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── SYNC DIARIO: cron job, trae ventas de ayer completas ──────────
 app.get('/api/sync/diario', async (req, res) => {
   const secret = req.headers['x-cron-secret'];
