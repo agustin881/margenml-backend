@@ -1844,6 +1844,51 @@ app.get('/api/devol/probe4', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── PROBE5 (TEMPORAL): API de facturacion ML (cargos reales por devolucion) ──
+// GET /api/devol/probe5?user_id=67619515&order=2000017191703550
+app.get('/api/devol/probe5', async (req, res) => {
+  try {
+    const user_id = req.query.user_id;
+    if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
+    const orderId = String(req.query.order || '2000017191703550').trim();
+    const token = await getValidToken(user_id);
+    const H = { Authorization: 'Bearer ' + token };
+    const out = { orderBuscada: orderId };
+
+    // 1) periodos de facturacion
+    try {
+      const r1 = await fetch('https://api.mercadolibre.com/billing/integration/monthly/periods?group=ML&document_type=BILL&offset=0&limit=3', { headers: H });
+      const j1 = await r1.json();
+      out.periodos = { http: r1.status, body: (JSON.stringify(j1).length > 1500 ? { keys: Object.keys(j1), primer: (j1.results && j1.results[0]) || null } : j1) };
+      // 2) detalles del periodo mas reciente, probando variantes de filtro por orden
+      const key = j1 && j1.results && j1.results[0] && (j1.results[0].key || (j1.results[0].period && j1.results[0].period.key));
+      out.periodKey = key || null;
+      if (key) {
+        const variantes = [
+          ['det_orderfilter', 'https://api.mercadolibre.com/billing/integration/periods/key/' + key + '/group/ML/details?document_type=BILL&limit=5&offset=0&order_id=' + orderId],
+          ['det_sample', 'https://api.mercadolibre.com/billing/integration/periods/key/' + key + '/group/ML/details?document_type=BILL&limit=3&offset=0']
+        ];
+        out.detalles = {};
+        for (const [k, url] of variantes) {
+          try {
+            const r2 = await fetch(url, { headers: H });
+            let j2 = null; try { j2 = await r2.json(); } catch (e2) {}
+            let resumen = null;
+            if (j2) {
+              const txt = JSON.stringify(j2);
+              if (txt.length <= 3000) resumen = j2;
+              else resumen = { keys: Object.keys(j2), total: j2.total || (j2.paging && j2.paging.total), primer: (j2.results && j2.results[0]) || null };
+            }
+            out.detalles[k] = { http: r2.status, body: resumen };
+          } catch (e) { out.detalles[k] = { error: e.message }; }
+          await new Promise(rs => setTimeout(rs, 150));
+        }
+      }
+    } catch (e) { out.periodos = { error: e.message }; }
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── SYNC DIARIO: cron job, trae ventas de ayer completas ──────────
 app.get('/api/sync/diario', async (req, res) => {
   const secret = req.headers['x-cron-secret'];
