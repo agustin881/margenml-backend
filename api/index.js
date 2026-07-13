@@ -1697,6 +1697,71 @@ app.get('/api/devol/ver', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── INSPECTOR de venta (TEMPORAL): todo lo que ML devuelve de una venta ──
+// GET /api/venta/inspect?user_id=67619515&nro=2000013785412851
+app.get('/api/venta/inspect', async (req, res) => {
+  try {
+    const user_id = req.query.user_id;
+    const nro = String(req.query.nro || '').trim();
+    if (!user_id || !nro) return res.status(400).json({ error: 'user_id y nro requeridos' });
+    const token = await getValidToken(user_id);
+    const H = { Authorization: 'Bearer ' + token };
+    const out = { nro };
+
+    // 1) fila en nuestra base (por nro_venta o pack_id)
+    let { data: rows } = await supabase.from('ventas')
+      .select('nro_venta,pack_id,sku,titulo,unidades,precio,comision,costo_envio,precio_comprador_envio,logistic_type,estado,fecha,dev_return,dev_benef,raw')
+      .eq('user_id', String(user_id)).or('nro_venta.eq.' + nro + ',pack_id.eq.' + nro);
+    out.enBase = (rows || []).map(r => ({ nro_venta: r.nro_venta, pack_id: r.pack_id, sku: r.sku, unidades: r.unidades, precio: r.precio, comision: r.comision, costo_envio: r.costo_envio, ingreso_envio_comprador: r.precio_comprador_envio, logistic: r.logistic_type, estado: r.estado, fecha: r.fecha, dev_return: r.dev_return, dev_benef: r.dev_benef }));
+
+    let orderIds = (rows || []).map(r => r.nro_venta);
+    if (!orderIds.length) orderIds = [nro];
+
+    // 2) orden fresca de ML (montos y pagos)
+    out.ordenes = [];
+    for (const oid of orderIds.slice(0, 4)) {
+      try {
+        const r1 = await fetch('https://api.mercadolibre.com/orders/' + oid, { headers: H });
+        const o = await r1.json();
+        if (o && o.id) {
+          out.ordenes.push({
+            id: o.id, status: o.status,
+            cancel_code: o.cancel_detail ? o.cancel_detail.code : null,
+            total_amount: o.total_amount, paid_amount: o.paid_amount,
+            pagos: Array.isArray(o.payments) ? o.payments.map(p => ({ status: p.status, transaction_amount: p.transaction_amount, refunded: p.transaction_amount_refunded, shipping_cost: p.shipping_cost, marketplace_fee: p.marketplace_fee })) : [],
+            mediations: Array.isArray(o.mediations) ? o.mediations.map(m => m.id) : [],
+            shipping_id: o.shipping && o.shipping.id, tags: o.tags
+          });
+        } else out.ordenes.push({ id: oid, error: o && (o.message || o.error) });
+      } catch (e) { out.ordenes.push({ id: oid, error: e.message }); }
+    }
+
+    // 3) costos reales del envio
+    out.envios = [];
+    const shipIds = [...new Set(out.ordenes.map(o => o.shipping_id).filter(Boolean))];
+    for (const sid of shipIds.slice(0, 3)) {
+      try {
+        const r2 = await fetch('https://api.mercadolibre.com/shipments/' + sid + '/costs', { headers: { ...H, 'x-format-new': 'true' } });
+        const c = await r2.json();
+        out.envios.push({ shipment: sid, gross_amount: c.gross_amount, receiver_cost: c.receiver ? c.receiver.cost : null, senders: Array.isArray(c.senders) ? c.senders.map(x => ({ cost: x.cost, save: x.save, compensation: x.compensation, charges: x.charges })) : c.senders });
+      } catch (e) { out.envios.push({ shipment: sid, error: e.message }); }
+    }
+
+    // 4) reclamo / mediacion
+    out.reclamos = [];
+    const medIds = [...new Set([].concat(...out.ordenes.map(o => o.mediations || [])))];
+    for (const mid of medIds.slice(0, 3)) {
+      try {
+        const r3 = await fetch('https://api.mercadolibre.com/post-purchase/v1/claims/' + mid, { headers: H });
+        const j = await r3.json();
+        out.reclamos.push({ claim: mid, type: j.type, stage: j.stage, status: j.status, reason_id: j.reason_id, resolution: j.resolution || null, related_entities: j.related_entities || null });
+      } catch (e) { out.reclamos.push({ claim: mid, error: e.message }); }
+    }
+
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── SYNC DIARIO: cron job, trae ventas de ayer completas ──────────
 app.get('/api/sync/diario', async (req, res) => {
   const secret = req.headers['x-cron-secret'];
