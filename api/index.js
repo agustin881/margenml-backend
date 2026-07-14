@@ -1977,6 +1977,7 @@ app.get('/api/devol/cargos-prep', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+const _devolCache = {};
 app.get('/api/devol/cargos-sync', async (req, res) => {
   try {
     const user_id = req.query.user_id;
@@ -1990,9 +1991,14 @@ app.get('/api/devol/cargos-sync', async (req, res) => {
     if (curErr) return res.status(500).json({ error: curErr.message, hint: 'falta la tabla margen_billing_cursor?' });
     let offset = (curRows && curRows[0] && curRows[0].next_offset) || 0;
 
-    // set de ordenes que son devoluciones (mediations)
-    const devolSet = new Set();
-    const devolPacks = {};
+    // set de ordenes que son devoluciones (mediations) - cacheado 10 min
+    const cacheKey = String(user_id);
+    let devolSet, devolPacks;
+    if (_devolCache[cacheKey] && (Date.now() - _devolCache[cacheKey].ts) < 600000) {
+      devolSet = _devolCache[cacheKey].set; devolPacks = _devolCache[cacheKey].packs;
+    } else {
+    devolSet = new Set();
+    devolPacks = {};
     let off2 = 0;
     while (true) {
       const { data, error } = await supabase.from('ventas').select('nro_venta,pack_id')
@@ -2004,18 +2010,32 @@ app.get('/api/devol/cargos-sync', async (req, res) => {
       if (data.length < 1000) break;
       off2 += 1000;
     }
-
-    const url = 'https://api.mercadolibre.com/billing/integration/periods/key/' + period + '/group/ML/details?document_type=BILL&limit=150&offset=' + offset;
-    let r = null;
-    for (let i = 0; i < 4; i++) {
-      r = await fetch(url, { headers: H });
-      if (r.status !== 429) break;
-      await new Promise(rp => setTimeout(rp, 6000));
+    _devolCache[cacheKey] = { set: devolSet, packs: devolPacks, ts: Date.now() };
     }
-    if (!r || r.status !== 200) return res.json({ period, offset, http: r ? r.status : null, reintentar: true, done: false });
-    const j = await r.json();
-    const rs = Array.isArray(j.results) ? j.results : [];
-    const total = (j.total != null) ? j.total : null;
+
+    let rs = [];
+    let total = null;
+    let paginasOk = 0;
+    for (let pg = 0; pg < 6; pg++) {
+      const url = 'https://api.mercadolibre.com/billing/integration/periods/key/' + period + '/group/ML/details?document_type=BILL&limit=150&offset=' + (offset + rs.length);
+      let r = null;
+      for (let i = 0; i < 4; i++) {
+        r = await fetch(url, { headers: H });
+        if (r.status !== 429) break;
+        await new Promise(rp => setTimeout(rp, 5000));
+      }
+      if (!r || r.status !== 200) {
+        if (!paginasOk) return res.json({ period, offset, http: r ? r.status : null, reintentar: true, done: false });
+        break;
+      }
+      const j = await r.json();
+      const pagina = Array.isArray(j.results) ? j.results : [];
+      if (j.total != null) total = j.total;
+      rs = rs.concat(pagina);
+      paginasOk++;
+      if (!pagina.length || (total != null && offset + rs.length >= total)) break;
+      await new Promise(rp => setTimeout(rp, 250));
+    }
 
     const sumas = {};
     let hits = 0;
@@ -3014,3 +3034,28 @@ app.get('/api/envio/diag', async (req, res) => {
 app.listen(PORT, () => console.log(`MargenML backend v34 (verificados) corriendo en puerto ${PORT}`));
 
 module.exports = app;
+
+// ── CARGOS DE DEVOLUCIONES: sincronizacion automatica cada 5 dias (ultimos 60 dias / 3 periodos) ──
+async function _cargosAutoSync() {
+  try {
+    const user_id = '67619515';
+    const base = 'https://margenml-backend-production.up.railway.app';
+    const h = new Date();
+    const per = [];
+    for (let k = 2; k >= 0; k--) { const d = new Date(h.getFullYear(), h.getMonth() - k, 1); per.push(d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-01'); }
+    console.log('[CARGOS-AUTO] arrancando, periodos:', per.join(','));
+    await fetch(base + '/api/devol/cargos-prep?user_id=' + user_id + '&periods=' + per.join(','));
+    for (const p of per) {
+      for (let i = 0; i < 500; i++) {
+        const r = await fetch(base + '/api/devol/cargos-sync?user_id=' + user_id + '&period=' + p);
+        const d = await r.json();
+        if (d.reintentar) { await new Promise(rs => setTimeout(rs, 20000)); continue; }
+        if (d.error || d.done) break;
+        await new Promise(rs => setTimeout(rs, 500));
+      }
+    }
+    console.log('[CARGOS-AUTO] completado');
+  } catch (e) { console.log('[CARGOS-AUTO] error:', e.message); }
+}
+setTimeout(_cargosAutoSync, 5 * 60 * 1000);          // 5 min despues de arrancar
+setInterval(_cargosAutoSync, 5 * 24 * 60 * 60 * 1000); // y cada 5 dias
