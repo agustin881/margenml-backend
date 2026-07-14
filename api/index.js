@@ -1992,14 +1992,15 @@ app.get('/api/devol/cargos-sync', async (req, res) => {
 
     // set de ordenes que son devoluciones (mediations)
     const devolSet = new Set();
+    const devolPacks = {};
     let off2 = 0;
     while (true) {
-      const { data, error } = await supabase.from('ventas').select('nro_venta')
+      const { data, error } = await supabase.from('ventas').select('nro_venta,pack_id')
         .eq('user_id', String(user_id)).eq('estado', 'cancelled')
         .filter('raw->cancel_detail->>code', 'eq', 'mediations')
         .range(off2, off2 + 999);
       if (error || !data || !data.length) break;
-      data.forEach(r => devolSet.add(String(r.nro_venta)));
+      data.forEach(r => { devolSet.add(String(r.nro_venta)); if (r.pack_id) devolPacks[String(r.pack_id)] = String(r.nro_venta); });
       if (data.length < 1000) break;
       off2 += 1000;
     }
@@ -2027,13 +2028,20 @@ app.get('/api/devol/cargos-sync', async (req, res) => {
       // creditos: bonificaciones/devoluciones de cargos (si reclamaste y ML te lo devolvio)
       if (!/env|devoluci|bonific/i.test(concepto) && !(esCredito && ci.charge_bonified_id)) continue;
       const sales = Array.isArray(d.sales_info) ? d.sales_info : [];
+      let destino = null;
       for (const si of sales) {
         const oid = si && String(si.order_id);
-        if (oid && devolSet.has(oid)) {
-          const monto = Math.abs(Number(ci.detail_amount) || 0);
-          sumas[oid] = (sumas[oid] || 0) + (esCredito ? -monto : monto);
-          hits++; break;
-        }
+        if (oid && devolSet.has(oid)) { destino = oid; break; }
+        const pid = si && si.pack_id && String(si.pack_id);
+        if (pid && devolPacks[pid]) { destino = devolPacks[pid]; break; }
+      }
+      if (!destino && d.shipping_info && d.shipping_info.pack_id && devolPacks[String(d.shipping_info.pack_id)]) {
+        destino = devolPacks[String(d.shipping_info.pack_id)];
+      }
+      if (destino) {
+        const monto = Math.abs(Number(ci.detail_amount) || 0);
+        sumas[destino] = (sumas[destino] || 0) + (esCredito ? -monto : monto);
+        hits++;
       }
     }
     const cambios = [];
