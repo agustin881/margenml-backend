@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v34-verificados', costo_congelado: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v36-permisos-asistente', costo_congelado: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -29,14 +29,16 @@ async function requireAuth(req, res, next) {
     try {
       const email = String(data.user.email || '').toLowerCase().trim();
       const { data: rolRow } = await supabase.from('mml_roles')
-        .select('rol,pestanas,apps').eq('email', email).single();
+        .select('rol,pestanas,apps,acciones').eq('email', email).single();
       req.rol      = (rolRow && rolRow.rol) || 'operador';
       req.pestanas = (rolRow && rolRow.pestanas) || null;
       req.apps     = (rolRow && rolRow.apps) || null;
+      req.acciones = (rolRow && rolRow.acciones) || null;
     } catch (e) {
       req.rol = 'operador';
       req.pestanas = null;
       req.apps = null;
+      req.acciones = null;
     }
     next();
   } catch (e) {
@@ -53,9 +55,75 @@ function soloRoles(...roles) {
   };
 }
 
+// ── Middleware: exige tener HABILITADA una app de Pontec OS ────────
+// Promociones y Asistente ya NO dependen de Rentabilidad ni del rol: se
+// habilitan por usuario desde el panel de Usuarios del hub (campo "apps").
+// Esta lista debe ser IGUAL a appsPorRol() del hub, para que lo que se ve
+// en el menu y lo que deja hacer el backend nunca se contradigan.
+function appsPorRol(rol) {
+  if (rol === 'admin' || rol === 'encargado') return ['rentabilidad', 'logistica', 'promos', 'respondia', 'asistente'];
+  return ['rentabilidad', 'logistica'];
+}
+function puedeApp(app) {
+  return (req, res, next) => {
+    if (req.rol === 'admin') return next();   // el admin siempre puede todo
+    const habilitadas = (req.apps && req.apps.length) ? req.apps : appsPorRol(req.rol);
+    if (habilitadas.includes(app)) return next();
+    return res.status(403).json({
+      error: 'Sin permiso para esta seccion',
+      rol: req.rol,
+      detalle: 'Tu usuario no tiene habilitado el modulo "' + app + '". Pediselo al admin en Pontec OS > Usuarios.'
+    });
+  };
+}
+
+// ══ PERMISOS FINOS DEL ASISTENTE ══════════════════════════════════
+// Todos pueden usar el Asistente, pero cada usuario hace SOLO lo que
+// tiene tildado en Pontec OS > Usuarios. Se guarda en mml_roles.acciones.
+const ASIS_PERMISOS = {
+  consultar:  'Consultar publicaciones y promos',
+  ventas:     'Ver ventas y ganancias',
+  desc_poner: 'Poner descuentos',
+  desc_sacar: 'Sacar descuentos',
+  desc_todos: 'Sacar TODOS los descuentos del catalogo',
+  smart:      'Sumar productos a campanas SMART',
+  fotos:      'Copiar fotos entre publicaciones',
+  medidas:    'Cargar medidas de embalaje en ML'
+};
+// que permiso exige cada accion que entiende el asistente
+const ASIS_ACCION_PERM = {
+  buscar: 'consultar', ver_promos: 'consultar',
+  ventas: 'ventas',
+  aplicar_descuento: 'desc_poner',
+  quitar_descuento: 'desc_sacar',
+  quitar_todo: 'desc_todos',
+  smart: 'smart', smart_aplicar: 'smart',
+  clonar_fotos: 'fotos',
+  medidas: 'medidas'
+  // 'multi' se valida por dentro (cada sub-accion) y 'charla' no exige nada
+};
+// Default cuando el usuario no tiene nada tildado (respeta lo que ya podia hacer).
+function accionesPorRol(rol) {
+  if (rol === 'admin') return Object.keys(ASIS_PERMISOS);
+  if (rol === 'encargado') return ['consultar', 'ventas'];
+  return ['consultar'];
+}
+function permisosDe(req) {
+  if (req.rol === 'admin') return Object.keys(ASIS_PERMISOS);  // el admin siempre todo
+  return (req.acciones && req.acciones.length) ? req.acciones : accionesPorRol(req.rol);
+}
+// ¿puede ejecutar esta accion del asistente? Devuelve null si puede, o el texto del "no".
+function noPuedeAccion(req, accion) {
+  const perm = ASIS_ACCION_PERM[accion];
+  if (!perm) return null;                       // charla / multi: no exigen permiso propio
+  if (permisosDe(req).includes(perm)) return null;
+  return 'No tenes permiso para: ' + ASIS_PERMISOS[perm] + '. Pediselo al admin en Pontec OS > Usuarios.';
+}
+
 // ── Quien soy: el frontend pregunta el rol para armar el menu ──────
 app.get('/api/mi-rol', requireAuth, (req, res) => {
-  res.json({ email: req.authUser.email, rol: req.rol, pestanas: req.pestanas, apps: req.apps });
+  res.json({ email: req.authUser.email, rol: req.rol, pestanas: req.pestanas, apps: req.apps,
+    acciones: req.acciones, acciones_efectivas: permisosDe(req), catalogo_acciones: ASIS_PERMISOS });
 });
 
 // ══ USUARIOS v14 (solo admin): gestion del equipo desde el panel ══
@@ -65,7 +133,7 @@ app.get('/api/mi-rol', requireAuth, (req, res) => {
 app.get('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) => {
   try {
     const { data, error } = await supabase.from('mml_roles')
-      .select('email,rol,pestanas,apps,user_id,creado').order('creado', { ascending: true });
+      .select('email,rol,pestanas,apps,acciones,user_id,creado').order('creado', { ascending: true });
     if (error) return res.status(500).json({ error: error.message });
     res.json({ usuarios: data || [] });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -132,6 +200,13 @@ app.put('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) => {
       else if (Array.isArray(a)) upd.apps = a.filter(x => appsOk.indexOf(String(x)) > -1);
       else return res.status(400).json({ error: 'apps debe ser lista o null' });
     }
+    if (req.body && ('acciones' in req.body)) {
+      const ac = req.body.acciones;
+      const okAc = Object.keys(ASIS_PERMISOS);
+      if (ac === null) upd.acciones = null;
+      else if (Array.isArray(ac)) upd.acciones = ac.filter(x => okAc.indexOf(String(x)) > -1);
+      else return res.status(400).json({ error: 'acciones debe ser lista o null' });
+    }
     const { error } = await supabase.from('mml_roles').upsert(upd, { onConflict: 'email' });
     if (error) return res.status(500).json({ error: error.message });
     res.json({ ok: true, email, rol });
@@ -165,7 +240,7 @@ app.delete('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) =>
 // Lectura: admin y encargado. Aplicar/quitar: SOLO admin.
 
 // Campañas y promos disponibles del vendedor
-app.get('/api/promos', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
+app.get('/api/promos', requireAuth, puedeApp('promos'), async (req, res) => {
   try {
     const userId = req.query.user_id || '67619515';
     const token = await getValidToken(userId);
@@ -179,7 +254,7 @@ app.get('/api/promos', requireAuth, soloRoles('admin', 'encargado'), async (req,
 });
 
 // Items de una promo (candidatos + activos)
-app.get('/api/promos/items', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
+app.get('/api/promos/items', requireAuth, puedeApp('promos'), async (req, res) => {
   try {
     const userId = req.query.user_id || '67619515';
     const { promotion_id, promotion_type } = req.query;
@@ -198,7 +273,7 @@ app.get('/api/promos/items', requireAuth, soloRoles('admin', 'encargado'), async
 });
 
 // Titulos + SKU + precio de items (para mostrar lindo y cruzar con costos)
-app.get('/api/promos/titulos', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
+app.get('/api/promos/titulos', requireAuth, puedeApp('promos'), async (req, res) => {
   try {
     const userId = req.query.user_id || '67619515';
     const ids = String(req.query.ids || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -229,7 +304,7 @@ app.get('/api/promos/titulos', requireAuth, soloRoles('admin', 'encargado'), asy
 });
 
 // Promos activas de UN item
-app.get('/api/promos/item/:item_id', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
+app.get('/api/promos/item/:item_id', requireAuth, puedeApp('promos'), async (req, res) => {
   try {
     const userId = req.query.user_id || '67619515';
     const token = await getValidToken(userId);
@@ -243,7 +318,7 @@ app.get('/api/promos/item/:item_id', requireAuth, soloRoles('admin', 'encargado'
 });
 
 // Aplicar oferta a un item (campaña o descuento individual PRICE_DISCOUNT)
-app.post('/api/promos/aplicar', requireAuth, soloRoles('admin'), async (req, res) => {
+app.post('/api/promos/aplicar', requireAuth, puedeApp('promos'), async (req, res) => {
   try {
     const userId = (req.body && req.body.user_id) || '67619515';
     const itemId = req.body && req.body.item_id;
@@ -275,7 +350,7 @@ app.post('/api/promos/aplicar', requireAuth, soloRoles('admin'), async (req, res
 
 // Quitar oferta(s) de un item. Con promotion_type+promotion_id saca ESA;
 // sin parametros saca TODAS las que se puedan (delete masivo de ML).
-app.delete('/api/promos/quitar', requireAuth, soloRoles('admin'), async (req, res) => {
+app.delete('/api/promos/quitar', requireAuth, puedeApp('promos'), async (req, res) => {
   try {
     const userId = req.query.user_id || '67619515';
     const itemId = req.query.item_id;
@@ -373,7 +448,7 @@ async function itemsMini(ids, token) {
 
 // GET /api/promos/analisis -> recorre TODAS las campañas y devuelve
 // cada item con precio actual, sugerido de ML y costo de Contabilium.
-app.get('/api/promos/analisis', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
+app.get('/api/promos/analisis', requireAuth, puedeApp('promos'), async (req, res) => {
   try {
     const userId = req.query.user_id || '67619515';
     const maxPag = Math.min(parseInt(req.query.max_paginas) || 4, 10);
@@ -686,17 +761,26 @@ async function asistenteVerPromos(p, userId, token) {
   return lineas.join('\n');
 }
 
-app.post('/api/asistente', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
+app.post('/api/asistente', requireAuth, puedeApp('asistente'), async (req, res) => {
   try {
     const userId = (req.body && req.body.user_id) || '67619515';
     const token = await getValidToken(userId);
     if (!token) return res.status(400).json({ error: 'Sin token ML' });
     const esAdmin = req.rol === 'admin';
+    const puedeSmart = permisosDe(req).includes('smart');
 
     // Boton Confirmar: ejecuta la accion pendiente tal cual se mostro
     const conf = req.body && req.body.confirmar;
     if (conf && conf.accion) {
-      if (!esAdmin) return res.json({ respuesta: 'Solo un admin puede confirmar cambios.' });
+      const noC = noPuedeAccion(req, conf.accion === 'multi' ? 'charla' : conf.accion);
+      if (noC) return res.json({ respuesta: noC });
+      // en un "multi" revisamos cada sub-accion por separado
+      if (conf.accion === 'multi' && Array.isArray(conf.acciones)) {
+        for (const sub of conf.acciones) {
+          const noS = noPuedeAccion(req, sub.accion);
+          if (noS) return res.json({ respuesta: noS });
+        }
+      }
       if (conf.accion === 'smart_aplicar' && Array.isArray(conf.objetivos)) {
         let okS = 0, errS = 0;
         const erroresS = [];
@@ -764,9 +848,14 @@ app.post('/api/asistente', requireAuth, soloRoles('admin', 'encargado'), async (
     const j = llm.json || {};
     const p = j.parametros || {};
 
-    const ESCRITURA = ['quitar_descuento','aplicar_descuento','multi','quitar_todo','clonar_fotos','medidas'];
-    if (ESCRITURA.indexOf(j.accion) > -1 && !esAdmin) {
-      return res.json({ respuesta: 'Tu usuario puede consultar (ventas, promociones, publicaciones) pero los cambios los hace un admin.' });
+    // Permisos finos: cada accion exige su tilde en Pontec OS > Usuarios
+    const noP = noPuedeAccion(req, j.accion);
+    if (noP) return res.json({ respuesta: noP });
+    if (j.accion === 'multi' && Array.isArray((j.parametros || {}).acciones)) {
+      for (const sub of j.parametros.acciones) {
+        const noS = noPuedeAccion(req, sub.accion);
+        if (noS) return res.json({ respuesta: noS });
+      }
     }
 
     if (j.accion === 'ventas') {
@@ -873,9 +962,9 @@ app.post('/api/asistente', requireAuth, soloRoles('admin', 'encargado'), async (
       }).join('\n');
       const resp = 'Encontre ' + props.length + ' propuesta(s) donde pones hasta ' + maxMi + '% y ML aporta el resto:\n' + lineasS
         + (masHayS ? '\n(Hay mas: proceso estas primero.)' : '')
-        + (esAdmin ? '\nConfirmas para sumarlas TODAS a sus campanas?' : '\n(Solo lectura: aplicar es de admin.)');
+        + (puedeSmart ? '\nConfirmas para sumarlas TODAS a sus campanas?' : '\n(Solo lectura: no tenes permiso para sumarlas.)');
       const out = { respuesta: resp };
-      if (esAdmin) out.pendiente = { accion: 'smart_aplicar', objetivos: props.map(x => ({ item: x.item, promo_id: x.promo_id, type: x.type, sug: x.sug })) };
+      if (puedeSmart) out.pendiente = { accion: 'smart_aplicar', objetivos: props.map(x => ({ item: x.item, promo_id: x.promo_id, type: x.type, sug: x.sug })) };
       return res.json(out);
     }
 
@@ -1019,7 +1108,7 @@ app.post('/api/asistente', requireAuth, soloRoles('admin', 'encargado'), async (
 
 // Numeros reales por SKU: comision % y envio neto promedio de ventas recientes
 // (para calcular el "limpio" en la app Promociones con datos propios)
-app.get('/api/promos/reales', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
+app.get('/api/promos/reales', requireAuth, puedeApp('promos'), async (req, res) => {
   try {
     const userId = req.query.user_id || '67619515';
     const skus = String(req.query.skus || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean).slice(0, 120);
