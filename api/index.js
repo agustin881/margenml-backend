@@ -29,16 +29,18 @@ async function requireAuth(req, res, next) {
     try {
       const email = String(data.user.email || '').toLowerCase().trim();
       const { data: rolRow } = await supabase.from('mml_roles')
-        .select('rol,pestanas,apps,acciones').eq('email', email).single();
+        .select('rol,pestanas,apps,acciones,pestanas_logistica').eq('email', email).single();
       req.rol      = (rolRow && rolRow.rol) || 'operador';
       req.pestanas = (rolRow && rolRow.pestanas) || null;
       req.apps     = (rolRow && rolRow.apps) || null;
       req.acciones = (rolRow && rolRow.acciones) || null;
+      req.pestanas_logistica = (rolRow && rolRow.pestanas_logistica) || null;
     } catch (e) {
       req.rol = 'operador';
       req.pestanas = null;
       req.apps = null;
       req.acciones = null;
+      req.pestanas_logistica = null;
     }
     next();
   } catch (e) {
@@ -122,7 +124,7 @@ function noPuedeAccion(req, accion) {
 
 // ── Quien soy: el frontend pregunta el rol para armar el menu ──────
 app.get('/api/mi-rol', requireAuth, (req, res) => {
-  res.json({ email: req.authUser.email, rol: req.rol, pestanas: req.pestanas, apps: req.apps,
+  res.json({ email: req.authUser.email, rol: req.rol, pestanas: req.pestanas, apps: req.apps, pestanas_logistica: req.pestanas_logistica,
     acciones: req.acciones, acciones_efectivas: permisosDe(req), catalogo_acciones: ASIS_PERMISOS });
 });
 
@@ -133,7 +135,7 @@ app.get('/api/mi-rol', requireAuth, (req, res) => {
 app.get('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) => {
   try {
     const { data, error } = await supabase.from('mml_roles')
-      .select('email,rol,pestanas,apps,acciones,user_id,creado').order('creado', { ascending: true });
+      .select('email,rol,pestanas,apps,acciones,pestanas_logistica,user_id,creado').order('creado', { ascending: true });
     if (error) return res.status(500).json({ error: error.message });
     res.json({ usuarios: data || [] });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -199,6 +201,13 @@ app.put('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) => {
       if (a === null) upd.apps = null;
       else if (Array.isArray(a)) upd.apps = a.filter(x => appsOk.indexOf(String(x)) > -1);
       else return res.status(400).json({ error: 'apps debe ser lista o null' });
+    }
+    if (req.body && ('pestanas_logistica' in req.body)) {
+      const pl = req.body.pestanas_logistica;
+      const okPl = ['imprimir','despachar','seguimiento','full','pagos','config'];
+      if (pl === null) upd.pestanas_logistica = null;
+      else if (Array.isArray(pl)) upd.pestanas_logistica = pl.filter(x => okPl.indexOf(String(x)) > -1);
+      else return res.status(400).json({ error: 'pestanas_logistica debe ser lista o null' });
     }
     if (req.body && ('acciones' in req.body)) {
       const ac = req.body.acciones;
