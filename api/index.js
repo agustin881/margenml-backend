@@ -1214,13 +1214,19 @@ async function getShipData(shipmentId, token) {
 
     // ML devuelve la dirección del comprador bajo receiver_address (no receiver)
     const rcv = ship.receiver_address || ship.receiver || {};
-    console.log(`[PROV] ship=${shipmentId} provincia=${(rcv.state && rcv.state.name) || '(vacío)'} ciudad=${(rcv.city && rcv.city.name) || '(vacío)'} | shipKeys=${Object.keys(ship).join(',')}`);
+    // Depósito de ORIGEN del envío (sender_address.node.logistic_center_id):
+    // identifica de forma exacta si salió de Flex Baires (Villa Crespo, ARP676195153)
+    // o de Flex Rosario (Ruedo/Gustavo), sin depender de las tablas de App Depósito.
+    const snd = ship.sender_address || {};
+    const logisticCenterId = (snd.node && snd.node.logistic_center_id) || '';
+    console.log(`[PROV] ship=${shipmentId} provincia=${(rcv.state && rcv.state.name) || '(vacío)'} ciudad=${(rcv.city && rcv.city.name) || '(vacío)'} centro_origen=${logisticCenterId || '(vacío)'} | shipKeys=${Object.keys(ship).join(',')}`);
     return {
       costo_envio:            costoEnvio,
       precio_comprador_envio: pagoComprador,
       logistic_type:          ship.logistic_type || '',
       provincia:             (rcv.state && rcv.state.name) || '',
       ciudad:                (rcv.city  && rcv.city.name)  || '',
+      logistic_center_id:     logisticCenterId,
     };
   } catch(e) {
     return {};
@@ -1242,6 +1248,94 @@ async function getItemData(itemId, token) {
   } catch(e) {
     return {};
   }
+}
+
+// ── FLEX BAIRES: depósito fulfillment tercerizado (Villa Crespo, CABA) ──
+// Identificado por sender_address.node.logistic_center_id del shipment.
+// Confirmado con dos ventas de prueba: Baires=ARP676195153, Rosario=ARP676195151.
+const FLEX_BAIRES_NODE = 'ARP676195153';
+
+// Cache en memoria (5 min) de las 4 tablas de configuración historizadas.
+let _fbCache = { cbm: [], unificado: [], zonas: [], umbral: [], ts: 0 };
+async function _fbCargarConfig() {
+  const ahora = Date.now();
+  if (_fbCache.ts && (ahora - _fbCache.ts) < 5 * 60 * 1000) return _fbCache;
+  const [cbm, uni, zonas, umbral] = await Promise.all([
+    supabase.from('fb_config_cbm').select('*').order('vigente_desde', { ascending: true }),
+    supabase.from('fb_config_unificado').select('*').order('vigente_desde', { ascending: true }),
+    supabase.from('fb_config_zonas').select('*').order('vigente_desde', { ascending: true }),
+    supabase.from('fb_config_umbral').select('*').order('vigente_desde', { ascending: true }),
+  ]);
+  _fbCache = {
+    cbm: cbm.data || [], unificado: uni.data || [], zonas: zonas.data || [], umbral: umbral.data || [],
+    ts: ahora
+  };
+  return _fbCache;
+}
+// Devuelve la fila vigente a una fecha dada, de una lista ordenada asc por vigente_desde.
+function _vigenteA(filas, fecha, filtro) {
+  let elegido = null;
+  for (const f of filas) {
+    if (filtro && !filtro(f)) continue;
+    if (new Date(f.vigente_desde) <= new Date(fecha)) elegido = f;
+    else break;
+  }
+  return elegido;
+}
+
+// Medidas por SKU (largo/ancho/alto en cm, planilla de Google Sheets).
+// Reutiliza el mismo cache que usa /api/medidas.
+async function getMedidas() {
+  const ahora = Date.now();
+  if (_medidasCache && (ahora - _medidasTs) < 5 * 60 * 1000) return _medidasCache;
+  try {
+    const r = await fetch(MEDIDAS_CSV_URL);
+    const text = await r.text();
+    const map = buildMedidas(text);
+    if (Object.keys(map).length > 0) { _medidasCache = map; _medidasTs = ahora; }
+    return map;
+  } catch (e) {
+    console.error('[FB-MEDIDAS] error:', e.message);
+    return _medidasCache || {};
+  }
+}
+
+// Calcula (y deja listos para congelar) los 4 costos de Flex Baires de una venta.
+async function calcularCostosFlexBaires({ sku, unidades, ciudad, fecha, precio }) {
+  const cfg = await _fbCargarConfig();
+  const out = { fb_cbm_m3: 0, fb_costo_cbm: 0, fb_costo_unificado: 0, fb_costo_zona: 0, fb_ahorro_ml: 0 };
+
+  // 1) Costo por CBM: largo x ancho x alto (cm, planilla de medidas) -> m3 -> $/CBM vigente
+  try {
+    const medidas = await getMedidas();
+    const m = medidas[String(sku || '').toUpperCase()];
+    if (m && m.largo > 0 && m.ancho > 0 && m.alto > 0) {
+      const cbmUnidad = (m.largo * m.ancho * m.alto) / 1000000; // cm3 -> m3
+      out.fb_cbm_m3 = Math.round(cbmUnidad * (unidades || 1) * 1e6) / 1e6;
+      const tarifaCbm = _vigenteA(cfg.cbm, fecha);
+      if (tarifaCbm) out.fb_costo_cbm = Math.round(out.fb_cbm_m3 * Number(tarifaCbm.costo_cbm) * 100) / 100;
+    } else {
+      console.log(`[FB-CBM] sin medidas para sku=${sku}, no se calculó CBM`);
+    }
+  } catch (e) { console.error('[FB-CBM] error:', e.message); }
+
+  // 2) Costo unificado Recepción + Picking + Packing (por unidad, tarifa vigente)
+  const uni = _vigenteA(cfg.unificado, fecha);
+  if (uni) out.fb_costo_unificado = Math.round(Number(uni.costo) * (unidades || 1) * 100) / 100;
+
+  // 3) Costo de envío según zona de destino (ciudad del comprador, solo Baires)
+  const zonaRow = _vigenteA(cfg.zonas, fecha, f => String(f.zona || '').trim().toLowerCase() === String(ciudad || '').trim().toLowerCase());
+  if (zonaRow) out.fb_costo_zona = Number(zonaRow.costo);
+
+  // 4) Bonificación/ahorro ML según umbral de precio del producto
+  //    PENDIENTE DE AJUSTAR: confirmar el monto real que paga ML (bonif_ml) y
+  //    cómo se compara contra el costo de Colecta desde Rosario para el ahorro real.
+  const umbralRow = _vigenteA(cfg.umbral, fecha);
+  if (umbralRow && precio != null) {
+    out.fb_ahorro_ml = (Number(precio) < Number(umbralRow.monto_umbral)) ? Number(umbralRow.bonif_ml || 0) : 0;
+  }
+
+  return out;
 }
 
 // ── Helper: construir objeto venta completo ───────────────────────
@@ -1270,6 +1364,22 @@ async function buildVentaRow(order, userId, token, incluirEnvio = true) {
     ? await getShipData(order.shipping.id, token)
     : {};
 
+  // Flex Baires: si el envío salió del depósito tercerizado de Villa Crespo,
+  // calculamos y congelamos sus 4 costos adicionales (CBM, unificado, zona, bonif ML).
+  const esFlexBaires = shipData.logistic_center_id === FLEX_BAIRES_NODE;
+  let fbCostos = { fb_cbm_m3: 0, fb_costo_cbm: 0, fb_costo_unificado: 0, fb_costo_zona: 0, fb_ahorro_ml: 0 };
+  if (esFlexBaires) {
+    try {
+      fbCostos = await calcularCostosFlexBaires({
+        sku: sku ? String(sku).trim() : '',
+        unidades: item.quantity || 1,
+        ciudad: shipData.ciudad || '',
+        fecha: order.date_created,
+        precio: order.total_amount
+      });
+    } catch (e) { console.error('[FLEX-BAIRES] error calculando costos:', e.message); }
+  }
+
   return {
     nro_venta:             String(order.id),
     user_id:               String(userId),
@@ -1285,6 +1395,13 @@ async function buildVentaRow(order, userId, token, incluirEnvio = true) {
     logistic_type:         shipData.logistic_type          || '',
     provincia:             shipData.provincia              || '',
     ciudad:                shipData.ciudad                 || '',
+    logistic_center_id:    shipData.logistic_center_id     || '',
+    deposito_flex_baires:  esFlexBaires,
+    fb_cbm_m3:             fbCostos.fb_cbm_m3,
+    fb_costo_cbm:          fbCostos.fb_costo_cbm,
+    fb_costo_unificado:    fbCostos.fb_costo_unificado,
+    fb_costo_zona:         fbCostos.fb_costo_zona,
+    fb_ahorro_ml:          fbCostos.fb_ahorro_ml,
     estado:                order.status,
     con_cuotas:            cuotas > 1,
     cuotas:                cuotas,
@@ -3059,6 +3176,86 @@ app.get('/api/envio/rawfull', async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ── FLEX BAIRES: configuración (CBM, unificado, zonas, umbral) ──────
+// GET: trae el valor vigente de cada uno + el historial completo, y de
+// yapa una lista de ciudades vistas en ventas de Buenos Aires (para que
+// el desplegable de zonas se pueda armar solo, aunque todavía no tengan costo cargado).
+app.get('/api/fb/config', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
+  try {
+    const cfg = await _fbCargarConfig();
+    const ahora = new Date().toISOString();
+    const vigenteCbm    = _vigenteA(cfg.cbm, ahora);
+    const vigenteUni    = _vigenteA(cfg.unificado, ahora);
+    const vigenteUmbral = _vigenteA(cfg.umbral, ahora);
+    // Zonas ya cargadas + costo vigente de cada una
+    const zonasSet = [...new Set(cfg.zonas.map(z => z.zona))];
+    const zonasVigentes = zonasSet.map(z => {
+      const row = _vigenteA(cfg.zonas, ahora, f => f.zona === z);
+      return { zona: z, costo: row ? Number(row.costo) : null };
+    });
+    // Ciudades vistas en ventas Flex Baires que todavía no tienen costo de zona cargado
+    const { data: ciudadesVentas } = await supabase
+      .from('ventas').select('ciudad').eq('deposito_flex_baires', true).not('ciudad', 'is', null).limit(2000);
+    const ciudadesSinCosto = [...new Set((ciudadesVentas || []).map(v => v.ciudad).filter(Boolean))]
+      .filter(c => !zonasSet.includes(c));
+    res.json({
+      cbm:      { vigente: vigenteCbm ? Number(vigenteCbm.costo_cbm) : null, historial: cfg.cbm },
+      unificado:{ vigente: vigenteUni ? Number(vigenteUni.costo) : null, historial: cfg.unificado },
+      zonas:    { cargadas: zonasVigentes, sin_costo: ciudadesSinCosto, historial: cfg.zonas },
+      umbral:   { vigente: vigenteUmbral ? { monto_umbral: Number(vigenteUmbral.monto_umbral), bonif_ml: Number(vigenteUmbral.bonif_ml) } : null, historial: cfg.umbral }
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST: cada uno agrega una fila NUEVA (nunca pisa la vieja) para no romper
+// el costo congelado de ventas ya sincronizadas.
+app.post('/api/fb/config/cbm', requireAuth, soloRoles('admin'), async (req, res) => {
+  try {
+    const costo_cbm = Number(req.body.costo_cbm);
+    if (!(costo_cbm >= 0)) return res.status(400).json({ error: 'costo_cbm inválido' });
+    const { error } = await supabase.from('fb_config_cbm').insert({ costo_cbm });
+    if (error) return res.status(500).json({ error: error.message });
+    _fbCache.ts = 0; // invalida cache
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/fb/config/unificado', requireAuth, soloRoles('admin'), async (req, res) => {
+  try {
+    const costo = Number(req.body.costo);
+    if (!(costo >= 0)) return res.status(400).json({ error: 'costo inválido' });
+    const { error } = await supabase.from('fb_config_unificado').insert({ costo });
+    if (error) return res.status(500).json({ error: error.message });
+    _fbCache.ts = 0;
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/fb/config/zona', requireAuth, soloRoles('admin'), async (req, res) => {
+  try {
+    const zona = String(req.body.zona || '').trim();
+    const costo = Number(req.body.costo);
+    if (!zona) return res.status(400).json({ error: 'zona requerida' });
+    if (!(costo >= 0)) return res.status(400).json({ error: 'costo inválido' });
+    const { error } = await supabase.from('fb_config_zonas').insert({ zona, costo });
+    if (error) return res.status(500).json({ error: error.message });
+    _fbCache.ts = 0;
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/fb/config/umbral', requireAuth, soloRoles('admin'), async (req, res) => {
+  try {
+    const monto_umbral = Number(req.body.monto_umbral);
+    const bonif_ml = Number(req.body.bonif_ml || 0);
+    if (!(monto_umbral >= 0)) return res.status(400).json({ error: 'monto_umbral inválido' });
+    const { error } = await supabase.from('fb_config_umbral').insert({ monto_umbral, bonif_ml });
+    if (error) return res.status(500).json({ error: error.message });
+    _fbCache.ts = 0;
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.listen(PORT, () => console.log(`MargenML backend v34 (verificados) corriendo en puerto ${PORT}`));
