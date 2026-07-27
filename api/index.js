@@ -1549,7 +1549,7 @@ app.get('/api/ventas', requireAuth, async (req, res) => {
     const lote = 1000;
 
     while (true) {
-      let query = supabase.from('ventas').select('nro_venta,user_id,fecha,fecha_cierre,sku,titulo,unidades,precio,comision,costo_envio,precio_comprador_envio,logistic_type,provincia,ciudad,estado,con_cuotas,cuotas,costo_financiero,tipo_publicacion,pack_id,item_id,costo_congelado,cancel_code:raw->cancel_detail->>code,ml_tags:raw->tags,dev_return,dev_benef,dev_cargo').eq('user_id', user_id);
+      let query = supabase.from('ventas').select('nro_venta,user_id,fecha,fecha_cierre,sku,titulo,unidades,precio,comision,costo_envio,precio_comprador_envio,logistic_type,provincia,ciudad,estado,con_cuotas,cuotas,costo_financiero,tipo_publicacion,pack_id,item_id,costo_congelado,cancel_code:raw->cancel_detail->>code,ml_tags:raw->tags,dev_return,dev_benef,dev_cargo,logistic_center_id,deposito_flex_baires,fb_cbm_m3,fb_costo_cbm,fb_costo_unificado,fb_costo_zona,fb_ahorro_ml').eq('user_id', user_id);
       if (desde) query = query.gte('fecha', desde);
       if (hasta) query = query.lte('fecha', hasta);
       query = query.order('fecha', { ascending: false }).range(offset, offset + lote - 1);
