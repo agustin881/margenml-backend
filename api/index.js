@@ -488,6 +488,7 @@ Acciones disponibles:
 
 Reglas:
 - Los SKU de Pontec son codigos tipo OFI210-BL o AIR010-NE: letras+numeros y a veces sufijo de color (NE=negro, BL=blanco, AZ=azul, RO=rojo, GR=gris, VE=verde, MA=marron, CO=cobre). Si el usuario dice "la silla ofi 210 blanca", el SKU es OFI210-BL.
+- MUY IMPORTANTE: tambien existen SKUs de COMBOS que llevan ESPACIOS adentro, con formato "COMBO 2X BAN002-BL", "COMBO 3X BAN005-NE", "COMBO 4X BAN002-BL", etc. Cada uno de esos es UN SOLO SKU completo: NUNCA lo partas, nunca le saques el "COMBO NX", y usalo entero (con espacios) en el parametro "sku". Si el usuario pega una lista de SKUs (uno por renglon o separados por comas), cada renglon/entrada es un SKU completo. Si en un texto corrido aparece "COMBO", el SKU abarca desde "COMBO" hasta el codigo con sufijo de color inclusive (ej: en "COMBO 2X BAN002-BL COMBO 2X BAN002-NE" hay DOS skus: "COMBO 2X BAN002-BL" y "COMBO 2X BAN002-NE").
 - Si el usuario dice un porcentaje de descuento, mandalo como "porcentaje"; NO le pidas el precio final.\n- Para clonar_fotos hace falta saber DE QUE publicacion copiar (un codigo MLA...). Si el usuario no lo dijo, pedilo con "charla".
 - El descuento individual dura maximo 14 dias (limite de ML); si piden mas, avisalo en "respuesta" y usa dias=14.
 - Si para aplicar_descuento no hay ni precio ni porcentaje, usa "charla" y pedi uno de los dos.
