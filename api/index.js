@@ -29,14 +29,16 @@ async function requireAuth(req, res, next) {
     try {
       const email = String(data.user.email || '').toLowerCase().trim();
       const { data: rolRow } = await supabase.from('mml_roles')
-        .select('rol,pestanas,apps').eq('email', email).single();
+        .select('rol,pestanas,apps,acciones').eq('email', email).single();
       req.rol      = (rolRow && rolRow.rol) || 'operador';
       req.pestanas = (rolRow && rolRow.pestanas) || null;
       req.apps     = (rolRow && rolRow.apps) || null;
+      req.acciones = (rolRow && rolRow.acciones) || null;
     } catch (e) {
       req.rol = 'operador';
       req.pestanas = null;
       req.apps = null;
+      req.acciones = null;
     }
     next();
   } catch (e) {
@@ -65,7 +67,7 @@ app.get('/api/mi-rol', requireAuth, (req, res) => {
 app.get('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) => {
   try {
     const { data, error } = await supabase.from('mml_roles')
-      .select('email,rol,pestanas,apps,user_id,creado').order('creado', { ascending: true });
+      .select('email,rol,pestanas,apps,acciones,user_id,creado').order('creado', { ascending: true });
     if (error) return res.status(500).json({ error: error.message });
     res.json({ usuarios: data || [] });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -127,10 +129,17 @@ app.put('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) => {
     }
     if (req.body && ('apps' in req.body)) {
       const a = req.body.apps;
-      const appsOk = ['rentabilidad','logistica','promos','respondia','asistente'];
+      const appsOk = ['rentabilidad','logistica','promos','respondia','posventa','asistente'];
       if (a === null) upd.apps = null;
       else if (Array.isArray(a)) upd.apps = a.filter(x => appsOk.indexOf(String(x)) > -1);
       else return res.status(400).json({ error: 'apps debe ser lista o null' });
+    }
+    if (req.body && ('acciones' in req.body)) {
+      const ac = req.body.acciones;
+      const accOk = ['consultar','ventas','desc_poner','desc_sacar','desc_todos','smart','fotos','medidas'];
+      if (ac === null) upd.acciones = null;
+      else if (Array.isArray(ac)) upd.acciones = ac.filter(x => accOk.indexOf(String(x)) > -1);
+      else return res.status(400).json({ error: 'acciones debe ser lista o null' });
     }
     const { error } = await supabase.from('mml_roles').upsert(upd, { onConflict: 'email' });
     if (error) return res.status(500).json({ error: error.message });
@@ -157,6 +166,31 @@ app.delete('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) =>
     }
     if (uid) { try { await supabase.auth.admin.deleteUser(uid); } catch (e3) {} }
     await supabase.from('mml_roles').delete().eq('email', email);
+    res.json({ ok: true, email });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Cambiar contraseña de un usuario (solo admin). Las contraseñas actuales
+// NO se pueden ver (Supabase las guarda encriptadas de forma irreversible);
+// esto pone una nueva.
+app.post('/api/usuarios/password', requireAuth, soloRoles('admin'), async (req, res) => {
+  try {
+    const email    = String((req.body && req.body.email) || '').toLowerCase().trim();
+    const password = String((req.body && req.body.password) || '');
+    if (!email) return res.status(400).json({ error: 'Falta email' });
+    if (password.length < 6) return res.status(400).json({ error: 'La contrasena debe tener 6 caracteres o mas' });
+    const { data: row } = await supabase.from('mml_roles').select('user_id').eq('email', email).single();
+    let uid = row && row.user_id;
+    if (!uid) {
+      try {
+        const { data: lu } = await supabase.auth.admin.listUsers({ page: 1, perPage: 200 });
+        const u = lu && lu.users && lu.users.find(x => String(x.email || '').toLowerCase() === email);
+        uid = u && u.id;
+      } catch (e2) {}
+    }
+    if (!uid) return res.status(400).json({ error: 'No encontre el login de ' + email });
+    const { error: ePw } = await supabase.auth.admin.updateUserById(uid, { password });
+    if (ePw) return res.status(400).json({ error: ePw.message });
     res.json({ ok: true, email });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -686,17 +720,45 @@ async function asistenteVerPromos(p, userId, token) {
   return lineas.join('\n');
 }
 
-app.post('/api/asistente', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
+// Permisos por defecto dentro del Asistente segun rol (igual que el hub).
+// Si el usuario tiene 'acciones' personalizadas en mml_roles, mandan esas.
+function asisPermisosDe(req) {
+  if (Array.isArray(req.acciones) && req.acciones.length) return req.acciones;
+  if (req.rol === 'admin') return ['consultar','ventas','desc_poner','desc_sacar','desc_todos','smart','fotos','medidas'];
+  if (req.rol === 'encargado') return ['consultar','ventas'];
+  return ['consultar'];
+}
+// Mapea la accion que pide el LLM al permiso que la habilita
+function asisPermisoRequerido(accion) {
+  const mapa = {
+    ventas: 'ventas',
+    aplicar_descuento: 'desc_poner',
+    quitar_descuento: 'desc_sacar',
+    quitar_todo: 'desc_todos',
+    smart: 'smart', smart_aplicar: 'smart',
+    clonar_fotos: 'fotos',
+    medidas: 'medidas',
+  };
+  return mapa[accion] || 'consultar';
+}
+
+app.post('/api/asistente', requireAuth, soloRoles('admin', 'encargado', 'operador'), async (req, res) => {
   try {
     const userId = (req.body && req.body.user_id) || '67619515';
     const token = await getValidToken(userId);
     if (!token) return res.status(400).json({ error: 'Sin token ML' });
     const esAdmin = req.rol === 'admin';
+    const permisos = asisPermisosDe(req);
+    const puede = (p) => permisos.indexOf(p) > -1;
 
-    // Boton Confirmar: ejecuta la accion pendiente tal cual se mostro
+    // Boton Confirmar: ejecuta la accion pendiente tal cual se mostro.
+    // Admin confirma todo; otros roles solo si tienen ese permiso marcado
+    // explicitamente en su usuario (los permisos por defecto nunca dan escritura).
     const conf = req.body && req.body.confirmar;
     if (conf && conf.accion) {
-      if (!esAdmin) return res.json({ respuesta: 'Solo un admin puede confirmar cambios.' });
+      const permConf = asisPermisoRequerido(conf.accion === 'multi' ? 'aplicar_descuento' : conf.accion);
+      const confAutorizado = esAdmin || (Array.isArray(req.acciones) && req.acciones.indexOf(permConf) > -1);
+      if (!confAutorizado) return res.json({ respuesta: 'Tu usuario no tiene permiso para confirmar este cambio. Pedile a un admin que te habilite "' + permConf + '" en Usuarios.' });
       if (conf.accion === 'smart_aplicar' && Array.isArray(conf.objetivos)) {
         let okS = 0, errS = 0;
         const erroresS = [];
@@ -765,8 +827,15 @@ app.post('/api/asistente', requireAuth, soloRoles('admin', 'encargado'), async (
     const p = j.parametros || {};
 
     const ESCRITURA = ['quitar_descuento','aplicar_descuento','multi','quitar_todo','clonar_fotos','medidas'];
-    if (ESCRITURA.indexOf(j.accion) > -1 && !esAdmin) {
-      return res.json({ respuesta: 'Tu usuario puede consultar (ventas, promociones, publicaciones) pero los cambios los hace un admin.' });
+    if (ESCRITURA.indexOf(j.accion) > -1) {
+      const permNec = asisPermisoRequerido(j.accion === 'multi' ? 'aplicar_descuento' : j.accion);
+      const autorizado = esAdmin || (Array.isArray(req.acciones) && req.acciones.indexOf(permNec) > -1);
+      if (!autorizado) {
+        return res.json({ respuesta: 'Tu usuario puede consultar pero no hacer este cambio. Un admin puede habilitartelo desde Usuarios (permiso "' + permNec + '").' });
+      }
+    }
+    if (j.accion === 'ventas' && !puede('ventas')) {
+      return res.json({ respuesta: 'Tu usuario no tiene habilitado ver ventas y ganancias. Un admin puede habilitartelo desde Usuarios.' });
     }
 
     if (j.accion === 'ventas') {
