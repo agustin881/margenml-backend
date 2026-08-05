@@ -67,7 +67,7 @@ app.get('/api/mi-rol', requireAuth, (req, res) => {
 app.get('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) => {
   try {
     const { data, error } = await supabase.from('mml_roles')
-      .select('email,rol,pestanas,apps,acciones,user_id,creado').order('creado', { ascending: true });
+      .select('email,rol,pestanas,apps,acciones,pestanas_logistica,user_id,creado').order('creado', { ascending: true });
     if (error) return res.status(500).json({ error: error.message });
     res.json({ usuarios: data || [] });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -140,6 +140,13 @@ app.put('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) => {
       if (ac === null) upd.acciones = null;
       else if (Array.isArray(ac)) upd.acciones = ac.filter(x => accOk.indexOf(String(x)) > -1);
       else return res.status(400).json({ error: 'acciones debe ser lista o null' });
+    }
+    if (req.body && ('pestanas_logistica' in req.body)) {
+      const pl = req.body.pestanas_logistica;
+      const plOk = ['imprimir','despachar','seguimiento','full','pagos','config'];
+      if (pl === null) upd.pestanas_logistica = null;
+      else if (Array.isArray(pl)) upd.pestanas_logistica = pl.filter(x => plOk.indexOf(String(x)) > -1);
+      else return res.status(400).json({ error: 'pestanas_logistica debe ser lista o null' });
     }
     const { error } = await supabase.from('mml_roles').upsert(upd, { onConflict: 'email' });
     if (error) return res.status(500).json({ error: error.message });
