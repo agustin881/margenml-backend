@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v34-verificados', costo_congelado: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v36-contiene', costo_congelado: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -29,18 +29,14 @@ async function requireAuth(req, res, next) {
     try {
       const email = String(data.user.email || '').toLowerCase().trim();
       const { data: rolRow } = await supabase.from('mml_roles')
-        .select('rol,pestanas,apps,acciones,pestanas_logistica').eq('email', email).single();
+        .select('rol,pestanas,apps').eq('email', email).single();
       req.rol      = (rolRow && rolRow.rol) || 'operador';
       req.pestanas = (rolRow && rolRow.pestanas) || null;
       req.apps     = (rolRow && rolRow.apps) || null;
-      req.acciones = (rolRow && rolRow.acciones) || null;
-      req.pestanas_logistica = (rolRow && rolRow.pestanas_logistica) || null;
     } catch (e) {
       req.rol = 'operador';
       req.pestanas = null;
       req.apps = null;
-      req.acciones = null;
-      req.pestanas_logistica = null;
     }
     next();
   } catch (e) {
@@ -59,7 +55,7 @@ function soloRoles(...roles) {
 
 // ── Quien soy: el frontend pregunta el rol para armar el menu ──────
 app.get('/api/mi-rol', requireAuth, (req, res) => {
-  res.json({ email: req.authUser.email, rol: req.rol, pestanas: req.pestanas, apps: req.apps, acciones: req.acciones, pestanas_logistica: req.pestanas_logistica });
+  res.json({ email: req.authUser.email, rol: req.rol, pestanas: req.pestanas, apps: req.apps });
 });
 
 // ══ USUARIOS v14 (solo admin): gestion del equipo desde el panel ══
@@ -69,7 +65,7 @@ app.get('/api/mi-rol', requireAuth, (req, res) => {
 app.get('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) => {
   try {
     const { data, error } = await supabase.from('mml_roles')
-      .select('email,rol,pestanas,apps,acciones,pestanas_logistica,user_id,creado').order('creado', { ascending: true });
+      .select('email,rol,pestanas,apps,user_id,creado').order('creado', { ascending: true });
     if (error) return res.status(500).json({ error: error.message });
     res.json({ usuarios: data || [] });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -131,24 +127,10 @@ app.put('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) => {
     }
     if (req.body && ('apps' in req.body)) {
       const a = req.body.apps;
-      const appsOk = ['rentabilidad','logistica','promos','respondia','posventa','asistente'];
+      const appsOk = ['rentabilidad','logistica','promos','respondia','asistente'];
       if (a === null) upd.apps = null;
       else if (Array.isArray(a)) upd.apps = a.filter(x => appsOk.indexOf(String(x)) > -1);
       else return res.status(400).json({ error: 'apps debe ser lista o null' });
-    }
-    if (req.body && ('acciones' in req.body)) {
-      const ac = req.body.acciones;
-      const accOk = ['consultar','ventas','desc_poner','desc_sacar','desc_todos','smart','fotos','medidas'];
-      if (ac === null) upd.acciones = null;
-      else if (Array.isArray(ac)) upd.acciones = ac.filter(x => accOk.indexOf(String(x)) > -1);
-      else return res.status(400).json({ error: 'acciones debe ser lista o null' });
-    }
-    if (req.body && ('pestanas_logistica' in req.body)) {
-      const pl = req.body.pestanas_logistica;
-      const plOk = ['imprimir','despachar','seguimiento','full','pagos','config'];
-      if (pl === null) upd.pestanas_logistica = null;
-      else if (Array.isArray(pl)) upd.pestanas_logistica = pl.filter(x => plOk.indexOf(String(x)) > -1);
-      else return res.status(400).json({ error: 'pestanas_logistica debe ser lista o null' });
     }
     const { error } = await supabase.from('mml_roles').upsert(upd, { onConflict: 'email' });
     if (error) return res.status(500).json({ error: error.message });
@@ -175,31 +157,6 @@ app.delete('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) =>
     }
     if (uid) { try { await supabase.auth.admin.deleteUser(uid); } catch (e3) {} }
     await supabase.from('mml_roles').delete().eq('email', email);
-    res.json({ ok: true, email });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// Cambiar contraseña de un usuario (solo admin). Las contraseñas actuales
-// NO se pueden ver (Supabase las guarda encriptadas de forma irreversible);
-// esto pone una nueva.
-app.post('/api/usuarios/password', requireAuth, soloRoles('admin'), async (req, res) => {
-  try {
-    const email    = String((req.body && req.body.email) || '').toLowerCase().trim();
-    const password = String((req.body && req.body.password) || '');
-    if (!email) return res.status(400).json({ error: 'Falta email' });
-    if (password.length < 6) return res.status(400).json({ error: 'La contrasena debe tener 6 caracteres o mas' });
-    const { data: row } = await supabase.from('mml_roles').select('user_id').eq('email', email).single();
-    let uid = row && row.user_id;
-    if (!uid) {
-      try {
-        const { data: lu } = await supabase.auth.admin.listUsers({ page: 1, perPage: 200 });
-        const u = lu && lu.users && lu.users.find(x => String(x.email || '').toLowerCase() === email);
-        uid = u && u.id;
-      } catch (e2) {}
-    }
-    if (!uid) return res.status(400).json({ error: 'No encontre el login de ' + email });
-    const { error: ePw } = await supabase.auth.admin.updateUserById(uid, { password });
-    if (ePw) return res.status(400).json({ error: ePw.message });
     res.json({ ok: true, email });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -497,7 +454,7 @@ Acciones disponibles:
 
 Reglas:
 - Los SKU de Pontec son codigos tipo OFI210-BL o AIR010-NE: letras+numeros y a veces sufijo de color (NE=negro, BL=blanco, AZ=azul, RO=rojo, GR=gris, VE=verde, MA=marron, CO=cobre). Si el usuario dice "la silla ofi 210 blanca", el SKU es OFI210-BL.
-- MUY IMPORTANTE: tambien existen SKUs de COMBOS que llevan ESPACIOS adentro, con formato "COMBO 2X BAN002-BL", "COMBO 3X BAN005-NE", "COMBO 4X BAN002-BL", etc. Cada uno de esos es UN SOLO SKU completo: NUNCA lo partas, nunca le saques el "COMBO NX", y usalo entero (con espacios) en el parametro "sku". Si el usuario pega una lista de SKUs (uno por renglon o separados por comas), cada renglon/entrada es un SKU completo. Si en un texto corrido aparece "COMBO", el SKU abarca desde "COMBO" hasta el codigo con sufijo de color inclusive (ej: en "COMBO 2X BAN002-BL COMBO 2X BAN002-NE" hay DOS skus: "COMBO 2X BAN002-BL" y "COMBO 2X BAN002-NE").
+- Si el usuario da un SKU madre sin sufijo de color (ej "STL150", "sacale el descuento al STL150"), pasalo TAL CUAL en "sku": el sistema lo expande solo a toda la familia: variantes de color Y combos que lo contengan (ej "COMBO 2X BAN005").
 - Si el usuario dice un porcentaje de descuento, mandalo como "porcentaje"; NO le pidas el precio final.\n- Para clonar_fotos hace falta saber DE QUE publicacion copiar (un codigo MLA...). Si el usuario no lo dijo, pedilo con "charla".
 - El descuento individual dura maximo 14 dias (limite de ML); si piden mas, avisalo en "respuesta" y usa dias=14.
 - Si para aplicar_descuento no hay ni precio ni porcentaje, usa "charla" y pedi uno de los dos.
@@ -597,6 +554,37 @@ function fechaLocalAR(masDias) {
   const t = new Date(Date.now() - 3 * 3600 * 1000 + (masDias || 0) * 864e5);
   const p = n => String(n).padStart(2, '0');
   return t.getUTCFullYear() + '-' + p(t.getUTCMonth() + 1) + '-' + p(t.getUTCDate()) + 'T00:00:00';
+}
+
+// SKU madre -> familia completa: busca hijos en ventas recientes y en Contabilium
+async function asistenteResolverFamilia(p, userId, token) {
+  const directo = await asistenteResolverItems(p, userId, token);
+  const base = String(p.sku || '').toUpperCase().trim();
+  if (!base || p.item_id) return { ids: directo, skus: base ? [base] : [], familia: false };
+  if (base.length < 4) return { ids: directo, skus: [base], familia: false };
+  const hijos = {};
+  try {
+    const desde = new Date(Date.now() - 120 * 864e5).toISOString();
+    const { data: dv } = await supabase.from('ventas').select('sku')
+      .eq('user_id', String(userId)).gte('fecha', desde).ilike('sku', '%' + base + '%').range(0, 999);
+    (dv || []).forEach(r => { const s = String(r.sku || '').toUpperCase().trim(); if (s && s !== base) hijos[s] = 1; });
+  } catch (e) {}
+  try {
+    if (_contaMapaCache.mapa) {
+      Object.keys(_contaMapaCache.mapa).forEach(s => { if (s !== base && s.indexOf(base) > -1) hijos[s] = 1; });
+    }
+  } catch (e) {}
+  const listaH = Object.keys(hijos).slice(0, 20);
+  if (!listaH.length) return { ids: directo, skus: [base], familia: false };
+  const ids = directo.slice();
+  const skus = directo.length ? [base] : [];
+  for (const h of listaH) {
+    const idsH = await asistenteResolverItems({ sku: h }, userId, token);
+    if (idsH.length) { skus.push(h); idsH.forEach(x => { if (ids.indexOf(x) === -1) ids.push(x); }); }
+    if (ids.length >= 40) break;
+    await new Promise(rs => setTimeout(rs, 120));
+  }
+  return { ids, skus, familia: skus.length > 1 };
 }
 
 // Errores de ML: el motivo real viene en el array "cause", no en el mensaje
@@ -730,45 +718,17 @@ async function asistenteVerPromos(p, userId, token) {
   return lineas.join('\n');
 }
 
-// Permisos por defecto dentro del Asistente segun rol (igual que el hub).
-// Si el usuario tiene 'acciones' personalizadas en mml_roles, mandan esas.
-function asisPermisosDe(req) {
-  if (Array.isArray(req.acciones) && req.acciones.length) return req.acciones;
-  if (req.rol === 'admin') return ['consultar','ventas','desc_poner','desc_sacar','desc_todos','smart','fotos','medidas'];
-  if (req.rol === 'encargado') return ['consultar','ventas'];
-  return ['consultar'];
-}
-// Mapea la accion que pide el LLM al permiso que la habilita
-function asisPermisoRequerido(accion) {
-  const mapa = {
-    ventas: 'ventas',
-    aplicar_descuento: 'desc_poner',
-    quitar_descuento: 'desc_sacar',
-    quitar_todo: 'desc_todos',
-    smart: 'smart', smart_aplicar: 'smart',
-    clonar_fotos: 'fotos',
-    medidas: 'medidas',
-  };
-  return mapa[accion] || 'consultar';
-}
-
-app.post('/api/asistente', requireAuth, soloRoles('admin', 'encargado', 'operador'), async (req, res) => {
+app.post('/api/asistente', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
   try {
     const userId = (req.body && req.body.user_id) || '67619515';
     const token = await getValidToken(userId);
     if (!token) return res.status(400).json({ error: 'Sin token ML' });
     const esAdmin = req.rol === 'admin';
-    const permisos = asisPermisosDe(req);
-    const puede = (p) => permisos.indexOf(p) > -1;
 
-    // Boton Confirmar: ejecuta la accion pendiente tal cual se mostro.
-    // Admin confirma todo; otros roles solo si tienen ese permiso marcado
-    // explicitamente en su usuario (los permisos por defecto nunca dan escritura).
+    // Boton Confirmar: ejecuta la accion pendiente tal cual se mostro
     const conf = req.body && req.body.confirmar;
     if (conf && conf.accion) {
-      const permConf = asisPermisoRequerido(conf.accion === 'multi' ? 'aplicar_descuento' : conf.accion);
-      const confAutorizado = esAdmin || (Array.isArray(req.acciones) && req.acciones.indexOf(permConf) > -1);
-      if (!confAutorizado) return res.json({ respuesta: 'Tu usuario no tiene permiso para confirmar este cambio. Pedile a un admin que te habilite "' + permConf + '" en Usuarios.' });
+      if (!esAdmin) return res.json({ respuesta: 'Solo un admin puede confirmar cambios.' });
       if (conf.accion === 'smart_aplicar' && Array.isArray(conf.objetivos)) {
         let okS = 0, errS = 0;
         const erroresS = [];
@@ -837,15 +797,8 @@ app.post('/api/asistente', requireAuth, soloRoles('admin', 'encargado', 'operado
     const p = j.parametros || {};
 
     const ESCRITURA = ['quitar_descuento','aplicar_descuento','multi','quitar_todo','clonar_fotos','medidas'];
-    if (ESCRITURA.indexOf(j.accion) > -1) {
-      const permNec = asisPermisoRequerido(j.accion === 'multi' ? 'aplicar_descuento' : j.accion);
-      const autorizado = esAdmin || (Array.isArray(req.acciones) && req.acciones.indexOf(permNec) > -1);
-      if (!autorizado) {
-        return res.json({ respuesta: 'Tu usuario puede consultar pero no hacer este cambio. Un admin puede habilitartelo desde Usuarios (permiso "' + permNec + '").' });
-      }
-    }
-    if (j.accion === 'ventas' && !puede('ventas')) {
-      return res.json({ respuesta: 'Tu usuario no tiene habilitado ver ventas y ganancias. Un admin puede habilitartelo desde Usuarios.' });
+    if (ESCRITURA.indexOf(j.accion) > -1 && !esAdmin) {
+      return res.json({ respuesta: 'Tu usuario puede consultar (ventas, promociones, publicaciones) pero los cambios los hace un admin.' });
     }
 
     if (j.accion === 'ventas') {
@@ -1018,7 +971,8 @@ app.post('/api/asistente', requireAuth, soloRoles('admin', 'encargado', 'operado
         if (s.accion === 'aplicar_descuento' && !(Number(sp.precio) > 0) && !sTienePct) {
           return res.json({ respuesta: 'Me falta el precio o el porcentaje para "' + (sp.sku || sp.item_id || '?') + '". Pasamelo y armo el plan completo.' });
         }
-        const ids = await asistenteResolverItems(sp, userId, token);
+        const famS = await asistenteResolverFamilia(sp, userId, token);
+        const ids = famS.ids;
         if (!ids.length) { lineas.push('- ' + (sp.sku || sp.item_id || '?') + ': no encontre publicaciones (la salteo)'); continue; }
         const mini = await itemsMini(ids, token);
         let sPrecios = null;
@@ -1050,8 +1004,10 @@ app.post('/api/asistente', requireAuth, soloRoles('admin', 'encargado', 'operado
       if (j.accion === 'aplicar_descuento' && !(Number(p.precio) > 0) && !tienePct) {
         return res.json({ respuesta: j.respuesta || 'Decime el precio final o el porcentaje de descuento.' });
       }
-      const ids = await asistenteResolverItems(p, userId, token);
-      if (!ids.length) return res.json({ respuesta: 'No encontre publicaciones activas para "' + (p.sku || p.item_id || '?') + '". Revisa el SKU.' });
+      const fam = await asistenteResolverFamilia(p, userId, token);
+      const ids = fam.ids;
+      const famTxt = fam.familia ? ' [familia ' + (p.sku || '').toUpperCase() + ': ' + fam.skus.join(', ') + ']' : '';
+      if (!ids.length) return res.json({ respuesta: 'No encontre publicaciones activas para "' + (p.sku || p.item_id || '?') + '" ni para su familia. Revisa el SKU.' });
       const mini = await itemsMini(ids, token);
 
       if (j.accion === 'aplicar_descuento' && tienePct) {
@@ -1069,15 +1025,15 @@ app.post('/api/asistente', requireAuth, soloRoles('admin', 'encargado', 'operado
         }
         if (!okIds.length) return res.json({ respuesta: 'No pude leer los precios actuales para calcular el ' + pct + '%.' });
         return res.json({
-          respuesta: 'Voy a aplicar ' + pct + '% de descuento (vigente ' + diasP + ' dias) en ' + okIds.length + ' publicacion(es):\n' + lineasP.join('\n'),
+          respuesta: 'Voy a aplicar ' + pct + '% de descuento (vigente ' + diasP + ' dias) en ' + okIds.length + ' publicacion(es)' + famTxt + ':\n' + lineasP.join('\n'),
           pendiente: { accion: j.accion, parametros: p, items: okIds, precios }
         });
       }
 
       const lista = ids.map(id => '- ' + ((mini[id] && mini[id].title) ? mini[id].title.slice(0, 48) : id)).join('\n');
       const desc = j.accion === 'quitar_descuento'
-        ? 'Voy a QUITAR los descuentos de ' + ids.length + ' publicacion(es):'
-        : 'Voy a aplicar descuento (vigente ' + diasP + ' dias) dejando el precio en $' + Math.round(Number(p.precio)).toLocaleString() + ' en ' + ids.length + ' publicacion(es):';
+        ? 'Voy a QUITAR los descuentos de ' + ids.length + ' publicacion(es)' + famTxt + ':'
+        : 'Voy a aplicar descuento (vigente ' + diasP + ' dias) dejando el precio en $' + Math.round(Number(p.precio)).toLocaleString() + ' en ' + ids.length + ' publicacion(es)' + famTxt + ':';
       return res.json({
         respuesta: desc + '\n' + lista,
         pendiente: { accion: j.accion, parametros: p, items: ids }
@@ -1293,19 +1249,13 @@ async function getShipData(shipmentId, token) {
 
     // ML devuelve la dirección del comprador bajo receiver_address (no receiver)
     const rcv = ship.receiver_address || ship.receiver || {};
-    // Depósito de ORIGEN del envío (sender_address.node.logistic_center_id):
-    // identifica de forma exacta si salió de Flex Baires (Villa Crespo, ARP676195153)
-    // o de Flex Rosario (Ruedo/Gustavo), sin depender de las tablas de App Depósito.
-    const snd = ship.sender_address || {};
-    const logisticCenterId = (snd.node && snd.node.logistic_center_id) || '';
-    console.log(`[PROV] ship=${shipmentId} provincia=${(rcv.state && rcv.state.name) || '(vacío)'} ciudad=${(rcv.city && rcv.city.name) || '(vacío)'} centro_origen=${logisticCenterId || '(vacío)'} | shipKeys=${Object.keys(ship).join(',')}`);
+    console.log(`[PROV] ship=${shipmentId} provincia=${(rcv.state && rcv.state.name) || '(vacío)'} ciudad=${(rcv.city && rcv.city.name) || '(vacío)'} | shipKeys=${Object.keys(ship).join(',')}`);
     return {
       costo_envio:            costoEnvio,
       precio_comprador_envio: pagoComprador,
       logistic_type:          ship.logistic_type || '',
       provincia:             (rcv.state && rcv.state.name) || '',
       ciudad:                (rcv.city  && rcv.city.name)  || '',
-      logistic_center_id:     logisticCenterId,
     };
   } catch(e) {
     return {};
@@ -1327,94 +1277,6 @@ async function getItemData(itemId, token) {
   } catch(e) {
     return {};
   }
-}
-
-// ── FLEX BAIRES: depósito fulfillment tercerizado (Villa Crespo, CABA) ──
-// Identificado por sender_address.node.logistic_center_id del shipment.
-// Confirmado con dos ventas de prueba: Baires=ARP676195153, Rosario=ARP676195151.
-const FLEX_BAIRES_NODE = 'ARP676195153';
-
-// Cache en memoria (5 min) de las 4 tablas de configuración historizadas.
-let _fbCache = { cbm: [], unificado: [], zonas: [], umbral: [], ts: 0 };
-async function _fbCargarConfig() {
-  const ahora = Date.now();
-  if (_fbCache.ts && (ahora - _fbCache.ts) < 5 * 60 * 1000) return _fbCache;
-  const [cbm, uni, zonas, umbral] = await Promise.all([
-    supabase.from('fb_config_cbm').select('*').order('vigente_desde', { ascending: true }),
-    supabase.from('fb_config_unificado').select('*').order('vigente_desde', { ascending: true }),
-    supabase.from('fb_config_zonas').select('*').order('vigente_desde', { ascending: true }),
-    supabase.from('fb_config_umbral').select('*').order('vigente_desde', { ascending: true }),
-  ]);
-  _fbCache = {
-    cbm: cbm.data || [], unificado: uni.data || [], zonas: zonas.data || [], umbral: umbral.data || [],
-    ts: ahora
-  };
-  return _fbCache;
-}
-// Devuelve la fila vigente a una fecha dada, de una lista ordenada asc por vigente_desde.
-function _vigenteA(filas, fecha, filtro) {
-  let elegido = null;
-  for (const f of filas) {
-    if (filtro && !filtro(f)) continue;
-    if (new Date(f.vigente_desde) <= new Date(fecha)) elegido = f;
-    else break;
-  }
-  return elegido;
-}
-
-// Medidas por SKU (largo/ancho/alto en cm, planilla de Google Sheets).
-// Reutiliza el mismo cache que usa /api/medidas.
-async function getMedidas() {
-  const ahora = Date.now();
-  if (_medidasCache && (ahora - _medidasTs) < 5 * 60 * 1000) return _medidasCache;
-  try {
-    const r = await fetch(MEDIDAS_CSV_URL);
-    const text = await r.text();
-    const map = buildMedidas(text);
-    if (Object.keys(map).length > 0) { _medidasCache = map; _medidasTs = ahora; }
-    return map;
-  } catch (e) {
-    console.error('[FB-MEDIDAS] error:', e.message);
-    return _medidasCache || {};
-  }
-}
-
-// Calcula (y deja listos para congelar) los 4 costos de Flex Baires de una venta.
-async function calcularCostosFlexBaires({ sku, unidades, ciudad, fecha, precio }) {
-  const cfg = await _fbCargarConfig();
-  const out = { fb_cbm_m3: 0, fb_costo_cbm: 0, fb_costo_unificado: 0, fb_costo_zona: 0, fb_ahorro_ml: 0 };
-
-  // 1) Costo por CBM: largo x ancho x alto (cm, planilla de medidas) -> m3 -> $/CBM vigente
-  try {
-    const medidas = await getMedidas();
-    const m = medidas[String(sku || '').toUpperCase()];
-    if (m && m.largo > 0 && m.ancho > 0 && m.alto > 0) {
-      const cbmUnidad = (m.largo * m.ancho * m.alto) / 1000000; // cm3 -> m3
-      out.fb_cbm_m3 = Math.round(cbmUnidad * (unidades || 1) * 1e6) / 1e6;
-      const tarifaCbm = _vigenteA(cfg.cbm, fecha);
-      if (tarifaCbm) out.fb_costo_cbm = Math.round(out.fb_cbm_m3 * Number(tarifaCbm.costo_cbm) * 100) / 100;
-    } else {
-      console.log(`[FB-CBM] sin medidas para sku=${sku}, no se calculó CBM`);
-    }
-  } catch (e) { console.error('[FB-CBM] error:', e.message); }
-
-  // 2) Costo unificado Recepción + Picking + Packing (por unidad, tarifa vigente)
-  const uni = _vigenteA(cfg.unificado, fecha);
-  if (uni) out.fb_costo_unificado = Math.round(Number(uni.costo) * (unidades || 1) * 100) / 100;
-
-  // 3) Costo de envío según zona de destino (ciudad del comprador, solo Baires)
-  const zonaRow = _vigenteA(cfg.zonas, fecha, f => String(f.zona || '').trim().toLowerCase() === String(ciudad || '').trim().toLowerCase());
-  if (zonaRow) out.fb_costo_zona = Number(zonaRow.costo);
-
-  // 4) Bonificación/ahorro ML según umbral de precio del producto
-  //    PENDIENTE DE AJUSTAR: confirmar el monto real que paga ML (bonif_ml) y
-  //    cómo se compara contra el costo de Colecta desde Rosario para el ahorro real.
-  const umbralRow = _vigenteA(cfg.umbral, fecha);
-  if (umbralRow && precio != null) {
-    out.fb_ahorro_ml = (Number(precio) < Number(umbralRow.monto_umbral)) ? Number(umbralRow.bonif_ml || 0) : 0;
-  }
-
-  return out;
 }
 
 // ── Helper: construir objeto venta completo ───────────────────────
@@ -1443,22 +1305,6 @@ async function buildVentaRow(order, userId, token, incluirEnvio = true) {
     ? await getShipData(order.shipping.id, token)
     : {};
 
-  // Flex Baires: si el envío salió del depósito tercerizado de Villa Crespo,
-  // calculamos y congelamos sus 4 costos adicionales (CBM, unificado, zona, bonif ML).
-  const esFlexBaires = shipData.logistic_center_id === FLEX_BAIRES_NODE;
-  let fbCostos = { fb_cbm_m3: 0, fb_costo_cbm: 0, fb_costo_unificado: 0, fb_costo_zona: 0, fb_ahorro_ml: 0 };
-  if (esFlexBaires) {
-    try {
-      fbCostos = await calcularCostosFlexBaires({
-        sku: sku ? String(sku).trim() : '',
-        unidades: item.quantity || 1,
-        ciudad: shipData.ciudad || '',
-        fecha: order.date_created,
-        precio: order.total_amount
-      });
-    } catch (e) { console.error('[FLEX-BAIRES] error calculando costos:', e.message); }
-  }
-
   return {
     nro_venta:             String(order.id),
     user_id:               String(userId),
@@ -1474,13 +1320,6 @@ async function buildVentaRow(order, userId, token, incluirEnvio = true) {
     logistic_type:         shipData.logistic_type          || '',
     provincia:             shipData.provincia              || '',
     ciudad:                shipData.ciudad                 || '',
-    logistic_center_id:    shipData.logistic_center_id     || '',
-    deposito_flex_baires:  esFlexBaires,
-    fb_cbm_m3:             fbCostos.fb_cbm_m3,
-    fb_costo_cbm:          fbCostos.fb_costo_cbm,
-    fb_costo_unificado:    fbCostos.fb_costo_unificado,
-    fb_costo_zona:         fbCostos.fb_costo_zona,
-    fb_ahorro_ml:          fbCostos.fb_ahorro_ml,
     estado:                order.status,
     con_cuotas:            cuotas > 1,
     cuotas:                cuotas,
@@ -1628,7 +1467,7 @@ app.get('/api/ventas', requireAuth, async (req, res) => {
     const lote = 1000;
 
     while (true) {
-      let query = supabase.from('ventas').select('nro_venta,user_id,fecha,fecha_cierre,sku,titulo,unidades,precio,comision,costo_envio,precio_comprador_envio,logistic_type,provincia,ciudad,estado,con_cuotas,cuotas,costo_financiero,tipo_publicacion,pack_id,item_id,costo_congelado,cancel_code:raw->cancel_detail->>code,ml_tags:raw->tags,dev_return,dev_benef,dev_cargo,logistic_center_id,deposito_flex_baires,fb_cbm_m3,fb_costo_cbm,fb_costo_unificado,fb_costo_zona,fb_ahorro_ml').eq('user_id', user_id);
+      let query = supabase.from('ventas').select('nro_venta,user_id,fecha,fecha_cierre,sku,titulo,unidades,precio,comision,costo_envio,precio_comprador_envio,logistic_type,provincia,ciudad,estado,con_cuotas,cuotas,costo_financiero,tipo_publicacion,pack_id,item_id,costo_congelado,cancel_code:raw->cancel_detail->>code,ml_tags:raw->tags,dev_return,dev_benef').eq('user_id', user_id);
       if (desde) query = query.gte('fecha', desde);
       if (hasta) query = query.lte('fecha', hasta);
       query = query.order('fecha', { ascending: false }).range(offset, offset + lote - 1);
@@ -1890,430 +1729,6 @@ app.get('/api/devol/ver', async (req, res) => {
       out.push({ nro: r.nro_venta, sku: r.sku, estado: r.estado, cancelCode: r.cc, tieneMed: Array.isArray(r.med) && !!r.med.length, dev_return: r.dev_return, dev_benef: r.dev_benef, dev_checked: r.dev_checked });
     }
     res.json({ casos: out });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── INSPECTOR de venta (TEMPORAL): todo lo que ML devuelve de una venta ──
-// GET /api/venta/inspect?user_id=67619515&nro=2000013785412851
-app.get('/api/venta/inspect', async (req, res) => {
-  try {
-    const user_id = req.query.user_id;
-    const nro = String(req.query.nro || '').trim();
-    if (!user_id || !nro) return res.status(400).json({ error: 'user_id y nro requeridos' });
-    const token = await getValidToken(user_id);
-    const H = { Authorization: 'Bearer ' + token };
-    const out = { nro };
-
-    // 1) fila en nuestra base (por nro_venta o pack_id)
-    let { data: rows } = await supabase.from('ventas')
-      .select('nro_venta,pack_id,sku,titulo,unidades,precio,comision,costo_envio,precio_comprador_envio,logistic_type,estado,fecha,dev_return,dev_benef,raw')
-      .eq('user_id', String(user_id)).or('nro_venta.eq.' + nro + ',pack_id.eq.' + nro);
-    out.enBase = (rows || []).map(r => ({ nro_venta: r.nro_venta, pack_id: r.pack_id, sku: r.sku, unidades: r.unidades, precio: r.precio, comision: r.comision, costo_envio: r.costo_envio, ingreso_envio_comprador: r.precio_comprador_envio, logistic: r.logistic_type, estado: r.estado, fecha: r.fecha, dev_return: r.dev_return, dev_benef: r.dev_benef }));
-
-    let orderIds = (rows || []).map(r => r.nro_venta);
-    if (!orderIds.length) orderIds = [nro];
-
-    // 2) orden fresca de ML (montos y pagos)
-    out.ordenes = [];
-    for (const oid of orderIds.slice(0, 4)) {
-      try {
-        const r1 = await fetch('https://api.mercadolibre.com/orders/' + oid, { headers: H });
-        const o = await r1.json();
-        if (o && o.id) {
-          out.ordenes.push({
-            id: o.id, status: o.status,
-            cancel_code: o.cancel_detail ? o.cancel_detail.code : null,
-            total_amount: o.total_amount, paid_amount: o.paid_amount,
-            pagos: Array.isArray(o.payments) ? o.payments.map(p => ({ status: p.status, transaction_amount: p.transaction_amount, refunded: p.transaction_amount_refunded, shipping_cost: p.shipping_cost, marketplace_fee: p.marketplace_fee })) : [],
-            mediations: Array.isArray(o.mediations) ? o.mediations.map(m => m.id) : [],
-            shipping_id: o.shipping && o.shipping.id, tags: o.tags
-          });
-        } else out.ordenes.push({ id: oid, error: o && (o.message || o.error) });
-      } catch (e) { out.ordenes.push({ id: oid, error: e.message }); }
-    }
-
-    // 3) costos reales del envio
-    out.envios = [];
-    const shipIds = [...new Set(out.ordenes.map(o => o.shipping_id).filter(Boolean))];
-    for (const sid of shipIds.slice(0, 3)) {
-      try {
-        const r2 = await fetch('https://api.mercadolibre.com/shipments/' + sid + '/costs', { headers: { ...H, 'x-format-new': 'true' } });
-        const c = await r2.json();
-        out.envios.push({ shipment: sid, gross_amount: c.gross_amount, receiver_cost: c.receiver ? c.receiver.cost : null, senders: Array.isArray(c.senders) ? c.senders.map(x => ({ cost: x.cost, save: x.save, compensation: x.compensation, charges: x.charges })) : c.senders });
-      } catch (e) { out.envios.push({ shipment: sid, error: e.message }); }
-    }
-
-    // 4) reclamo / mediacion
-    out.reclamos = [];
-    const medIds = [...new Set([].concat(...out.ordenes.map(o => o.mediations || [])))];
-    for (const mid of medIds.slice(0, 3)) {
-      try {
-        const r3 = await fetch('https://api.mercadolibre.com/post-purchase/v1/claims/' + mid, { headers: H });
-        const j = await r3.json();
-        out.reclamos.push({ claim: mid, type: j.type, stage: j.stage, status: j.status, reason_id: j.reason_id, resolution: j.resolution || null, related_entities: j.related_entities || null });
-      } catch (e) { out.reclamos.push({ claim: mid, error: e.message }); }
-    }
-
-    res.json(out);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── PROBE3 (TEMPORAL): donde vive el cargo real por devolucion ──
-// GET /api/devol/probe3?user_id=67619515&claims=5539834073,5533529331,5535841572
-app.get('/api/devol/probe3', async (req, res) => {
-  try {
-    const user_id = req.query.user_id;
-    if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
-    const claims = String(req.query.claims || '5539834073,5533529331,5535841572').split(',').map(x => x.trim()).filter(Boolean);
-    const token = await getValidToken(user_id);
-    const H = { Authorization: 'Bearer ' + token };
-    const out = [];
-    for (const cid of claims.slice(0, 5)) {
-      const caso = { claim: cid, probes: {} };
-      const paths = [
-        ['charges', 'post-purchase/v1/claims/' + cid + '/charges'],
-        ['charges_rsc', 'post-purchase/v1/claims/' + cid + '/charges/return-shipping-costs'],
-        ['returns_v2', 'post-purchase/v2/claims/' + cid + '/returns'],
-        ['returns_v1', 'post-purchase/v1/claims/' + cid + '/returns'],
-        ['detail_returns', 'post-purchase/v1/claims/' + cid + '?with=returns']
-      ];
-      for (const [k, path] of paths) {
-        try {
-          const r = await fetch('https://api.mercadolibre.com/' + path, { headers: H });
-          let j = null; try { j = await r.json(); } catch (e2) {}
-          let resumen = null;
-          if (j) {
-            const txt = JSON.stringify(j);
-            resumen = txt.length > 1200 ? (Array.isArray(j) ? { array: j.length, primer: j[0] } : { keys: Object.keys(j) }) : j;
-          }
-          caso.probes[k] = { http: r.status, body: resumen };
-        } catch (e) { caso.probes[k] = { error: e.message }; }
-        await new Promise(rs => setTimeout(rs, 120));
-      }
-      out.push(caso);
-    }
-    res.json({ casos: out, ref: { malacate: '5539834073 (3 envios cobrados)', freidora: '5533529331 (1 envio)', silla: '5535841572 ($0)' } });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── PROBE4 (TEMPORAL): retorno completo + costos de envios de devolucion ──
-// GET /api/devol/probe4?user_id=67619515&claims=5539834073,5535841572
-app.get('/api/devol/probe4', async (req, res) => {
-  try {
-    const user_id = req.query.user_id;
-    if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
-    const claims = String(req.query.claims || '5539834073,5535841572').split(',').map(x => x.trim()).filter(Boolean);
-    const token = await getValidToken(user_id);
-    const H = { Authorization: 'Bearer ' + token };
-    const out = [];
-    for (const cid of claims.slice(0, 4)) {
-      const caso = { claim: cid };
-      try {
-        const r = await fetch('https://api.mercadolibre.com/post-purchase/v2/claims/' + cid + '/returns', { headers: H });
-        const j = await r.json();
-        caso.return_http = r.status;
-        caso.subtype = j.subtype; caso.status = j.status; caso.status_money = j.status_money; caso.refund_at = j.refund_at;
-        caso.intermediate_check = j.intermediate_check;
-        caso.shipments_raw = j.shipments;
-        const shipIds = [];
-        (Array.isArray(j.shipments) ? j.shipments : []).forEach(sh => { const id = sh && (sh.id || sh.shipment_id); if (id) shipIds.push(id); });
-        caso.envios_devolucion = [];
-        for (const sid of shipIds.slice(0, 3)) {
-          const e = { shipment: sid };
-          try {
-            const r2 = await fetch('https://api.mercadolibre.com/shipments/' + sid, { headers: { ...H, 'x-format-new': 'true' } });
-            const js = await r2.json();
-            e.status = js.status; e.substatus = js.substatus; e.logistic = js.logistic && js.logistic.type;
-          } catch (e2) { e.shipErr = e2.message; }
-          try {
-            const r3 = await fetch('https://api.mercadolibre.com/shipments/' + sid + '/costs', { headers: { ...H, 'x-format-new': 'true' } });
-            const jc = await r3.json();
-            e.costs = { gross_amount: jc.gross_amount, receiver: jc.receiver ? { cost: jc.receiver.cost, save: jc.receiver.save } : null, senders: Array.isArray(jc.senders) ? jc.senders.map(x => ({ cost: x.cost, save: x.save, compensation: x.compensation, charges: x.charges })) : jc.senders };
-          } catch (e3) { e.costErr = e3.message; }
-          caso.envios_devolucion.push(e);
-          await new Promise(rs => setTimeout(rs, 120));
-        }
-      } catch (e) { caso.error = e.message; }
-      out.push(caso);
-    }
-    res.json({ casos: out, ref: { malacate: '5539834073 (cargo devolucion $19.720 + ida $9.860)', silla: '5535841572 ($0)' } });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── PROBE5 (TEMPORAL): API de facturacion ML (cargos reales por devolucion) ──
-// GET /api/devol/probe5?user_id=67619515&order=2000017191703550
-app.get('/api/devol/probe5', async (req, res) => {
-  try {
-    const user_id = req.query.user_id;
-    if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
-    const orderId = String(req.query.order || '2000017191703550').trim();
-    const token = await getValidToken(user_id);
-    const H = { Authorization: 'Bearer ' + token };
-    const out = { orderBuscada: orderId };
-
-    // 1) periodos de facturacion
-    try {
-      const r1 = await fetch('https://api.mercadolibre.com/billing/integration/monthly/periods?group=ML&document_type=BILL&offset=0&limit=3', { headers: H });
-      const j1 = await r1.json();
-      out.periodos = { http: r1.status, body: (JSON.stringify(j1).length > 1500 ? { keys: Object.keys(j1), primer: (j1.results && j1.results[0]) || null } : j1) };
-      // 2) detalles del periodo mas reciente, probando variantes de filtro por orden
-      const key = j1 && j1.results && j1.results[0] && (j1.results[0].key || (j1.results[0].period && j1.results[0].period.key));
-      out.periodKey = key || null;
-      if (key) {
-        const variantes = [
-          ['det_orderfilter', 'https://api.mercadolibre.com/billing/integration/periods/key/' + key + '/group/ML/details?document_type=BILL&limit=5&offset=0&order_id=' + orderId],
-          ['det_sample', 'https://api.mercadolibre.com/billing/integration/periods/key/' + key + '/group/ML/details?document_type=BILL&limit=3&offset=0']
-        ];
-        out.detalles = {};
-        for (const [k, url] of variantes) {
-          try {
-            const r2 = await fetch(url, { headers: H });
-            let j2 = null; try { j2 = await r2.json(); } catch (e2) {}
-            let resumen = null;
-            if (j2) {
-              const txt = JSON.stringify(j2);
-              if (txt.length <= 3000) resumen = j2;
-              else resumen = { keys: Object.keys(j2), total: j2.total || (j2.paging && j2.paging.total), primer: (j2.results && j2.results[0]) || null };
-            }
-            out.detalles[k] = { http: r2.status, body: resumen };
-          } catch (e) { out.detalles[k] = { error: e.message }; }
-          await new Promise(rs => setTimeout(rs, 150));
-        }
-      }
-    } catch (e) { out.periodos = { error: e.message }; }
-    res.json(out);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── PROBE6 (TEMPORAL): lineas de facturacion de ordenes especificas ──
-// GET /api/devol/probe6?user_id=67619515&orders=2000017191703550,2000017077382238,2000017080396472&periods=2026-07-01,2026-06-01
-app.get('/api/devol/probe6', async (req, res) => {
-  try {
-    const user_id = req.query.user_id;
-    if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
-    const orders = new Set(String(req.query.orders || '2000017191703550,2000017077382238,2000017080396472').split(',').map(x => x.trim()).filter(Boolean));
-    const periods = String(req.query.periods || '2026-07-01,2026-06-01').split(',').map(x => x.trim()).filter(Boolean);
-    const token = await getValidToken(user_id);
-    const H = { Authorization: 'Bearer ' + token };
-    const encontrados = [];
-    const meta = { paginas: 0, detallesRecorridos: 0, porPeriodo: {} };
-    const limit = Math.min(parseInt(req.query.limit) || 300, 1000);
-    for (const key of periods.slice(0, 3)) {
-      let offset = 0; let total = null; let vueltas = 0;
-      while (vueltas < 80) {
-        vueltas++;
-        const url = 'https://api.mercadolibre.com/billing/integration/periods/key/' + key + '/group/ML/details?document_type=BILL&limit=' + limit + '&offset=' + offset;
-        let r = null;
-        for (let intento = 0; intento < 6; intento++) {
-          r = await fetch(url, { headers: H });
-          if (r.status !== 429) break;
-          await new Promise(rp => setTimeout(rp, 15000));
-        }
-        if (r.status !== 200) { meta.porPeriodo[key] = { http: r.status, offsetAlFallar: offset }; break; }
-        const j = await r.json();
-        const rs = Array.isArray(j.results) ? j.results : [];
-        total = j.total;
-        meta.paginas++;
-        meta.detallesRecorridos += rs.length;
-        for (const d of rs) {
-          const sales = Array.isArray(d.sales_info) ? d.sales_info : [];
-          const hit = sales.find(si => si && orders.has(String(si.order_id)));
-          if (hit) {
-            const ci = d.charge_info || {};
-            encontrados.push({
-              period: key,
-              order_id: String(hit.order_id),
-              concepto: ci.transaction_detail,
-              monto: ci.detail_amount,
-              tipo: ci.detail_type,
-              sub_tipo: ci.detail_sub_type,
-              debitado_de_venta: ci.debited_from_operation,
-              bonificado_id: ci.charge_bonified_id,
-              fecha: ci.creation_date_time,
-              descuento: d.discount_info ? { sin_desc: d.discount_info.charge_amount_without_discount, desc: d.discount_info.discount_amount } : null
-            });
-          }
-        }
-        if (!rs.length || offset + rs.length >= (total || 0)) break;
-        offset += limit;
-        await new Promise(rp => setTimeout(rp, 700));
-      }
-      meta.porPeriodo[key] = meta.porPeriodo[key] || { total, paginas: vueltas };
-    }
-    res.json({ encontrados, meta, ref: { malacate: '2000017191703550 (espero ~9860+19720)', freidora: '2000017077382238 (espero ~13920)', silla: '2000017080396472 (espero $0 o bonificado)' } });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── DEVOLUCIONES: cargos reales desde la facturacion de ML (incremental con cursor) ──
-// 1) GET /api/devol/cargos-prep?user_id=..&periods=p1,p2  -> prepara cursores (full scan solo la 1ra vez)
-// 2) GET /api/devol/cargos-sync?user_id=..&period=..      -> procesa UNA pagina desde el cursor guardado
-app.get('/api/devol/cargos-prep', async (req, res) => {
-  try {
-    const user_id = req.query.user_id;
-    const periods = String(req.query.periods || '').split(',').map(x => x.trim()).filter(Boolean);
-    if (!user_id || !periods.length) return res.status(400).json({ error: 'user_id y periods requeridos' });
-    const { data: cur, error } = await supabase.from('margen_billing_cursor').select('period,next_offset').eq('user_id', String(user_id)).in('period', periods);
-    if (error) return res.status(500).json({ error: error.message, hint: 'falta la tabla margen_billing_cursor?' });
-    const existentes = new Set((cur || []).map(r => r.period));
-    const faltantes = periods.filter(p => !existentes.has(p));
-    let fullScan = false;
-    if (faltantes.length) {
-      fullScan = true;
-      // primera vez: limpiar cargos y arrancar todos los cursores de cero
-      await supabase.from('ventas').update({ dev_cargo: null })
-        .eq('user_id', String(user_id)).eq('estado', 'cancelled')
-        .filter('raw->cancel_detail->>code', 'eq', 'mediations');
-      await supabase.from('margen_billing_cursor').delete().eq('user_id', String(user_id)).in('period', periods);
-      for (const p of periods) {
-        await supabase.from('margen_billing_cursor').insert({ user_id: String(user_id), period: p, next_offset: 0, updated_at: new Date().toISOString() });
-      }
-    }
-    const { data: cur2 } = await supabase.from('margen_billing_cursor').select('period,next_offset').eq('user_id', String(user_id)).in('period', periods);
-    res.json({ fullScan, cursores: (cur2 || []) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-const _devolCache = {};
-app.get('/api/devol/cargos-sync', async (req, res) => {
-  try {
-    const user_id = req.query.user_id;
-    const period = String(req.query.period || '').trim();
-    if (!user_id || !period) return res.status(400).json({ error: 'user_id y period requeridos' });
-    const token = await getValidToken(user_id);
-    const H = { Authorization: 'Bearer ' + token };
-
-    // cursor guardado
-    const { data: curRows, error: curErr } = await supabase.from('margen_billing_cursor').select('next_offset').eq('user_id', String(user_id)).eq('period', period).limit(1);
-    if (curErr) return res.status(500).json({ error: curErr.message, hint: 'falta la tabla margen_billing_cursor?' });
-    let offset = (curRows && curRows[0] && curRows[0].next_offset) || 0;
-
-    // set de ordenes que son devoluciones (mediations) - cacheado 10 min
-    const cacheKey = String(user_id);
-    let devolSet, devolPacks;
-    if (_devolCache[cacheKey] && (Date.now() - _devolCache[cacheKey].ts) < 600000) {
-      devolSet = _devolCache[cacheKey].set; devolPacks = _devolCache[cacheKey].packs;
-    } else {
-    devolSet = new Set();
-    devolPacks = {};
-    let off2 = 0;
-    while (true) {
-      const { data, error } = await supabase.from('ventas').select('nro_venta,pack_id')
-        .eq('user_id', String(user_id)).eq('estado', 'cancelled')
-        .filter('raw->cancel_detail->>code', 'eq', 'mediations')
-        .range(off2, off2 + 999);
-      if (error || !data || !data.length) break;
-      data.forEach(r => { devolSet.add(String(r.nro_venta)); if (r.pack_id) devolPacks[String(r.pack_id)] = String(r.nro_venta); });
-      if (data.length < 1000) break;
-      off2 += 1000;
-    }
-    _devolCache[cacheKey] = { set: devolSet, packs: devolPacks, ts: Date.now() };
-    }
-
-    let rs = [];
-    let total = null;
-    let paginasOk = 0;
-    for (let pg = 0; pg < 6; pg++) {
-      const url = 'https://api.mercadolibre.com/billing/integration/periods/key/' + period + '/group/ML/details?document_type=BILL&limit=150&offset=' + (offset + rs.length);
-      let r = null;
-      for (let i = 0; i < 4; i++) {
-        r = await fetch(url, { headers: H });
-        if (r.status !== 429) break;
-        await new Promise(rp => setTimeout(rp, 5000));
-      }
-      if (!r || r.status !== 200) {
-        if (!paginasOk) return res.json({ period, offset, http: r ? r.status : null, reintentar: true, done: false });
-        break;
-      }
-      const j = await r.json();
-      const pagina = Array.isArray(j.results) ? j.results : [];
-      if (j.total != null) total = j.total;
-      rs = rs.concat(pagina);
-      paginasOk++;
-      if (!pagina.length || (total != null && offset + rs.length >= total)) break;
-      await new Promise(rp => setTimeout(rp, 250));
-    }
-
-    const sumas = {};
-    let hits = 0;
-    for (const d of rs) {
-      const ci = d.charge_info || {};
-      const esCargo = ci.detail_type === 'CHARGE';
-      const esCredito = ci.detail_type === 'CREDIT';
-      if (!esCargo && !esCredito) continue;
-      const concepto = String(ci.transaction_detail || '');
-      // creditos: bonificaciones/devoluciones de cargos (si reclamaste y ML te lo devolvio)
-      if (!/env|devoluci|bonific/i.test(concepto) && !(esCredito && ci.charge_bonified_id)) continue;
-      const sales = Array.isArray(d.sales_info) ? d.sales_info : [];
-      let destino = null;
-      for (const si of sales) {
-        const oid = si && String(si.order_id);
-        if (oid && devolSet.has(oid)) { destino = oid; break; }
-        const pid = si && si.pack_id && String(si.pack_id);
-        if (pid && devolPacks[pid]) { destino = devolPacks[pid]; break; }
-      }
-      if (!destino && d.shipping_info && d.shipping_info.pack_id && devolPacks[String(d.shipping_info.pack_id)]) {
-        destino = devolPacks[String(d.shipping_info.pack_id)];
-      }
-      if (destino) {
-        const monto = Math.abs(Number(ci.detail_amount) || 0);
-        sumas[destino] = (sumas[destino] || 0) + (esCredito ? -monto : monto);
-        hits++;
-      }
-    }
-    const cambios = [];
-    for (const oid of Object.keys(sumas)) {
-      const { data: cur } = await supabase.from('ventas').select('dev_cargo,sku').eq('user_id', String(user_id)).eq('nro_venta', oid).limit(1);
-      const prev = (cur && cur[0] && cur[0].dev_cargo != null) ? Number(cur[0].dev_cargo) : null;
-      const nuevo = (prev || 0) + sumas[oid];
-      await supabase.from('ventas').update({ dev_cargo: nuevo }).eq('user_id', String(user_id)).eq('nro_venta', oid);
-      cambios.push({ nro: oid, sku: (cur && cur[0] && cur[0].sku) || '', antes: prev, ahora: nuevo });
-    }
-    const nextOffset = offset + rs.length;
-    const done = !rs.length || (total != null && nextOffset >= total);
-    await supabase.from('margen_billing_cursor').update({ next_offset: nextOffset, updated_at: new Date().toISOString() }).eq('user_id', String(user_id)).eq('period', period);
-    res.json({ period, escaneados: rs.length, total, nextOffset, done, hits, ordenesActualizadas: Object.keys(sumas).length, cambios });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── PROBE7 (TEMPORAL): variantes de filtro por orden en facturacion ──
-// GET /api/devol/probe7?user_id=67619515&order=2000017191703550
-app.get('/api/devol/probe7', async (req, res) => {
-  try {
-    const user_id = req.query.user_id;
-    if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
-    const orderId = String(req.query.order || '2000017191703550').trim();
-    const token = await getValidToken(user_id);
-    const H = { Authorization: 'Bearer ' + token };
-    const out = { order: orderId, variantes: {} };
-    const urls = [
-      ['v1_order_details', 'https://api.mercadolibre.com/billing/integration/group/ML/order/' + orderId + '/details?document_type=BILL'],
-      ['v1_order_details_noDoc', 'https://api.mercadolibre.com/billing/integration/group/ML/order/' + orderId + '/details'],
-      ['v2_order', 'https://api.mercadolibre.com/billing/integration/order/' + orderId + '/details?group=ML'],
-      ['periods_orderparam', 'https://api.mercadolibre.com/billing/integration/periods/key/2026-07-01/group/ML/details?document_type=BILL&limit=10&offset=0&sales_info.order_id=' + orderId]
-    ];
-    for (const [k, url] of urls) {
-      try {
-        let r = null;
-        for (let i = 0; i < 3; i++) {
-          r = await fetch(url, { headers: H });
-          if (r.status !== 429) break;
-          await new Promise(rp => setTimeout(rp, 8000));
-        }
-        let j = null; try { j = await r.json(); } catch (e2) {}
-        let resumen = null;
-        if (j) {
-          const txt = JSON.stringify(j);
-          if (txt.length <= 2500) resumen = j;
-          else {
-            const rs = j.results || [];
-            resumen = { keys: Object.keys(j), total: j.total, resultados: rs.length, lineas: rs.slice(0, 8).map(d => ({ concepto: d.charge_info && d.charge_info.transaction_detail, monto: d.charge_info && d.charge_info.detail_amount, tipo: d.charge_info && d.charge_info.detail_type, orden: d.sales_info && d.sales_info[0] && d.sales_info[0].order_id })) };
-          }
-        }
-        out.variantes[k] = { http: r.status, body: resumen };
-      } catch (e) { out.variantes[k] = { error: e.message }; }
-      await new Promise(rp => setTimeout(rp, 400));
-    }
-    res.json(out);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -3107,25 +2522,6 @@ app.get('/api/ads/items', async (req, res) => {
     const base = `https://api.mercadolibre.com/advertising/advertisers/${a}/product_ads/items?date_from=${desde}&date_to=${hasta}&metrics=${M}`;
     const headers = { Authorization: `Bearer ${token}`, 'Api-Version': '2' };
 
-    // La API de Ads de ML es inestable: a veces devuelve respuestas vacias o
-    // cortadas. Reintentamos hasta 3 veces con espera antes de rendirnos.
-    const fetchAds = async (url) => {
-      let ultimo = null;
-      for (let intento = 1; intento <= 3; intento++) {
-        try {
-          const r = await fetch(url, { headers });
-          const txt = await r.text();
-          if (!txt || !txt.trim()) { ultimo = { status: r.status, motivo: 'respuesta vacia' }; }
-          else {
-            try { return { status: r.status, json: JSON.parse(txt) }; }
-            catch (e) { ultimo = { status: r.status, motivo: 'JSON cortado' }; }
-          }
-        } catch (e) { ultimo = { status: 0, motivo: e.message }; }
-        await new Promise(rs => setTimeout(rs, 800 * intento));
-      }
-      return { error: ultimo };
-    };
-
     const map = {};
     let gastoTotal = 0;
     const acc = (arr) => {
@@ -3139,24 +2535,19 @@ app.get('/api/ads/items', async (req, res) => {
     };
 
     // primera página: saber el total
-    const first = await fetchAds(`${base}&limit=50&offset=0`);
-    if (first.error) return res.status(502).json({ error: 'Error API ads (ML no responde bien)', detalle: first.error });
-    if (first.status !== 200) return res.status(first.status).json({ error: 'Error API ads', detalle: first.json });
-    const fj = first.json;
+    const first = await fetch(`${base}&limit=50&offset=0`, { headers });
+    const fj = await first.json();
+    if (first.status !== 200) return res.status(first.status).json({ error: 'Error API ads', detalle: fj });
     const total = (fj.paging && fj.paging.total) || 0;
     acc(fj.results);
 
-    // resto en lotes concurrentes (rápido); cada pagina con sus reintentos
+    // resto en lotes concurrentes (rápido)
     const offsets = [];
     for (let o = 50; o < total; o += 50) offsets.push(o);
     const LOTE = 6;
-    let paginasCaidas = 0;
     for (let i = 0; i < offsets.length; i += LOTE) {
       const batch = offsets.slice(i, i + LOTE).map(o =>
-        fetchAds(`${base}&limit=50&offset=${o}`).then(r => {
-          if (r.error || r.status !== 200) { paginasCaidas++; return {}; }
-          return r.json;
-        })
+        fetch(`${base}&limit=50&offset=${o}`, { headers }).then(r => r.json()).catch(() => ({}))
       );
       const results = await Promise.all(batch);
       results.forEach(j => acc(j.results));
@@ -3168,11 +2559,9 @@ app.get('/api/ads/items', async (req, res) => {
       total_items: total,
       anuncios_con_gasto: Object.keys(map).length,
       gasto_total: Math.round(gastoTotal),
-      paginas_caidas: paginasCaidas,
       gastos: map
     };
-    // No cachear si hubo paginas caidas: mejor reintentar completo la proxima
-    if (!paginasCaidas) _adsCache[key] = { ts: Date.now(), data };
+    _adsCache[key] = { ts: Date.now(), data };
     res.json(Object.assign({ cached: false }, data));
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -3253,141 +2642,6 @@ app.get('/api/envio/diag', async (req, res) => {
   }
 });
 
-// ── DIAGNÓSTICO RAW COMPLETO (TEMPORAL) ──
-// Uso: /api/envio/rawfull?user_id=67619515&order=2000017591069580
-// Devuelve el JSON crudo completo de la orden y del shipment, sin recortar nada.
-// Sirve para ubicar el campo de origen/deposito (Flex Baires vs Flex Rosario).
-app.get('/api/envio/rawfull', async (req, res) => {
-  try {
-    const { user_id, order } = req.query;
-    if (!user_id || !order) return res.status(400).json({ error: 'Pasá user_id y order' });
-    const token = await getValidToken(user_id);
-    if (!token) return res.status(400).json({ error: 'Sin token ML' });
-    const H = { headers: { Authorization: `Bearer ${token}` } };
-
-    const ro = await fetch(`https://api.mercadolibre.com/orders/${order}`, H);
-    const ord = await ro.json();
-    const shipId = ord.shipping && ord.shipping.id;
-
-    let ship = null, costs = null;
-    if (shipId) {
-      const rs = await fetch(`https://api.mercadolibre.com/shipments/${shipId}`, H);
-      ship = await rs.json();
-      const rc = await fetch(`https://api.mercadolibre.com/shipments/${shipId}/costs`, H);
-      costs = await rc.json();
-    }
-
-    res.json({ orden_raw: ord, shipment_raw: ship, costs_raw: costs });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ── FLEX BAIRES: configuración (CBM, unificado, zonas, umbral) ──────
-// GET: trae el valor vigente de cada uno + el historial completo, y de
-// yapa una lista de ciudades vistas en ventas de Buenos Aires (para que
-// el desplegable de zonas se pueda armar solo, aunque todavía no tengan costo cargado).
-app.get('/api/fb/config', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
-  try {
-    const cfg = await _fbCargarConfig();
-    const ahora = new Date().toISOString();
-    const vigenteCbm    = _vigenteA(cfg.cbm, ahora);
-    const vigenteUni    = _vigenteA(cfg.unificado, ahora);
-    const vigenteUmbral = _vigenteA(cfg.umbral, ahora);
-    // Zonas ya cargadas + costo vigente de cada una
-    const zonasSet = [...new Set(cfg.zonas.map(z => z.zona))];
-    const zonasVigentes = zonasSet.map(z => {
-      const row = _vigenteA(cfg.zonas, ahora, f => f.zona === z);
-      return { zona: z, costo: row ? Number(row.costo) : null };
-    });
-    // Ciudades vistas en ventas Flex Baires que todavía no tienen costo de zona cargado
-    const { data: ciudadesVentas } = await supabase
-      .from('ventas').select('ciudad').eq('deposito_flex_baires', true).not('ciudad', 'is', null).limit(2000);
-    const ciudadesSinCosto = [...new Set((ciudadesVentas || []).map(v => v.ciudad).filter(Boolean))]
-      .filter(c => !zonasSet.includes(c));
-    res.json({
-      cbm:      { vigente: vigenteCbm ? Number(vigenteCbm.costo_cbm) : null, historial: cfg.cbm },
-      unificado:{ vigente: vigenteUni ? Number(vigenteUni.costo) : null, historial: cfg.unificado },
-      zonas:    { cargadas: zonasVigentes, sin_costo: ciudadesSinCosto, historial: cfg.zonas },
-      umbral:   { vigente: vigenteUmbral ? { monto_umbral: Number(vigenteUmbral.monto_umbral), bonif_ml: Number(vigenteUmbral.bonif_ml) } : null, historial: cfg.umbral }
-    });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// POST: cada uno agrega una fila NUEVA (nunca pisa la vieja) para no romper
-// el costo congelado de ventas ya sincronizadas.
-app.post('/api/fb/config/cbm', requireAuth, soloRoles('admin'), async (req, res) => {
-  try {
-    const costo_cbm = Number(req.body.costo_cbm);
-    if (!(costo_cbm >= 0)) return res.status(400).json({ error: 'costo_cbm inválido' });
-    const { error } = await supabase.from('fb_config_cbm').insert({ costo_cbm });
-    if (error) return res.status(500).json({ error: error.message });
-    _fbCache.ts = 0; // invalida cache
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/fb/config/unificado', requireAuth, soloRoles('admin'), async (req, res) => {
-  try {
-    const costo = Number(req.body.costo);
-    if (!(costo >= 0)) return res.status(400).json({ error: 'costo inválido' });
-    const { error } = await supabase.from('fb_config_unificado').insert({ costo });
-    if (error) return res.status(500).json({ error: error.message });
-    _fbCache.ts = 0;
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/fb/config/zona', requireAuth, soloRoles('admin'), async (req, res) => {
-  try {
-    const zona = String(req.body.zona || '').trim();
-    const costo = Number(req.body.costo);
-    if (!zona) return res.status(400).json({ error: 'zona requerida' });
-    if (!(costo >= 0)) return res.status(400).json({ error: 'costo inválido' });
-    const { error } = await supabase.from('fb_config_zonas').insert({ zona, costo });
-    if (error) return res.status(500).json({ error: error.message });
-    _fbCache.ts = 0;
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/fb/config/umbral', requireAuth, soloRoles('admin'), async (req, res) => {
-  try {
-    const monto_umbral = Number(req.body.monto_umbral);
-    const bonif_ml = Number(req.body.bonif_ml || 0);
-    if (!(monto_umbral >= 0)) return res.status(400).json({ error: 'monto_umbral inválido' });
-    const { error } = await supabase.from('fb_config_umbral').insert({ monto_umbral, bonif_ml });
-    if (error) return res.status(500).json({ error: error.message });
-    _fbCache.ts = 0;
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.listen(PORT, () => console.log(`MargenML backend v34 (verificados) corriendo en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`MargenML backend v36 (contiene) corriendo en puerto ${PORT}`));
 
 module.exports = app;
-
-// ── CARGOS DE DEVOLUCIONES: sincronizacion automatica cada 5 dias (ultimos 60 dias / 3 periodos) ──
-async function _cargosAutoSync() {
-  try {
-    const user_id = '67619515';
-    const base = 'https://margenml-backend-production.up.railway.app';
-    const h = new Date();
-    const per = [];
-    for (let k = 2; k >= 0; k--) { const d = new Date(h.getFullYear(), h.getMonth() - k, 1); per.push(d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-01'); }
-    console.log('[CARGOS-AUTO] arrancando, periodos:', per.join(','));
-    await fetch(base + '/api/devol/cargos-prep?user_id=' + user_id + '&periods=' + per.join(','));
-    for (const p of per) {
-      for (let i = 0; i < 500; i++) {
-        const r = await fetch(base + '/api/devol/cargos-sync?user_id=' + user_id + '&period=' + p);
-        const d = await r.json();
-        if (d.reintentar) { await new Promise(rs => setTimeout(rs, 20000)); continue; }
-        if (d.error || d.done) break;
-        await new Promise(rs => setTimeout(rs, 500));
-      }
-    }
-    console.log('[CARGOS-AUTO] completado');
-  } catch (e) { console.log('[CARGOS-AUTO] error:', e.message); }
-}
-setTimeout(_cargosAutoSync, 5 * 60 * 1000);          // 5 min despues de arrancar
-setInterval(_cargosAutoSync, 5 * 24 * 60 * 60 * 1000); // y cada 5 dias
