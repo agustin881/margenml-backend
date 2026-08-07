@@ -58,7 +58,13 @@ function soloRoles(...roles) {
 }
 
 // ── Quien soy: el frontend pregunta el rol para armar el menu ──────
+// Sin cache: es un endpoint de permisos, tiene que responder siempre fresco.
+// Si se cachea (304 Not Modified), el hub arma el menu con permisos viejos.
 app.get('/api/mi-rol', requireAuth, (req, res) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  res.set('Surrogate-Control', 'no-store');
   res.json({ email: req.authUser.email, rol: req.rol, pestanas: req.pestanas, apps: req.apps, acciones: req.acciones, pestanas_logistica: req.pestanas_logistica });
 });
 
