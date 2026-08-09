@@ -1637,9 +1637,10 @@ async function buildVentaRow(order, userId, token, incluirEnvio = true) {
 
   // Cuotas y costo financiero
   const cuotas = payment.installments || 1;
-  // ML cobra un costo financiero por cuotas: total_paid_amount - transaction_amount
-  const costoFinanciero = (payment.total_paid_amount && payment.transaction_amount)
-    ? Math.max(0, payment.total_paid_amount - payment.transaction_amount)
+  // ML cobra un costo financiero por cuotas: total_paid - transaction - envio del comprador.
+  // Con 1 cuota NO hay costo financiero (antes se colaba el envio pagado por el comprador).
+  const costoFinanciero = (cuotas > 1 && payment.total_paid_amount && payment.transaction_amount)
+    ? Math.max(0, payment.total_paid_amount - payment.transaction_amount - (Number(payment.shipping_cost) || 0))
     : 0;
 
   // Tipo de publicación
