@@ -3645,6 +3645,59 @@ app.get('/api/ads/diag2', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── DIAGNÓSTICO ADS v3 (TEMPORAL): cadena nueva post-mayo-2026 ──
+// Uso: /api/ads/diag3?user_id=67619515
+// ML desactivó los endpoints viejos (27-may-2026). El modelo nuevo es
+// campañas → ad groups → anuncios. Este diag recorre la cadena con las rutas
+// nuevas y devuelve las estructuras reales para reescribir /api/ads/items.
+app.get('/api/ads/diag3', async (req, res) => {
+  try {
+    const { user_id } = req.query;
+    if (!user_id) return res.status(400).json({ error: 'Pasá user_id' });
+    const token = await getValidToken(user_id);
+    if (!token) return res.status(400).json({ error: 'Sin token ML' });
+    const H = { headers: { Authorization: `Bearer ${token}`, 'api-version': '2' } };
+    const out = {};
+    const hoy = new Date().toISOString().slice(0, 10);
+    const hace7 = new Date(Date.now() - 7 * 864e5).toISOString().slice(0, 10);
+    const get = async (url) => {
+      const r = await fetch(url, H);
+      const txt = await r.text();
+      let body; try { body = JSON.parse(txt); } catch (e) { body = (txt || '').slice(0, 200) || '(vacio)'; }
+      return { status: r.status, body };
+    };
+
+    // 1) Campañas (ruta nueva con /search)
+    const camp = await get(`https://api.mercadolibre.com/marketplace/advertising/MLA/advertisers/10904/product_ads/campaigns/search?limit=3&offset=0&date_from=${hace7}&date_to=${hoy}&metrics=cost`);
+    out.campanas = { status: camp.status, body: camp.body && camp.body.results ? { total: camp.body.paging && camp.body.paging.total, primeras: camp.body.results.slice(0, 2) } : camp.body };
+
+    // 2) Ad groups de la primera campaña (probamos las dos formas de ruta)
+    let campId = null;
+    try { campId = camp.body.results[0].id || camp.body.results[0].campaign_id; } catch (e) {}
+    out.primera_campana_id = campId;
+    let agId = null;
+    if (campId) {
+      const v1 = await get(`https://api.mercadolibre.com/advertising/MLA/product_ads/campaigns/${campId}/ad_groups?date_from=${hace7}&date_to=${hoy}&metrics=cost&limit=3`);
+      out.ad_groups_rutaA = { status: v1.status, body: v1.body && v1.body.results ? { total: v1.body.paging && v1.body.paging.total, primeros: v1.body.results.slice(0, 2) } : v1.body };
+      try { agId = v1.body.results[0].id || v1.body.results[0].ad_group_id; } catch (e) {}
+      if (!agId) {
+        const v2 = await get(`https://api.mercadolibre.com/marketplace/advertising/MLA/advertisers/10904/product_ads/ad_groups/search?limit=3&offset=0&date_from=${hace7}&date_to=${hoy}&filters[campaign_id]=${campId}`);
+        out.ad_groups_rutaB = { status: v2.status, body: v2.body && v2.body.results ? { total: v2.body.paging && v2.body.paging.total, primeros: v2.body.results.slice(0, 2) } : v2.body };
+        try { agId = v2.body.results[0].id || v2.body.results[0].ad_group_id; } catch (e) {}
+      }
+    }
+    out.primer_ad_group_id = agId;
+
+    // 3) Anuncios (con métricas) del primer ad group
+    if (agId) {
+      const ads = await get(`https://api.mercadolibre.com/advertising/MLA/product_ads/ad_groups/${agId}/ads?date_from=${hace7}&date_to=${hoy}&metrics=cost,acos,units_quantity,total_amount&limit=5&offset=0`);
+      out.anuncios = { status: ads.status, body: ads.body && ads.body.results ? { total: ads.body.paging && ads.body.paging.total, primeros: ads.body.results.slice(0, 3) } : ads.body };
+    }
+
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.listen(PORT, () => console.log(`MargenML backend v35 (pack-envio) corriendo en puerto ${PORT}`));
 
 module.exports = app;
