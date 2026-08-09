@@ -508,7 +508,7 @@ Acciones disponibles:
 
 Reglas:
 - Los SKU de Pontec son codigos tipo OFI210-BL o AIR010-NE: letras+numeros y a veces sufijo de color (NE=negro, BL=blanco, AZ=azul, RO=rojo, GR=gris, VE=verde, MA=marron, CO=cobre). Si el usuario dice "la silla ofi 210 blanca", el SKU es OFI210-BL.
-- SKU MASTER/FAMILIA: si el usuario da un SKU SIN sufijo de color (ej: "STL150", "sacale el descuento al OFI210"), NO le pidas los colores: pasa el SKU tal cual (ej: "STL150") y el sistema lo expande solo a todas las variantes de la familia (STL150-BL, STL150-NE, etc.). Solo agrega el sufijo si el usuario nombro un color especifico.
+- SKU MASTER/FAMILIA: si el usuario da un SKU SIN sufijo de color (ej: "STL150", "sacale el descuento al BAN005"), NO le pidas los colores: pasa el SKU tal cual (ej: "BAN005") y el sistema lo expande solo a TODA la familia: todas las variantes de color (BAN005-BL, BAN005-NE, etc.) Y TAMBIEN los combos que contienen ese codigo (COMBO 2X BAN005-BL, COMBO 3X BAN005-NE, etc.). Solo agrega el sufijo si el usuario nombro un color especifico.
 - MUY IMPORTANTE: tambien existen SKUs de COMBOS que llevan ESPACIOS adentro, con formato "COMBO 2X BAN002-BL", "COMBO 3X BAN005-NE", "COMBO 4X BAN002-BL", etc. Cada uno de esos es UN SOLO SKU completo: NUNCA lo partas, nunca le saques el "COMBO NX", y usalo entero (con espacios) en el parametro "sku". Si el usuario pega una lista de SKUs (uno por renglon o separados por comas), cada renglon/entrada es un SKU completo. Si en un texto corrido aparece "COMBO", el SKU abarca desde "COMBO" hasta el codigo con sufijo de color inclusive (ej: en "COMBO 2X BAN002-BL COMBO 2X BAN002-NE" hay DOS skus: "COMBO 2X BAN002-BL" y "COMBO 2X BAN002-NE").
 - Si el usuario dice un porcentaje de descuento, mandalo como "porcentaje"; NO le pidas el precio final.\n- Para clonar_fotos hace falta saber DE QUE publicacion copiar (un codigo MLA...). Si el usuario no lo dijo, pedilo con "charla".
 - El descuento individual dura maximo 14 dias (limite de ML); si piden mas, avisalo en "respuesta" y usa dias=14.
@@ -535,6 +535,26 @@ async function asistenteLLM(mensajes) {
   catch (e) { return { json: { accion: 'charla', respuesta: txt || 'No te entendi, proba de nuevo.' } }; }
 }
 
+// ¿El SKU candidato pertenece a la familia del codigo base?
+// Matchea el base en CUALQUIER parte, delimitado por inicio/fin/espacio/guion:
+//   base "BAN005" → BAN005 ✓ · BAN005-BL ✓ · COMBO 2X BAN005-NE ✓ · BAN0055 ✗
+function _skuEsFamilia(candidato, base) {
+  const s = String(candidato || '').toUpperCase().trim();
+  const b = String(base || '').toUpperCase().trim();
+  if (!s || !b) return false;
+  let desde = 0;
+  while (true) {
+    const i = s.indexOf(b, desde);
+    if (i < 0) return false;
+    const antes = i === 0 ? '' : s[i - 1];
+    const desp = (i + b.length >= s.length) ? '' : s[i + b.length];
+    const okA = antes === '' || antes === ' ' || antes === '-';
+    const okD = desp === '' || desp === ' ' || desp === '-';
+    if (okA && okD) return true;
+    desde = i + 1;
+  }
+}
+
 async function asistenteResolverItems(p, userId, token) {
   if (p.item_id) return [String(p.item_id).toUpperCase().trim()];
   const sku = String(p.sku || '').toUpperCase().trim();
@@ -549,27 +569,27 @@ async function asistenteResolverItems(p, userId, token) {
       if (Array.isArray(d.results) && d.results.length) return d.results.slice(0, 20);
     } catch (e) {}
   }
-  // 2) SKU MASTER/FAMILIA: si no hubo coincidencia exacta, expandir a toda la familia.
-  //    Ej: "STL150" → STL150-BL, STL150-NE... Primero buscamos las variantes en
-  //    NUESTRA base (tabla ventas + catalogo dep_productos): es instantaneo y cubre
-  //    todo el catalogo. Cada variante encontrada se resuelve exacta contra ML.
+  // 2) SKU MASTER/FAMILIA: si no hubo coincidencia exacta, expandir a toda la familia,
+  //    INCLUIDOS los combos que contienen el codigo (ej: "COMBO 2X BAN005-BL").
+  //    Primero buscamos las variantes en NUESTRA base (tabla ventas + catalogo
+  //    dep_productos): es instantaneo y cubre todo el catalogo.
   try {
     const variantes = new Set();
-    // 2a) SKUs vistos en ventas (cualquier variante que se haya vendido alguna vez)
+    // 2a) SKUs vistos en ventas (cualquier variante o combo que se haya vendido)
     try {
       const { data: vs } = await supabase.from('ventas').select('sku')
-        .eq('user_id', String(userId)).ilike('sku', sku + '%').limit(2000);
+        .eq('user_id', String(userId)).ilike('sku', '%' + sku + '%').limit(2000);
       for (const v of (vs || [])) {
         const s = String(v.sku || '').toUpperCase().trim();
-        if (s === sku || s.startsWith(sku + '-') || s.startsWith(sku + ' ')) variantes.add(s);
+        if (_skuEsFamilia(s, sku)) variantes.add(s);
       }
     } catch (e) {}
     // 2b) Catalogo de productos de App Deposito (incluye variantes nunca vendidas)
     try {
-      const { data: ps } = await supabase.from('dep_productos').select('sku').ilike('sku', sku + '%').limit(2000);
+      const { data: ps } = await supabase.from('dep_productos').select('sku').ilike('sku', '%' + sku + '%').limit(2000);
       for (const v of (ps || [])) {
         const s = String(v.sku || '').toUpperCase().trim();
-        if (s === sku || s.startsWith(sku + '-') || s.startsWith(sku + ' ')) variantes.add(s);
+        if (_skuEsFamilia(s, sku)) variantes.add(s);
       }
     } catch (e) {}
 
@@ -629,10 +649,7 @@ async function asistenteResolverItems(p, userId, token) {
               }
             }
           }
-          const esFam = skus.some(s => {
-            const su = s.toUpperCase().trim();
-            return su === sku || su.startsWith(sku + '-') || su.startsWith(sku + ' ');
-          });
+          const esFam = skus.some(s => _skuEsFamilia(s, sku));
           if (esFam && b.id) familia.add(String(b.id).toUpperCase());
         }
       }
