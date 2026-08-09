@@ -550,9 +550,51 @@ async function asistenteResolverItems(p, userId, token) {
     } catch (e) {}
   }
   // 2) SKU MASTER/FAMILIA: si no hubo coincidencia exacta, expandir a toda la familia.
-  //    Ej: "STL150" → STL150-BL, STL150-NE, STL150-RO... (todas las publicaciones
-  //    activas cuyo seller_sku empiece con "STL150-" o sea exactamente "STL150").
-  //    Asi se puede decir "sacale el descuento al STL150" sin tipear cada color.
+  //    Ej: "STL150" → STL150-BL, STL150-NE... Primero buscamos las variantes en
+  //    NUESTRA base (tabla ventas + catalogo dep_productos): es instantaneo y cubre
+  //    todo el catalogo. Cada variante encontrada se resuelve exacta contra ML.
+  try {
+    const variantes = new Set();
+    // 2a) SKUs vistos en ventas (cualquier variante que se haya vendido alguna vez)
+    try {
+      const { data: vs } = await supabase.from('ventas').select('sku')
+        .eq('user_id', String(userId)).ilike('sku', sku + '%').limit(2000);
+      for (const v of (vs || [])) {
+        const s = String(v.sku || '').toUpperCase().trim();
+        if (s === sku || s.startsWith(sku + '-') || s.startsWith(sku + ' ')) variantes.add(s);
+      }
+    } catch (e) {}
+    // 2b) Catalogo de productos de App Deposito (incluye variantes nunca vendidas)
+    try {
+      const { data: ps } = await supabase.from('dep_productos').select('sku').ilike('sku', sku + '%').limit(2000);
+      for (const v of (ps || [])) {
+        const s = String(v.sku || '').toUpperCase().trim();
+        if (s === sku || s.startsWith(sku + '-') || s.startsWith(sku + ' ')) variantes.add(s);
+      }
+    } catch (e) {}
+
+    if (variantes.size) {
+      // Resolver cada variante exacta contra ML (en paralelo, solo activas)
+      const lista = Array.from(variantes).slice(0, 30);
+      const porVariante = await Promise.all(lista.map(async (vs) => {
+        try {
+          const r = await fetch(`https://api.mercadolibre.com/users/${userId}/items/search?seller_sku=${encodeURIComponent(vs)}&status=active`, {
+            headers: { Authorization: 'Bearer ' + token }
+          });
+          const d = await r.json();
+          return Array.isArray(d.results) ? d.results : [];
+        } catch (e) { return []; }
+      }));
+      const ids = new Set();
+      porVariante.forEach(arr => arr.forEach(id => ids.add(String(id).toUpperCase())));
+      if (ids.size) {
+        console.log(`[ASIS-FAMILIA] "${sku}" expandio via base a ${variantes.size} variante(s) → ${ids.size} publicacion(es) activas`);
+        return Array.from(ids).slice(0, 20);
+      }
+    }
+  } catch (e) { console.error('[ASIS-FAMILIA-BASE] error:', e.message); }
+
+  // 2c) Ultimo recurso: barrido del catalogo activo de ML (lento, tope 1000 publicaciones)
   try {
     const familia = new Set();
     let offset = 0;
