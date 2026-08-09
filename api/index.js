@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v34-verificados', costo_congelado: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v35-pack-envio', costo_congelado: true, pack_envio: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -1428,6 +1428,106 @@ async function calcularCostosFlexBaires({ sku, unidades, ciudad, fecha, precio }
   return out;
 }
 
+// ── REPARTO DE ENVÍO EN PACKS (carrito: varias órdenes, UN solo envío) ──
+// ML crea una orden por producto pero cobra UN envío por el paquete. Sin esto,
+// cada fila de venta se llevaba el costo COMPLETO del envío (se contaba doble).
+// Regla acordada:
+//   1. Ítems con precio UNITARIO < umbral ($33.000, tabla fb_config_umbral) NO pagan envío.
+//   2. Envío teórico del Drive (columna envioML, c/IVA) por cada ítem que paga.
+//   3. Si la suma teórica ≈ envío real de ML (tolerancia $2) → usar valores del Drive.
+//   4. Si no coincide → repartir el envío real por unidades entre los que pagan.
+//   5. Si un solo ítem paga → absorbe el envío completo.
+// El ingreso del comprador (precio_comprador_envio) se reparte en la misma proporción.
+const _packCache = new Map(); // pack_id → { t, ordenes:[{orderId,sku,unitPrice,qty}] }
+
+async function _ordenesDelPack(packId, token) {
+  const c = _packCache.get(String(packId));
+  if (c && Date.now() - c.t < 10 * 60 * 1000) return c.ordenes;
+  const H = { headers: { Authorization: `Bearer ${token}` } };
+  const rp = await fetch(`https://api.mercadolibre.com/packs/${packId}`, H);
+  const pack = await rp.json();
+  if (!pack || !Array.isArray(pack.orders) || pack.orders.length < 2) return null;
+  const ordenes = [];
+  for (const o of pack.orders) {
+    const ro = await fetch(`https://api.mercadolibre.com/orders/${o.id}`, H);
+    const ord = await ro.json();
+    if (!ord || ord.error) continue;
+    const it = (ord.order_items && ord.order_items[0]) || {};
+    ordenes.push({
+      orderId: String(ord.id),
+      sku: String((it.item && (it.item.seller_sku || it.item.seller_custom_field)) || '').trim().toUpperCase(),
+      unitPrice: Number(it.unit_price) || 0,
+      qty: Number(it.quantity) || 1
+    });
+  }
+  if (ordenes.length < 2) return null;
+  _packCache.set(String(packId), { t: Date.now(), ordenes });
+  return ordenes;
+}
+
+async function repartirEnvioPack(order, envioRealTotal, ingresoTotal, token) {
+  try {
+    if (!order.pack_id) return null;
+    if (!(envioRealTotal > 0) && !(ingresoTotal > 0)) return null; // nada que repartir
+    const ordenes = await _ordenesDelPack(order.pack_id, token);
+    if (!ordenes) return null; // pack de 1 sola orden o error → sin cambios
+
+    // Umbral vigente a la fecha de la venta (fb_config_umbral, fallback $33.000)
+    let umbral = 33000;
+    try {
+      const cfg = await _fbCargarConfig();
+      const u = _vigenteA(cfg.umbral, order.date_created);
+      if (u && Number(u.monto_umbral) > 0) umbral = Number(u.monto_umbral);
+    } catch (e) {}
+
+    // Quiénes pagan envío (precio unitario >= umbral)
+    const pagan = ordenes.filter(o => o.unitPrice >= umbral);
+    // Caso raro: nadie supera el umbral pero ML cobró igual → reparten todos por unidades
+    const grupo = pagan.length > 0 ? pagan : ordenes;
+
+    // Envío teórico del Drive (envioML c/IVA, por unidad) de cada ítem del grupo
+    let teoricos = null;
+    try {
+      const medidas = await getMedidas();
+      const t = {};
+      let suma = 0, completos = true;
+      for (const o of grupo) {
+        const m = medidas[o.sku];
+        const e = m && Number(m.envioML) > 0 ? Number(m.envioML) * o.qty : 0;
+        if (!(e > 0)) completos = false;
+        t[o.orderId] = e;
+        suma += e;
+      }
+      if (completos && suma > 0) teoricos = { porOrden: t, suma };
+    } catch (e) {}
+
+    // Asignación del COSTO
+    const asignado = {};
+    if (teoricos && Math.abs(teoricos.suma - envioRealTotal) <= 2) {
+      // Coincide con lo que descontó ML → usar los valores del Drive tal cual
+      for (const o of ordenes) asignado[o.orderId] = teoricos.porOrden[o.orderId] || 0;
+      console.log(`[PACK-ENVIO] pack=${order.pack_id} DRIVE (suma=${teoricos.suma} vs real=${envioRealTotal})`);
+    } else {
+      // No coincide (o faltan datos en el Drive) → dividir el real por unidades
+      const totalUnidades = grupo.reduce((a, o) => a + o.qty, 0) || 1;
+      const porUnidad = envioRealTotal / totalUnidades;
+      for (const o of ordenes) asignado[o.orderId] = grupo.indexOf(o) > -1 ? porUnidad * o.qty : 0;
+      console.log(`[PACK-ENVIO] pack=${order.pack_id} POR-UNIDADES (teorico=${teoricos ? teoricos.suma : 'sin datos'} vs real=${envioRealTotal})`);
+    }
+
+    // Ingreso del comprador: misma proporción que el costo asignado
+    const miCosto = asignado[String(order.id)];
+    if (miCosto == null) return null; // esta orden no está en el pack (raro) → sin cambios
+    const sumaAsignada = Object.values(asignado).reduce((a, b) => a + b, 0) || 1;
+    const miIngreso = (ingresoTotal > 0) ? ingresoTotal * (miCosto / sumaAsignada) : 0;
+
+    return { costo: Math.round(miCosto * 100) / 100, ingreso: Math.round(miIngreso * 100) / 100 };
+  } catch (e) {
+    console.error('[PACK-ENVIO] error:', e.message);
+    return null; // ante cualquier duda, no tocar (queda el comportamiento anterior)
+  }
+}
+
 // ── Helper: construir objeto venta completo ───────────────────────
 async function buildVentaRow(order, userId, token, incluirEnvio = true) {
   const item     = (order.order_items && order.order_items[0]) || {};
@@ -1453,6 +1553,14 @@ async function buildVentaRow(order, userId, token, incluirEnvio = true) {
   const shipData = incluirEnvio && order.shipping && order.shipping.id
     ? await getShipData(order.shipping.id, token)
     : {};
+
+  // Pack (carrito): varias órdenes comparten UN envío → repartirlo para no contarlo doble
+  let envioCosto   = shipData.costo_envio           || 0;
+  let envioIngreso = shipData.precio_comprador_envio || 0;
+  if (incluirEnvio && order.pack_id) {
+    const rep = await repartirEnvioPack(order, envioCosto, envioIngreso, token);
+    if (rep) { envioCosto = rep.costo; envioIngreso = rep.ingreso; }
+  }
 
   // Flex Baires: si el envío salió del depósito tercerizado de Villa Crespo,
   // calculamos y congelamos sus 4 costos adicionales (CBM, unificado, zona, bonif ML).
@@ -1480,8 +1588,8 @@ async function buildVentaRow(order, userId, token, incluirEnvio = true) {
     unidades:              item.quantity || 1,
     precio:                order.total_amount,
     comision,
-    costo_envio:           shipData.costo_envio           || 0,
-    precio_comprador_envio:shipData.precio_comprador_envio || 0,
+    costo_envio:           envioCosto,
+    precio_comprador_envio:envioIngreso,
     logistic_type:         shipData.logistic_type          || '',
     provincia:             shipData.provincia              || '',
     ciudad:                shipData.ciudad                 || '',
