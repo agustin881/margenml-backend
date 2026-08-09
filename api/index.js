@@ -3603,7 +3603,49 @@ app.get('/api/diag/rol', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.listen(PORT, () => console.log(`MargenML backend v34 (verificados) corriendo en puerto ${PORT}`));
+// ── DIAGNÓSTICO ADS (TEMPORAL) ──
+// Uso: /api/ads/diag?user_id=67619515
+// Prueba las rutas de la API de Publicidad de ML para encontrar la vigente:
+// 1) lista los advertisers de la cuenta, 2) prueba variantes del endpoint de items.
+app.get('/api/ads/diag', async (req, res) => {
+  try {
+    const { user_id } = req.query;
+    if (!user_id) return res.status(400).json({ error: 'Pasá user_id' });
+    const token = await getValidToken(user_id);
+    if (!token) return res.status(400).json({ error: 'Sin token ML' });
+    const out = {};
+    const probar = async (nombre, url, headers) => {
+      try {
+        const r = await fetch(url, { headers: Object.assign({ Authorization: `Bearer ${token}` }, headers || {}) });
+        const txt = await r.text();
+        let body; try { body = JSON.parse(txt); } catch (e) { body = (txt || '').slice(0, 300) || '(vacio)'; }
+        // resumir para no inundar
+        if (body && body.results && Array.isArray(body.results)) {
+          body = { total: (body.paging && body.paging.total), primeros: body.results.slice(0, 2) };
+        }
+        out[nombre] = { status: r.status, body };
+      } catch (e) { out[nombre] = { error: e.message }; }
+    };
+
+    const hoy = new Date().toISOString().slice(0, 10);
+    const hace7 = new Date(Date.now() - 7 * 864e5).toISOString().slice(0, 10);
+
+    // 1) ¿Qué advertisers tiene la cuenta hoy? (con las dos versiones de header)
+    await probar('advertisers_v1', 'https://api.mercadolibre.com/advertising/advertisers?product_id=PADS', { 'Api-Version': '1' });
+    await probar('advertisers_v2', 'https://api.mercadolibre.com/advertising/advertisers?product_id=PADS', { 'Api-Version': '2' });
+
+    // 2) El endpoint actual (el que da 404) tal cual lo usamos
+    await probar('items_actual_v2', `https://api.mercadolibre.com/advertising/advertisers/10904/product_ads/items?date_from=${hace7}&date_to=${hoy}&metrics=cost,acos&limit=2&offset=0`, { 'Api-Version': '2' });
+
+    // 3) Variantes posibles de la ruta nueva
+    await probar('items_pads_v2', `https://api.mercadolibre.com/advertising/product_ads/items?date_from=${hace7}&date_to=${hoy}&metrics=cost,acos&limit=2&offset=0`, { 'Api-Version': '2' });
+    await probar('campaigns_v2', `https://api.mercadolibre.com/advertising/advertisers/10904/product_ads/campaigns?limit=2`, { 'Api-Version': '2' });
+
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.listen(PORT, () => console.log(`MargenML backend v35 (pack-envio) corriendo en puerto ${PORT}`));
 
 module.exports = app;
 
