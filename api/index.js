@@ -3603,11 +3603,11 @@ app.get('/api/diag/rol', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── DIAGNÓSTICO ADS (TEMPORAL) ──
-// Uso: /api/ads/diag?user_id=67619515
+// ── DIAGNÓSTICO ADS v2 (TEMPORAL) ──
+// Uso: /api/ads/diag2?user_id=67619515
 // Prueba las rutas de la API de Publicidad de ML para encontrar la vigente:
 // 1) lista los advertisers de la cuenta, 2) prueba variantes del endpoint de items.
-app.get('/api/ads/diag', async (req, res) => {
+app.get('/api/ads/diag2', async (req, res) => {
   try {
     const { user_id } = req.query;
     if (!user_id) return res.status(400).json({ error: 'Pasá user_id' });
