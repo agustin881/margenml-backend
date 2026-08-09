@@ -1661,9 +1661,13 @@ async function buildVentaRow(order, userId, token, incluirEnvio = true) {
     if (rep) { envioCosto = rep.costo; envioIngreso = rep.ingreso; }
   }
 
-  // Flex Baires: si el envío salió del depósito tercerizado de Villa Crespo,
-  // calculamos y congelamos sus 4 costos adicionales (CBM, unificado, zona, bonif ML).
-  const esFlexBaires = shipData.logistic_center_id === FLEX_BAIRES_NODE;
+  // Flex Baires: identificar el depósito de origen por DOS vías:
+  // 1) sender_address.node.logistic_center_id del shipment (cuando se consultó el envío)
+  // 2) stock.node_id de los items de la orden (viene SIEMPRE, incluso en syncs sin envío)
+  const nodoOrden = ((order.order_items || [])
+    .map(i => i && i.stock && i.stock.node_id).find(n => n)) || '';
+  const centroLogistico = shipData.logistic_center_id || nodoOrden || '';
+  const esFlexBaires = centroLogistico === FLEX_BAIRES_NODE;
   let fbCostos = { fb_cbm_m3: 0, fb_costo_cbm: 0, fb_costo_unificado: 0, fb_costo_zona: 0, fb_ahorro_ml: 0 };
   if (esFlexBaires) {
     try {
@@ -1692,7 +1696,7 @@ async function buildVentaRow(order, userId, token, incluirEnvio = true) {
     logistic_type:         shipData.logistic_type          || '',
     provincia:             shipData.provincia              || '',
     ciudad:                shipData.ciudad                 || '',
-    logistic_center_id:    shipData.logistic_center_id     || '',
+    logistic_center_id:    centroLogistico,
     deposito_flex_baires:  esFlexBaires,
     fb_cbm_m3:             fbCostos.fb_cbm_m3,
     fb_costo_cbm:          fbCostos.fb_costo_cbm,
