@@ -508,6 +508,7 @@ Acciones disponibles:
 
 Reglas:
 - Los SKU de Pontec son codigos tipo OFI210-BL o AIR010-NE: letras+numeros y a veces sufijo de color (NE=negro, BL=blanco, AZ=azul, RO=rojo, GR=gris, VE=verde, MA=marron, CO=cobre). Si el usuario dice "la silla ofi 210 blanca", el SKU es OFI210-BL.
+- SKU MASTER/FAMILIA: si el usuario da un SKU SIN sufijo de color (ej: "STL150", "sacale el descuento al OFI210"), NO le pidas los colores: pasa el SKU tal cual (ej: "STL150") y el sistema lo expande solo a todas las variantes de la familia (STL150-BL, STL150-NE, etc.). Solo agrega el sufijo si el usuario nombro un color especifico.
 - MUY IMPORTANTE: tambien existen SKUs de COMBOS que llevan ESPACIOS adentro, con formato "COMBO 2X BAN002-BL", "COMBO 3X BAN005-NE", "COMBO 4X BAN002-BL", etc. Cada uno de esos es UN SOLO SKU completo: NUNCA lo partas, nunca le saques el "COMBO NX", y usalo entero (con espacios) en el parametro "sku". Si el usuario pega una lista de SKUs (uno por renglon o separados por comas), cada renglon/entrada es un SKU completo. Si en un texto corrido aparece "COMBO", el SKU abarca desde "COMBO" hasta el codigo con sufijo de color inclusive (ej: en "COMBO 2X BAN002-BL COMBO 2X BAN002-NE" hay DOS skus: "COMBO 2X BAN002-BL" y "COMBO 2X BAN002-NE").
 - Si el usuario dice un porcentaje de descuento, mandalo como "porcentaje"; NO le pidas el precio final.\n- Para clonar_fotos hace falta saber DE QUE publicacion copiar (un codigo MLA...). Si el usuario no lo dijo, pedilo con "charla".
 - El descuento individual dura maximo 14 dias (limite de ML); si piden mas, avisalo en "respuesta" y usa dias=14.
@@ -538,6 +539,7 @@ async function asistenteResolverItems(p, userId, token) {
   if (p.item_id) return [String(p.item_id).toUpperCase().trim()];
   const sku = String(p.sku || '').toUpperCase().trim();
   if (!sku) return [];
+  // 1) Busqueda exacta por seller_sku
   for (const param of ['seller_sku', 'sku']) {
     try {
       const r = await fetch(`https://api.mercadolibre.com/users/${userId}/items/search?${param}=${encodeURIComponent(sku)}&status=active`, {
@@ -547,6 +549,60 @@ async function asistenteResolverItems(p, userId, token) {
       if (Array.isArray(d.results) && d.results.length) return d.results.slice(0, 20);
     } catch (e) {}
   }
+  // 2) SKU MASTER/FAMILIA: si no hubo coincidencia exacta, expandir a toda la familia.
+  //    Ej: "STL150" → STL150-BL, STL150-NE, STL150-RO... (todas las publicaciones
+  //    activas cuyo seller_sku empiece con "STL150-" o sea exactamente "STL150").
+  //    Asi se puede decir "sacale el descuento al STL150" sin tipear cada color.
+  try {
+    const familia = new Set();
+    let offset = 0;
+    while (offset < 1000) { // recorre el catalogo activo (paginado de a 100)
+      const r = await fetch(`https://api.mercadolibre.com/users/${userId}/items/search?status=active&limit=100&offset=${offset}`, {
+        headers: { Authorization: 'Bearer ' + token }
+      });
+      const d = await r.json();
+      const ids = Array.isArray(d.results) ? d.results : [];
+      if (!ids.length) break;
+      // Traer los seller_sku de este lote (multiget de a 20)
+      for (let i = 0; i < ids.length; i += 20) {
+        const lote = ids.slice(i, i + 20);
+        const rm = await fetch(`https://api.mercadolibre.com/items?ids=${lote.join(',')}&attributes=id,seller_custom_field,attributes,variations`, {
+          headers: { Authorization: 'Bearer ' + token }
+        });
+        const dm = await rm.json();
+        for (const it of (Array.isArray(dm) ? dm : [])) {
+          const b = it.body || {};
+          // seller_sku puede venir en seller_custom_field, en attributes (SELLER_SKU) o en las variantes
+          const skus = [];
+          if (b.seller_custom_field) skus.push(String(b.seller_custom_field));
+          if (Array.isArray(b.attributes)) {
+            const a = b.attributes.find(x => x.id === 'SELLER_SKU');
+            if (a && a.value_name) skus.push(String(a.value_name));
+          }
+          if (Array.isArray(b.variations)) {
+            for (const v of b.variations) {
+              if (Array.isArray(v.attributes)) {
+                const av = v.attributes.find(x => x.id === 'SELLER_SKU');
+                if (av && av.value_name) skus.push(String(av.value_name));
+              }
+            }
+          }
+          const esFam = skus.some(s => {
+            const su = s.toUpperCase().trim();
+            return su === sku || su.startsWith(sku + '-') || su.startsWith(sku + ' ');
+          });
+          if (esFam && b.id) familia.add(String(b.id).toUpperCase());
+        }
+      }
+      offset += 100;
+      const total = (d.paging && d.paging.total) || 0;
+      if (offset >= total) break;
+    }
+    if (familia.size) {
+      console.log(`[ASIS-FAMILIA] "${sku}" expandio a ${familia.size} publicacion(es)`);
+      return Array.from(familia).slice(0, 20);
+    }
+  } catch (e) { console.error('[ASIS-FAMILIA] error:', e.message); }
   return [];
 }
 
