@@ -3319,13 +3319,14 @@ app.get('/api/ads/items', async (req, res) => {
     const token = await getValidToken(user_id);
     if (!token) return res.status(400).json({ error: 'Sin token ML para ese user_id' });
 
+    // API NUEVA de Product Ads (ML desactivó la vieja el 27-may-2026, daba 404).
+    // Modelo: campañas → ad groups → anuncios. Las métricas por anuncio (item_id +
+    // cost) viven en /advertising/MLA/product_ads/ad_groups/{id}/ads.
     const a = 10904; // advertiser PONTEC SA
-    const M = 'cost,acos,units_quantity,total_amount,organic_units_quantity';
-    const base = `https://api.mercadolibre.com/advertising/advertisers/${a}/product_ads/items?date_from=${desde}&date_to=${hasta}&metrics=${M}`;
-    const headers = { Authorization: `Bearer ${token}`, 'Api-Version': '2' };
+    const SITE = 'MLA';
+    const M = 'cost,acos,units_quantity,total_amount';
+    const headers = { Authorization: `Bearer ${token}`, 'api-version': '2' };
 
-    // La API de Ads de ML es inestable: a veces devuelve respuestas vacias o
-    // cortadas. Reintentamos hasta 3 veces con espera antes de rendirnos.
     const fetchAds = async (url) => {
       let ultimo = null;
       for (let intento = 1; intento <= 3; intento++) {
@@ -3342,47 +3343,76 @@ app.get('/api/ads/items', async (req, res) => {
       }
       return { error: ultimo };
     };
+    // Pagina un listado /search completo y devuelve todos los results
+    const paginar = async (baseUrl, porPagina) => {
+      const first = await fetchAds(`${baseUrl}&limit=${porPagina}&offset=0`);
+      if (first.error || first.status !== 200) return { error: first.error || first.json, status: first.status };
+      const total = (first.json.paging && first.json.paging.total) || 0;
+      let resultados = (first.json.results || []).slice();
+      const offsets = [];
+      for (let o = porPagina; o < total; o += porPagina) offsets.push(o);
+      let caidas = 0;
+      const LOTE = 5;
+      for (let i = 0; i < offsets.length; i += LOTE) {
+        const batch = offsets.slice(i, i + LOTE).map(o =>
+          fetchAds(`${baseUrl}&limit=${porPagina}&offset=${o}`).then(r => {
+            if (r.error || r.status !== 200) { caidas++; return []; }
+            return r.json.results || [];
+          })
+        );
+        const rs2 = await Promise.all(batch);
+        rs2.forEach(arr => { resultados = resultados.concat(arr); });
+      }
+      return { resultados, total, caidas };
+    };
 
     const map = {};
     let gastoTotal = 0;
     const acc = (arr) => {
       for (const it of arr || []) {
         const c = (it.metrics && it.metrics.cost) || 0;
-        if (c > 0) {
-          map[it.item_id] = { cost: c, acos: it.metrics.acos || 0, units: it.metrics.units_quantity || 0 };
+        if (c > 0 && it.item_id) {
+          map[it.item_id] = { cost: c, acos: (it.metrics.acos || 0), units: (it.metrics.units_quantity || 0) };
           gastoTotal += c;
         }
       }
     };
-
-    // primera página: saber el total
-    const first = await fetchAds(`${base}&limit=50&offset=0`);
-    if (first.error) return res.status(502).json({ error: 'Error API ads (ML no responde bien)', detalle: first.error });
-    if (first.status !== 200) return res.status(first.status).json({ error: 'Error API ads', detalle: first.json });
-    const fj = first.json;
-    const total = (fj.paging && fj.paging.total) || 0;
-    acc(fj.results);
-
-    // resto en lotes concurrentes (rápido); cada pagina con sus reintentos
-    const offsets = [];
-    for (let o = 50; o < total; o += 50) offsets.push(o);
-    const LOTE = 6;
+    const rango = `date_from=${desde}&date_to=${hasta}`;
     let paginasCaidas = 0;
-    for (let i = 0; i < offsets.length; i += LOTE) {
-      const batch = offsets.slice(i, i + LOTE).map(o =>
-        fetchAds(`${base}&limit=50&offset=${o}`).then(r => {
-          if (r.error || r.status !== 200) { paginasCaidas++; return {}; }
-          return r.json;
-        })
-      );
-      const results = await Promise.all(batch);
-      results.forEach(j => acc(j.results));
+    let via = '';
+
+    // Plan A: listado global de anuncios del advertiser (una sola paginación)
+    const planA = await paginar(`https://api.mercadolibre.com/marketplace/advertising/${SITE}/advertisers/${a}/product_ads/ads/search?${rango}&metrics=${M}`, 50);
+    if (!planA.error && Array.isArray(planA.resultados) && planA.resultados.length) {
+      acc(planA.resultados);
+      paginasCaidas = planA.caidas || 0;
+      via = 'ads_search';
+    } else {
+      // Plan B: ad groups del advertiser (con métricas) → anuncios SOLO de los
+      // grupos con gasto (minimiza llamadas: los grupos sin cost no gastan).
+      via = 'ad_groups';
+      const grupos = await paginar(`https://api.mercadolibre.com/marketplace/advertising/${SITE}/advertisers/${a}/product_ads/ad_groups/search?${rango}&metrics=cost`, 50);
+      if (grupos.error) return res.status(502).json({ error: 'Error API ads (ad_groups)', detalle: grupos.error });
+      paginasCaidas += grupos.caidas || 0;
+      const conGasto = (grupos.resultados || []).filter(g => g && g.id && g.metrics && Number(g.metrics.cost) > 0);
+      const LOTE_G = 5;
+      for (let i = 0; i < conGasto.length; i += LOTE_G) {
+        const batch = conGasto.slice(i, i + LOTE_G).map(async (g) => {
+          const r = await paginar(`https://api.mercadolibre.com/advertising/${SITE}/product_ads/ad_groups/${g.id}/ads?${rango}&metrics=${M}`, 50);
+          if (r.error) { paginasCaidas++; return []; }
+          paginasCaidas += r.caidas || 0;
+          return r.resultados || [];
+        });
+        const rs3 = await Promise.all(batch);
+        rs3.forEach(arr => acc(arr));
+      }
     }
 
     const data = {
       advertiser_id: a,
+      via,
       rango: `${desde} a ${hasta}`,
-      total_items: total,
+      total_items: Object.keys(map).length,
       anuncios_con_gasto: Object.keys(map).length,
       gasto_total: Math.round(gastoTotal),
       paginas_caidas: paginasCaidas,
