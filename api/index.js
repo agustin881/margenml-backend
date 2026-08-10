@@ -1445,6 +1445,10 @@ async function getShipData(shipmentId, token) {
       provincia:             (rcv.state && rcv.state.name) || '',
       ciudad:                (rcv.city  && rcv.city.name)  || '',
       logistic_center_id:     logisticCenterId,
+      // Si ML partio la orden en varios paquetes (splitted_order), el shipment
+      // apunta a su hermano: lo usamos para agrupar el envio total del pack.
+      sibling_ship_id: (ship.sibling && ship.sibling.source === 'split' && ship.sibling.sibling_id)
+        ? String(ship.sibling.sibling_id) : '',
     };
   } catch(e) {
     return {};
@@ -1570,12 +1574,18 @@ const _packCache = new Map(); // pack_id → { t, ordenes:[{orderId,sku,unitPric
 
 async function _ordenesDelPack(packId, token) {
   const c = _packCache.get(String(packId));
-  if (c && Date.now() - c.t < 10 * 60 * 1000) return c.ordenes;
+  if (c && Date.now() - c.t < 10 * 60 * 1000) return c;
   const H = { headers: { Authorization: `Bearer ${token}` } };
   const rp = await fetch(`https://api.mercadolibre.com/packs/${packId}`, H);
   const pack = await rp.json();
   if (!pack || !Array.isArray(pack.orders) || pack.orders.length < 2) return null;
   const ordenes = [];
+  // Un pack puede tener: (a) varias ordenes compartiendo UN envio, o (b) ordenes
+  // PARTIDAS por ML en varios paquetes, cada una con SU envio (tag splitted_order).
+  // Sumamos el costo de TODOS los envios distintos del pack (deduplicando por
+  // shipment_id) para obtener el envio real total a repartir.
+  const shipsVistos = new Set();
+  let envioTotal = 0, ingresoTotal = 0;
   for (const o of pack.orders) {
     const ro = await fetch(`https://api.mercadolibre.com/orders/${o.id}`, H);
     const ord = await ro.json();
@@ -1587,18 +1597,97 @@ async function _ordenesDelPack(packId, token) {
       unitPrice: Number(it.unit_price) || 0,
       qty: Number(it.quantity) || 1
     });
+    const shipId = ord.shipping && ord.shipping.id;
+    if (shipId && !shipsVistos.has(String(shipId))) {
+      shipsVistos.add(String(shipId));
+      try {
+        const sd = await getShipData(shipId, token);
+        envioTotal += Number(sd.costo_envio) || 0;
+        ingresoTotal += Number(sd.precio_comprador_envio) || 0;
+      } catch (e) {}
+    }
   }
   if (ordenes.length < 2) return null;
-  _packCache.set(String(packId), { t: Date.now(), ordenes });
-  return ordenes;
+  const out = { t: Date.now(), ordenes, envioTotal, ingresoTotal };
+  _packCache.set(String(packId), out);
+  return out;
 }
 
-async function repartirEnvioPack(order, envioRealTotal, ingresoTotal, token) {
+// Cuando ML PARTE una orden en varios paquetes (tag splitted_order), cada mitad
+// recibe un pack_id DISTINTO (ej: ...837 y ...839), asi que /packs/{id} devuelve
+// una sola orden y no sirve para agrupar. En ese caso seguimos la cadena de
+// hermanos (shipment.sibling.sibling_id) para reconstruir el grupo real.
+async function _grupoPorSiblings(order, siblingShipId, token) {
+  const clave = 'sib:' + String(order.id);
+  const c = _packCache.get(clave);
+  if (c && Date.now() - c.t < 10 * 60 * 1000) return c;
+  const H = { headers: { Authorization: `Bearer ${token}` } };
+  const it0 = (order.order_items && order.order_items[0]) || {};
+  const ordenes = [{
+    orderId: String(order.id),
+    sku: String((it0.item && (it0.item.seller_sku || it0.item.seller_custom_field)) || '').trim().toUpperCase(),
+    unitPrice: Number(it0.unit_price) || 0,
+    qty: Number(it0.quantity) || 1
+  }];
+  const shipsVistos = new Set();
+  let envioTotal = 0, ingresoTotal = 0;
+  const miShip = order.shipping && order.shipping.id;
+  if (miShip) {
+    shipsVistos.add(String(miShip));
+    try {
+      const sd = await getShipData(miShip, token);
+      envioTotal += Number(sd.costo_envio) || 0;
+      ingresoTotal += Number(sd.precio_comprador_envio) || 0;
+    } catch (e) {}
+  }
+  // Seguir la cadena de hermanos (tope 4 saltos, con guardia anti-ciclos)
+  let siguiente = String(siblingShipId || '');
+  let saltos = 0;
+  while (siguiente && saltos < 4 && !shipsVistos.has(siguiente)) {
+    shipsVistos.add(siguiente);
+    saltos++;
+    try {
+      const rs = await fetch(`https://api.mercadolibre.com/shipments/${siguiente}`, H);
+      const sh = await rs.json();
+      if (!sh || sh.error) break;
+      const sd2 = await getShipData(siguiente, token);
+      envioTotal += Number(sd2.costo_envio) || 0;
+      ingresoTotal += Number(sd2.precio_comprador_envio) || 0;
+      if (sh.order_id) {
+        const ro = await fetch(`https://api.mercadolibre.com/orders/${sh.order_id}`, H);
+        const ord = await ro.json();
+        if (ord && !ord.error) {
+          const it = (ord.order_items && ord.order_items[0]) || {};
+          ordenes.push({
+            orderId: String(ord.id),
+            sku: String((it.item && (it.item.seller_sku || it.item.seller_custom_field)) || '').trim().toUpperCase(),
+            unitPrice: Number(it.unit_price) || 0,
+            qty: Number(it.quantity) || 1
+          });
+        }
+      }
+      siguiente = (sh.sibling && sh.sibling.source === 'split' && sh.sibling.sibling_id) ? String(sh.sibling.sibling_id) : '';
+    } catch (e) { break; }
+  }
+  if (ordenes.length < 2) return null;
+  const out = { t: Date.now(), ordenes, envioTotal, ingresoTotal };
+  _packCache.set(clave, out);
+  console.log(`[PACK-SPLIT] orden=${order.id} agrupo ${ordenes.length} ordenes via siblings, envio total=${envioTotal}`);
+  return out;
+}
+
+async function repartirEnvioPack(order, envioRealFallback, ingresoFallback, token, siblingShipId) {
   try {
-    if (!order.pack_id) return null;
-    if (!(envioRealTotal > 0) && !(ingresoTotal > 0)) return null; // nada que repartir
-    const ordenes = await _ordenesDelPack(order.pack_id, token);
-    if (!ordenes) return null; // pack de 1 sola orden o error → sin cambios
+    let info = null;
+    if (order.pack_id) info = await _ordenesDelPack(order.pack_id, token);
+    if (!info && siblingShipId) info = await _grupoPorSiblings(order, siblingShipId, token);
+    if (!info) return null; // sin grupo real → sin cambios
+    const ordenes = info.ordenes;
+    // Total real del pack: suma de todos sus envios (deduplicados). Si por algun
+    // motivo no se pudo sumar, caemos al costo de esta orden (comportamiento previo).
+    const envioRealTotal = info.envioTotal > 0 ? info.envioTotal : (envioRealFallback || 0);
+    const ingresoTotal = info.ingresoTotal > 0 ? info.ingresoTotal : (ingresoFallback || 0);
+    if (!(envioRealTotal > 0) && !(ingresoTotal > 0)) return null;
 
     // Umbral vigente a la fecha de la venta (fb_config_umbral, fallback $33.000)
     let umbral = 33000;
@@ -1683,11 +1772,12 @@ async function buildVentaRow(order, userId, token, incluirEnvio = true) {
     ? await getShipData(order.shipping.id, token)
     : {};
 
-  // Pack (carrito): varias órdenes comparten UN envío → repartirlo para no contarlo doble
+  // Pack (carrito) u orden PARTIDA por ML en varios paquetes: repartir el envio
+  // total del grupo para no cargarlo doble ni todo en una sola linea
   let envioCosto   = shipData.costo_envio           || 0;
   let envioIngreso = shipData.precio_comprador_envio || 0;
-  if (incluirEnvio && order.pack_id) {
-    const rep = await repartirEnvioPack(order, envioCosto, envioIngreso, token);
+  if (incluirEnvio && (order.pack_id || shipData.sibling_ship_id)) {
+    const rep = await repartirEnvioPack(order, envioCosto, envioIngreso, token, shipData.sibling_ship_id);
     if (rep) { envioCosto = rep.costo; envioIngreso = rep.ingreso; }
   }
 
