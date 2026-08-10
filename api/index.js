@@ -511,7 +511,7 @@ Reglas:
 - SKU MASTER/FAMILIA: si el usuario da un SKU SIN sufijo de color (ej: "STL150", "sacale el descuento al BAN005"), NO le pidas los colores: pasa el SKU tal cual (ej: "BAN005") y el sistema lo expande solo a TODA la familia: todas las variantes de color (BAN005-BL, BAN005-NE, etc.) Y TAMBIEN los combos que contienen ese codigo (COMBO 2X BAN005-BL, COMBO 3X BAN005-NE, etc.). Solo agrega el sufijo si el usuario nombro un color especifico.
 - MUY IMPORTANTE: tambien existen SKUs de COMBOS que llevan ESPACIOS adentro, con formato "COMBO 2X BAN002-BL", "COMBO 3X BAN005-NE", "COMBO 4X BAN002-BL", etc. Cada uno de esos es UN SOLO SKU completo: NUNCA lo partas, nunca le saques el "COMBO NX", y usalo entero (con espacios) en el parametro "sku". Si el usuario pega una lista de SKUs (uno por renglon o separados por comas), cada renglon/entrada es un SKU completo. Si en un texto corrido aparece "COMBO", el SKU abarca desde "COMBO" hasta el codigo con sufijo de color inclusive (ej: en "COMBO 2X BAN002-BL COMBO 2X BAN002-NE" hay DOS skus: "COMBO 2X BAN002-BL" y "COMBO 2X BAN002-NE").
 - Si el usuario dice un porcentaje de descuento, mandalo como "porcentaje"; NO le pidas el precio final.\n- Para clonar_fotos hace falta saber DE QUE publicacion copiar (un codigo MLA...). Si el usuario no lo dijo, pedilo con "charla".
-- El descuento individual dura maximo 14 dias (limite de ML); si piden mas, avisalo en "respuesta" y usa dias=14.
+- Duracion del descuento: por defecto 30 dias (no hace falta que el usuario lo diga). Si el usuario pide otra duracion (ej: "por 7 dias", "por 2 meses"), pasa ese valor en "dias" (hasta 365). Si ML no aceptara la duracion, el sistema reintenta solo con 14 dias y lo avisa en el resultado.
 - Si para aplicar_descuento no hay ni precio ni porcentaje, usa "charla" y pedi uno de los dos.
 - Nunca inventes precios ni SKUs que el usuario no dijo.
 - "respuesta" siempre en espanol rioplatense informal y corta.`;
@@ -773,7 +773,7 @@ async function asistenteEjecutar(acc, userId, token) {
         }
       } else if (acc.accion === 'aplicar_descuento') {
         const precioFinal = (acc.precios && acc.precios[id] != null) ? Number(acc.precios[id]) : Number(p.precio);
-        const diasE = Math.min(Math.max(parseInt(p.dias) || 14, 1), 14);
+        const diasE = Math.min(Math.max(parseInt(p.dias) || 30, 1), 365);
         const body = { deal_price: precioFinal, promotion_type: 'PRICE_DISCOUNT',
           start_date: fechaLocalAR(0), finish_date: fechaLocalAR(diasE - 1) };
         const url = `https://api.mercadolibre.com/seller-promotions/items/${id}?app_version=v2`;
@@ -784,8 +784,21 @@ async function asistenteEjecutar(acc, userId, token) {
           r = await fetch(url, { method: 'PUT', headers: hdr, body: JSON.stringify(body) });
           try { d1 = await r.json(); } catch (e6) { d1 = {}; }
         }
+        // Fallback: si ML rechazo una duracion larga, reintentar con 14 dias y avisar
+        let notaDias = '';
+        if (!r.ok && diasE > 14) {
+          const body14 = { deal_price: precioFinal, promotion_type: 'PRICE_DISCOUNT',
+            start_date: fechaLocalAR(0), finish_date: fechaLocalAR(13) };
+          r = await fetch(url, { method: 'POST', headers: hdr, body: JSON.stringify(body14) });
+          try { d1 = await r.json(); } catch (e7) { d1 = {}; }
+          if (!r.ok) {
+            r = await fetch(url, { method: 'PUT', headers: hdr, body: JSON.stringify(body14) });
+            try { d1 = await r.json(); } catch (e8) { d1 = {}; }
+          }
+          if (r.ok) notaDias = ' (ML no acepto ' + diasE + ' dias; quedo por 14)';
+        }
         lineas.push((r.ok ? 'OK - ' : 'ERROR - ') + t + (r.ok
-          ? ' -> $' + Math.round(precioFinal).toLocaleString()
+          ? ' -> $' + Math.round(precioFinal).toLocaleString() + notaDias
           : ' (' + mlErrDetalle(d1) + ')'));
       } else if (acc.accion === 'medidas') {
         const md = acc.medidas || {};
@@ -1140,7 +1153,7 @@ app.post('/api/asistente', requireAuth, soloRoles('admin', 'encargado', 'operado
         const sp = s.parametros || {};
         const spct = Number(sp.porcentaje);
         const sTienePct = spct > 0 && spct < 95;
-        const sDias = Math.min(Math.max(parseInt(sp.dias) || 14, 1), 14);
+        const sDias = Math.min(Math.max(parseInt(sp.dias) || 30, 1), 365);
         if (s.accion === 'aplicar_descuento' && !(Number(sp.precio) > 0) && !sTienePct) {
           return res.json({ respuesta: 'Me falta el precio o el porcentaje para "' + (sp.sku || sp.item_id || '?') + '". Pasamelo y armo el plan completo.' });
         }
@@ -1172,7 +1185,7 @@ app.post('/api/asistente', requireAuth, soloRoles('admin', 'encargado', 'operado
     if (j.accion === 'quitar_descuento' || j.accion === 'aplicar_descuento') {
       const pct = Number(p.porcentaje);
       const tienePct = pct > 0 && pct < 95;
-      const diasP = Math.min(Math.max(parseInt(p.dias) || 14, 1), 14);
+      const diasP = Math.min(Math.max(parseInt(p.dias) || 30, 1), 365);
       if (j.accion === 'aplicar_descuento' && !(Number(p.precio) > 0) && !tienePct) {
         return res.json({ respuesta: j.respuesta || 'Decime el precio final o el porcentaje de descuento.' });
       }
