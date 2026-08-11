@@ -1590,6 +1590,7 @@ async function _ordenesDelPack(packId, token) {
     const ro = await fetch(`https://api.mercadolibre.com/orders/${o.id}`, H);
     const ord = await ro.json();
     if (!ord || ord.error) continue;
+    if (ord.status === 'cancelled') continue; // canceladas: ni unidades ni envio
     const it = (ord.order_items && ord.order_items[0]) || {};
     ordenes.push({
       orderId: String(ord.id),
@@ -1640,7 +1641,10 @@ async function _grupoPorSiblings(order, siblingShipId, token) {
       ingresoTotal += Number(sd.precio_comprador_envio) || 0;
     } catch (e) {}
   }
-  // Seguir la cadena de hermanos (tope 4 saltos, con guardia anti-ciclos)
+  // Seguir la cadena de hermanos (tope 4 saltos, con guardia anti-ciclos).
+  // Las ordenes CANCELADAS (ej: la orden madre que ML cancela al partir la compra)
+  // no participan del grupo: ni sus unidades ni su envio. Pero la cadena las
+  // atraviesa para llegar al siguiente hermano real.
   let siguiente = String(siblingShipId || '');
   let saltos = 0;
   while (siguiente && saltos < 4 && !shipsVistos.has(siguiente)) {
@@ -1650,21 +1654,27 @@ async function _grupoPorSiblings(order, siblingShipId, token) {
       const rs = await fetch(`https://api.mercadolibre.com/shipments/${siguiente}`, H);
       const sh = await rs.json();
       if (!sh || sh.error) break;
-      const sd2 = await getShipData(siguiente, token);
-      envioTotal += Number(sd2.costo_envio) || 0;
-      ingresoTotal += Number(sd2.precio_comprador_envio) || 0;
+      let ordCancelada = false;
       if (sh.order_id) {
         const ro = await fetch(`https://api.mercadolibre.com/orders/${sh.order_id}`, H);
         const ord = await ro.json();
         if (ord && !ord.error) {
-          const it = (ord.order_items && ord.order_items[0]) || {};
-          ordenes.push({
-            orderId: String(ord.id),
-            sku: String((it.item && (it.item.seller_sku || it.item.seller_custom_field)) || '').trim().toUpperCase(),
-            unitPrice: Number(it.unit_price) || 0,
-            qty: Number(it.quantity) || 1
-          });
+          ordCancelada = (ord.status === 'cancelled');
+          if (!ordCancelada) {
+            const it = (ord.order_items && ord.order_items[0]) || {};
+            ordenes.push({
+              orderId: String(ord.id),
+              sku: String((it.item && (it.item.seller_sku || it.item.seller_custom_field)) || '').trim().toUpperCase(),
+              unitPrice: Number(it.unit_price) || 0,
+              qty: Number(it.quantity) || 1
+            });
+          }
         }
+      }
+      if (!ordCancelada) {
+        const sd2 = await getShipData(siguiente, token);
+        envioTotal += Number(sd2.costo_envio) || 0;
+        ingresoTotal += Number(sd2.precio_comprador_envio) || 0;
       }
       siguiente = (sh.sibling && sh.sibling.source === 'split' && sh.sibling.sibling_id) ? String(sh.sibling.sibling_id) : '';
     } catch (e) { break; }
@@ -1776,7 +1786,7 @@ async function buildVentaRow(order, userId, token, incluirEnvio = true) {
   // total del grupo para no cargarlo doble ni todo en una sola linea
   let envioCosto   = shipData.costo_envio           || 0;
   let envioIngreso = shipData.precio_comprador_envio || 0;
-  if (incluirEnvio && (order.pack_id || shipData.sibling_ship_id)) {
+  if (incluirEnvio && order.status !== 'cancelled' && (order.pack_id || shipData.sibling_ship_id)) {
     const rep = await repartirEnvioPack(order, envioCosto, envioIngreso, token, shipData.sibling_ship_id);
     if (rep) { envioCosto = rep.costo; envioIngreso = rep.ingreso; }
   }
