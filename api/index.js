@@ -1,5204 +1,3893 @@
-// =====================================================================
-// RespondIA - Backend v2 (Node + Express) -> Railway
-// Multi-cuenta + Config avanzada:
-//  - Interruptor de respuestas automaticas (OFF = modo sombra)
-//  - Saludo inicial/final configurables
-//  - Zona horaria + franjas horarias con demora de respuesta
-//  - Limite anti-pelea (max respuestas seguidas al mismo comprador)
-//  - Hilo por comprador (contexto de consultas previas del mismo cliente)
-//  - Worker de envio programado (solo actua con auto ON y confianza alta)
-// Archivo en GitHub: index.js
-// =====================================================================
-
-const express = require('express');
+const express    = require('express');
+const cors       = require('cors');
+const fetch      = require('node-fetch');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
+app.use(cors({ origin: '*' }));
+app.use(express.json({ limit: '50mb' }));
 
-// CORS: permite que el panel (Vercel) llame a este backend (Railway)
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, x-clave, x-token');
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
-  next();
-});
+// Marcador de version (para verificar que Railway tiene el codigo nuevo)
+app.get('/api/version', (req, res) => res.json({ version: 'v35-pack-envio', costo_congelado: true, pack_envio: true }));
 
-// 45mb porque los manuales viajan en base64 dentro del JSON: un archivo de
-// 25MB (el maximo que acepta la mensajeria de ML) ocupa ~34mb codificado.
-app.use(express.json({ limit: '45mb' }));
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY
+);
 
-// ---------------------------------------------------------------------
-// CONFIG (variables de entorno en Railway)
-// ---------------------------------------------------------------------
-const SUPABASE_URL      = process.env.SUPABASE_URL;
-const SUPABASE_KEY      = process.env.SUPABASE_SERVICE_KEY;
-const ML_CLIENT_ID      = process.env.ML_CLIENT_ID;
-const ML_CLIENT_SECRET  = process.env.ML_CLIENT_SECRET;
-const ML_REDIRECT_URI   = process.env.ML_REDIRECT_URI;
-const ML_USER_ID        = process.env.ML_USER_ID;
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const OPENAI_API_KEY    = process.env.OPENAI_API_KEY;
-const GEMINI_API_KEY    = process.env.GEMINI_API_KEY;
-const MODELO_IA         = process.env.MODELO_IA || 'claude-sonnet-4-6';   // Claude (por defecto)
-const MODELO_GPT        = process.env.MODELO_GPT || 'gpt-5.4';            // rival GPT del Duelo
-const MODELO_GEMINI     = process.env.MODELO_GEMINI || 'gemini-3.5-flash';// rival Gemini del Duelo
-const CLAVE_PANEL       = process.env.CLAVE_PANEL || 'pontec';
-
-// ---------------------------------------------------------------------
-// PRECIOS DE LAS IA (USD por 1.000.000 de tokens)
-//  in         = entrada normal (sin cache)
-//  cacheWrite = escribir en cache (Claude cobra 1,25x la entrada)
-//  cacheRead  = leer de cache (mucho mas barato)
-//  out        = salida
-// Editables aca si cambian las tarifas. Sirven para el Duelo y el costo real.
-// ---------------------------------------------------------------------
-const PRECIOS = {
-  'claude-sonnet-4-6': { in: 3,   cacheWrite: 3.75, cacheRead: 0.30, out: 15 },
-  'claude-sonnet-5':   { in: 3,   cacheWrite: 3.75, cacheRead: 0.30, out: 15 },
-  'gpt-5.4':           { in: 2.5, cacheWrite: 2.5,  cacheRead: 0.25, out: 15 },
-  'gpt-5.5':           { in: 5,   cacheWrite: 5,    cacheRead: 0.50, out: 30 },
-  'gemini-3.5-flash':  { in: 1.5, cacheWrite: 1.5,  cacheRead: 0.15, out: 9 },
-  'gemini-3.1-flash-lite': { in: 0.25, cacheWrite: 0.25, cacheRead: 0.025, out: 1.5 }
-};
-// u = { in, cacheWrite, cacheRead, out } (tokens). Devuelve USD reales de esa llamada.
-function costoUSD(modelo, u) {
-  const p = PRECIOS[modelo] || {};
-  return (
-    (u.in || 0)         * (p.in || 0) +
-    (u.cacheWrite || 0) * (p.cacheWrite || p.in || 0) +
-    (u.cacheRead || 0)  * (p.cacheRead || 0) +
-    (u.out || 0)        * (p.out || 0)
-  ) / 1e6;
-}
-// clave de cuenta ('claude' | 'gpt' | 'gemini') -> string real del modelo
-function modeloDe(clave) {
-  if (clave === 'gpt') return MODELO_GPT;
-  if (clave === 'gemini') return MODELO_GEMINI;
-  return MODELO_IA;
-}
-
-const db = createClient(SUPABASE_URL, SUPABASE_KEY);
-
-let backfill = { corriendo: false, procesadas: 0, total: 0, desde: null, error: null, cuenta: null };
-
-// =====================================================================
-// CONFIG POR CUENTA (valores por defecto + merge con lo guardado)
-// =====================================================================
-const CONFIG_DEFAULT = {
-  auto_responder: false,               // OFF = modo sombra (no envia nada)
-  saludo_inicial: 'Hola!',
-  saludo_final: '',
-  timezone: 'America/Argentina/Buenos_Aires',
-  demora_default_min: 5,               // demora si no hay franja que aplique
-  fuera_de_franja: 'esperar',          // 'esperar' (manda al abrir la proxima franja) | 'revision' (queda para humano)
-  franjas: [],                         // [{desde:'09:00', hasta:'20:00', demora_min:5}]
-  max_respuestas_seguidas: 2,          // limite anti-pelea por comprador+producto
-  ventana_hilo_dias: 7,                // dias hacia atras para armar el hilo del comprador
-  msg_sin_dato: '',                    // plantilla de respuesta cuando falta un dato del producto
-  auto_sin_dato: false,                // true = enviar esa plantilla automaticamente (con franjas); false = queda a revision
-  confianza_minima: 'alta',            // precision minima para auto-enviar: 'alta' (recomendado) | 'media'
-  ia_responde: 'claude'                // que IA responde esta cuenta: 'claude' | 'gpt' (lo elige el master / el cliente)
-};
-
-function configDe(cuenta) {
-  return Object.assign({}, CONFIG_DEFAULT, (cuenta && cuenta.config) || {});
-}
-
-// =====================================================================
-// FRANJAS HORARIAS (todas las cuentas en su propia zona horaria)
-// =====================================================================
-// Hora local "HH:MM" en la zona horaria dada
-function horaLocal(tz, fecha = new Date()) {
+// ── Middleware: exige usuario logueado (token de Supabase) ────────
+// NUEVO v13: ademas del login, carga el ROL del usuario desde mml_roles.
+// Si el email no esta en la tabla, queda como 'operador' (lo mas restrictivo).
+async function requireAuth(req, res, next) {
   try {
-    return new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false }).format(fecha);
-  } catch (e) {
-    return new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false }).format(fecha);
-  }
-}
-
-function aMinutos(hhmm) {
-  const [h, m] = String(hhmm || '0:0').split(':').map(Number);
-  return (h || 0) * 60 + (m || 0);
-}
-
-// Devuelve la franja activa para una hora local, o null.
-// Soporta franjas que cruzan medianoche (ej: 22:00 -> 06:00).
-function franjaActiva(franjas, hhmm) {
-  const t = aMinutos(hhmm);
-  for (const f of (franjas || [])) {
-    const d = aMinutos(f.desde), h = aMinutos(f.hasta);
-    if (d === h) continue;
-    const dentro = d < h ? (t >= d && t < h) : (t >= d || t < h);
-    if (dentro) return f;
-  }
-  return null;
-}
-
-// Minutos que faltan (en la zona tz) hasta que abra la proxima franja.
-// Si no hay franjas, devuelve null.
-function minutosHastaProximaFranja(franjas, tz, fecha = new Date()) {
-  if (!franjas || !franjas.length) return null;
-  const ahora = aMinutos(horaLocal(tz, fecha));
-  let mejor = null;
-  for (const f of franjas) {
-    const d = aMinutos(f.desde);
-    let delta = d - ahora;
-    if (delta <= 0) delta += 24 * 60; // manana
-    if (mejor === null || delta < mejor) mejor = delta;
-  }
-  return mejor;
-}
-
-// Decide cuando enviar una respuesta segun la config de la cuenta.
-// Devuelve { enviar_at: Date | null, motivo: string }
-//  - enviar_at = null significa "queda para revision humana".
-function calcularEnvio(cfg, ahora = new Date()) {
-  const hh = horaLocal(cfg.timezone, ahora);
-  const franja = franjaActiva(cfg.franjas, hh);
-  if (franja) {
-    const demora = Number(franja.demora_min ?? cfg.demora_default_min) || 0;
-    return { enviar_at: new Date(ahora.getTime() + demora * 60000), motivo: `franja ${franja.desde}-${franja.hasta}, demora ${demora}m` };
-  }
-  // fuera de toda franja
-  if (!cfg.franjas || !cfg.franjas.length) {
-    const demora = Number(cfg.demora_default_min) || 0;
-    return { enviar_at: new Date(ahora.getTime() + demora * 60000), motivo: `sin franjas, demora default ${demora}m` };
-  }
-  if (cfg.fuera_de_franja === 'revision') {
-    return { enviar_at: null, motivo: 'fuera de franja -> revision humana' };
-  }
-  const faltan = minutosHastaProximaFranja(cfg.franjas, cfg.timezone, ahora) || 0;
-  return { enviar_at: new Date(ahora.getTime() + faltan * 60000), motivo: `fuera de franja -> espera ${faltan}m hasta proxima franja` };
-}
-
-// =====================================================================
-// USUARIOS Y SESIONES (Etapa 1)
-// - Passwords hasheadas con scrypt (crypto de Node, sin dependencias).
-// - Sesiones por token (30 dias) en pq_sesiones.
-// - RED DE SEGURIDAD: la CLAVE_PANEL sigue funcionando como acceso MASTER,
-//   asi nunca quedas afuera aunque el login fallara.
-// Roles: master (todas las cuentas) | dueno | gerente | operador
-// =====================================================================
-const crypto = require('crypto');
-
-function hashPassword(pass, sal = null) {
-  sal = sal || crypto.randomBytes(16).toString('hex');
-  const hash = crypto.scryptSync(String(pass), sal, 64).toString('hex');
-  return { hash, sal };
-}
-function verificarPassword(pass, hash, sal) {
-  try {
-    const h = crypto.scryptSync(String(pass), sal, 64).toString('hex');
-    return crypto.timingSafeEqual(Buffer.from(h, 'hex'), Buffer.from(hash, 'hex'));
-  } catch (e) { return false; }
-}
-function nuevoToken() { return crypto.randomBytes(32).toString('hex'); }
-
-async function usuarioPorToken(token) {
-  if (!token) return null;
-  try {
-    const trabajo = (async () => {
-      const { data: ses } = await db.from('pq_sesiones').select('usuario_id, expira_at').eq('token', token).single();
-      if (!ses || new Date(ses.expira_at) < new Date()) return null;
-      const { data: u } = await db.from('pq_usuarios').select('id, cuenta_id, email, nombre, rol, permisos, activo').eq('id', ses.usuario_id).single();
-      if (!u || !u.activo) return null;
-      return u;
-    })();
-    const timeout = new Promise(r => setTimeout(() => r(null), 5000));
-    return await Promise.race([trabajo, timeout]);
-  } catch (e) { return null; }
-}
-
-// Middleware de acceso: acepta CLAVE_PANEL (master legado) o token de sesion
-async function soloPanel(req, res, next) {
-  const clave = req.query.clave || req.headers['x-clave'];
-  if (clave && clave === CLAVE_PANEL) {
-    req.usuario = { id: 0, email: 'master', rol: 'master', cuenta_id: null, permisos: {} };
-    return next();
-  }
-  const token = req.query.token || req.headers['x-token'];
-  if (token) {
-    const u = await usuarioPorToken(token);
-    if (u) { req.usuario = u; return next(); }
-  }
-  return res.status(401).json({ error: 'clave invalida' });
-}
-
-// Solo ciertos roles pueden pasar
-function requiereRol(...roles) {
-  return (req, res, next) => {
-    if (!req.usuario || !roles.includes(req.usuario.rol)) {
-      return res.status(403).json({ error: 'no tenes permiso para esto (' + roles.join('/') + ')' });
+    const h = req.headers.authorization || '';
+    const token = h.startsWith('Bearer ') ? h.slice(7) : '';
+    if (!token) return res.status(401).json({ error: 'No autorizado' });
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error || !data || !data.user) return res.status(401).json({ error: 'Sesion invalida' });
+    req.authUser = data.user;
+    try {
+      const email = String(data.user.email || '').toLowerCase().trim();
+      const { data: rolRow } = await supabase.from('mml_roles')
+        .select('rol,pestanas,apps,acciones,pestanas_logistica').eq('email', email).single();
+      req.rol      = (rolRow && rolRow.rol) || 'operador';
+      req.pestanas = (rolRow && rolRow.pestanas) || null;
+      req.apps     = (rolRow && rolRow.apps) || null;
+      req.acciones = (rolRow && rolRow.acciones) || null;
+      req.pestanas_logistica = (rolRow && rolRow.pestanas_logistica) || null;
+    } catch (e) {
+      req.rol = 'operador';
+      req.pestanas = null;
+      req.apps = null;
+      req.acciones = null;
+      req.pestanas_logistica = null;
     }
     next();
-  };
+  } catch (e) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
 }
-// El operador necesita el permiso puntual; master/dueno/gerente pasan siempre
-function requierePermiso(perm) {
+
+// ── Middleware: exige uno de estos roles (usar DESPUES de requireAuth) ──
+// Ejemplo: app.get('/ruta', requireAuth, soloRoles('admin','encargado'), handler)
+function soloRoles(...roles) {
   return (req, res, next) => {
-    const u = req.usuario;
-    if (!u) return res.status(401).json({ error: 'sin sesion' });
-    if (['master', 'dueno', 'gerente'].includes(u.rol)) return next();
-    if (u.permisos && u.permisos[perm]) return next();
-    return res.status(403).json({ error: 'tu usuario no tiene el permiso: ' + perm });
+    if (roles.includes(req.rol)) return next();
+    return res.status(403).json({ error: 'Sin permiso para esta seccion', rol: req.rol });
   };
 }
 
-// Rate limit de login: 5 intentos fallidos por 15 min por IP+email (anti fuerza bruta)
-const _intentosLogin = new Map();
-function loginPermitido(key) {
+// ── Quien soy: el frontend pregunta el rol para armar el menu ──────
+// Sin cache: es un endpoint de permisos, tiene que responder siempre fresco.
+// Si se cachea (304 Not Modified), el hub arma el menu con permisos viejos.
+app.get('/api/mi-rol', requireAuth, (req, res) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  res.set('Surrogate-Control', 'no-store');
+  res.json({ email: req.authUser.email, rol: req.rol, pestanas: req.pestanas, apps: req.apps, acciones: req.acciones, pestanas_logistica: req.pestanas_logistica });
+});
+
+// ══ USUARIOS v14 (solo admin): gestion del equipo desde el panel ══
+// Crea el login en Supabase Auth Y la fila de rol en mml_roles de un saque.
+
+// Listar equipo
+app.get('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('mml_roles')
+      .select('email,rol,pestanas,apps,acciones,pestanas_logistica,user_id,creado').order('creado', { ascending: true });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ usuarios: data || [] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Crear usuario (login + rol)
+app.post('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) => {
+  try {
+    const email    = String((req.body && req.body.email) || '').toLowerCase().trim();
+    const password = String((req.body && req.body.password) || '');
+    const rol      = String((req.body && req.body.rol) || 'operador');
+    if (!email || email.indexOf('@') === -1) return res.status(400).json({ error: 'Email invalido' });
+    if (password.length < 6) return res.status(400).json({ error: 'La contrasena debe tener 6 caracteres o mas' });
+    if (['admin','encargado','operador'].indexOf(rol) === -1) return res.status(400).json({ error: 'Rol invalido' });
+
+    const { data: created, error: eAuth } = await supabase.auth.admin.createUser({
+      email, password, email_confirm: true
+    });
+    let uid = created && created.user && created.user.id;
+    if (eAuth) {
+      const yaExiste = /already|registered|exists/i.test(eAuth.message || '');
+      if (!yaExiste) return res.status(400).json({ error: 'No se pudo crear el login: ' + eAuth.message });
+      // El login ya existia (quedo de antes): lo adoptamos -> buscamos su id,
+      // le pisamos la contrasena con la nueva y le asignamos el rol.
+      try {
+        const { data: lu } = await supabase.auth.admin.listUsers({ page: 1, perPage: 200 });
+        const u = lu && lu.users && lu.users.find(x => String(x.email || '').toLowerCase() === email);
+        uid = u && u.id;
+      } catch (e2) {}
+      if (!uid) return res.status(400).json({ error: 'Ese email ya tiene login pero no pude ubicarlo para asignarle el rol' });
+      const { error: ePw } = await supabase.auth.admin.updateUserById(uid, { password });
+      if (ePw) return res.status(400).json({ error: 'El login ya existia y no pude actualizarle la contrasena: ' + ePw.message });
+    }
+
+    const { error: eRol } = await supabase.from('mml_roles')
+      .upsert({ email, rol, user_id: uid || null }, { onConflict: 'email' });
+    if (eRol) return res.status(500).json({ error: 'Login listo pero fallo el rol: ' + eRol.message });
+
+    res.json({ ok: true, email, rol, adoptado: !!eAuth });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Cambiar rol
+app.put('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) => {
+  try {
+    const email = String((req.body && req.body.email) || '').toLowerCase().trim();
+    const rol   = String((req.body && req.body.rol) || '');
+    if (!email || ['admin','encargado','operador'].indexOf(rol) === -1) return res.status(400).json({ error: 'Datos invalidos' });
+    if (email === String(req.authUser.email || '').toLowerCase() && rol !== 'admin') {
+      return res.status(400).json({ error: 'No podes sacarte el rol admin a vos mismo' });
+    }
+    const upd = { email, rol };
+    // El panel de MargenML solo maneja las pestañas de Rentabilidad. Los campos
+    // del hub (apps, acciones, pestanas_logistica) solo se tocan si vienen
+    // EXPLICITAMENTE en el request; nunca se pisan desde un guardado parcial.
+    // Esto evita que cambiar el rol o las pestañas en MargenML borre los permisos
+    // de Logística/Apps configurados en el hub Pontec OS.
+    if (req.body && ('pestanas' in req.body)) {
+      const p = req.body.pestanas;
+      const permitidas = ['resumen','ventas','graficos','top','alertas','reclamo','promos','config','usuarios'];
+      if (p === null) upd.pestanas = null;
+      else if (Array.isArray(p)) upd.pestanas = p.filter(x => permitidas.indexOf(String(x)) > -1);
+      else return res.status(400).json({ error: 'pestanas debe ser lista o null' });
+    }
+    if (req.body && ('apps' in req.body)) {
+      const a = req.body.apps;
+      const appsOk = ['rentabilidad','logistica','promos','respondia','posventa','asistente'];
+      if (a === null) upd.apps = null;
+      else if (Array.isArray(a)) upd.apps = a.filter(x => appsOk.indexOf(String(x)) > -1);
+      else return res.status(400).json({ error: 'apps debe ser lista o null' });
+    }
+    if (req.body && ('acciones' in req.body)) {
+      const ac = req.body.acciones;
+      const accOk = ['consultar','ventas','desc_poner','desc_sacar','desc_todos','smart','fotos','medidas'];
+      if (ac === null) upd.acciones = null;
+      else if (Array.isArray(ac)) upd.acciones = ac.filter(x => accOk.indexOf(String(x)) > -1);
+      else return res.status(400).json({ error: 'acciones debe ser lista o null' });
+    }
+    if (req.body && ('pestanas_logistica' in req.body)) {
+      const pl = req.body.pestanas_logistica;
+      const plOk = ['imprimir','despachar','seguimiento','full','pagos','config'];
+      if (pl === null) upd.pestanas_logistica = null;
+      else if (Array.isArray(pl)) upd.pestanas_logistica = pl.filter(x => plOk.indexOf(String(x)) > -1);
+      else return res.status(400).json({ error: 'pestanas_logistica debe ser lista o null' });
+    }
+    const { error } = await supabase.from('mml_roles').upsert(upd, { onConflict: 'email' });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ ok: true, email, rol });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Borrar usuario (rol + login)
+app.delete('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) => {
+  try {
+    const email = String(req.query.email || (req.body && req.body.email) || '').toLowerCase().trim();
+    if (!email) return res.status(400).json({ error: 'Falta email' });
+    if (email === String(req.authUser.email || '').toLowerCase()) {
+      return res.status(400).json({ error: 'No podes borrarte a vos mismo' });
+    }
+    const { data: row } = await supabase.from('mml_roles').select('user_id').eq('email', email).single();
+    let uid = row && row.user_id;
+    if (!uid) {
+      try {
+        const { data: lu } = await supabase.auth.admin.listUsers({ page: 1, perPage: 200 });
+        const u = lu && lu.users && lu.users.find(x => String(x.email || '').toLowerCase() === email);
+        uid = u && u.id;
+      } catch (e2) {}
+    }
+    if (uid) { try { await supabase.auth.admin.deleteUser(uid); } catch (e3) {} }
+    await supabase.from('mml_roles').delete().eq('email', email);
+    res.json({ ok: true, email });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Cambiar contraseña de un usuario (solo admin). Las contraseñas actuales
+// NO se pueden ver (Supabase las guarda encriptadas de forma irreversible);
+// esto pone una nueva.
+app.post('/api/usuarios/password', requireAuth, soloRoles('admin'), async (req, res) => {
+  try {
+    const email    = String((req.body && req.body.email) || '').toLowerCase().trim();
+    const password = String((req.body && req.body.password) || '');
+    if (!email) return res.status(400).json({ error: 'Falta email' });
+    if (password.length < 6) return res.status(400).json({ error: 'La contrasena debe tener 6 caracteres o mas' });
+    const { data: row } = await supabase.from('mml_roles').select('user_id').eq('email', email).single();
+    let uid = row && row.user_id;
+    if (!uid) {
+      try {
+        const { data: lu } = await supabase.auth.admin.listUsers({ page: 1, perPage: 200 });
+        const u = lu && lu.users && lu.users.find(x => String(x.email || '').toLowerCase() === email);
+        uid = u && u.id;
+      } catch (e2) {}
+    }
+    if (!uid) return res.status(400).json({ error: 'No encontre el login de ' + email });
+    const { error: ePw } = await supabase.auth.admin.updateUserById(uid, { password });
+    if (ePw) return res.status(400).json({ error: ePw.message });
+    res.json({ ok: true, email });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══ PROMOCIONES v15: central de descuentos de ML ═══════════════════
+// Lectura: admin y encargado. Aplicar/quitar: SOLO admin.
+
+// Campañas y promos disponibles del vendedor
+app.get('/api/promos', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
+  try {
+    const userId = req.query.user_id || '67619515';
+    const token = await getValidToken(userId);
+    if (!token) return res.status(400).json({ error: 'Sin token ML' });
+    const r = await fetch(`https://api.mercadolibre.com/seller-promotions/users/${userId}?app_version=v2`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    const d = await r.json();
+    res.status(r.status).json(d);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Items de una promo (candidatos + activos)
+app.get('/api/promos/items', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
+  try {
+    const userId = req.query.user_id || '67619515';
+    const { promotion_id, promotion_type } = req.query;
+    if (!promotion_id || !promotion_type) return res.status(400).json({ error: 'Faltan promotion_id y promotion_type' });
+    const token = await getValidToken(userId);
+    if (!token) return res.status(400).json({ error: 'Sin token ML' });
+    let url = `https://api.mercadolibre.com/seller-promotions/promotions/${encodeURIComponent(promotion_id)}/items`
+      + `?promotion_type=${encodeURIComponent(promotion_type)}&app_version=v2&limit=${Math.min(parseInt(req.query.limit) || 50, 50)}`;
+    if (req.query.offset)       url += `&offset=${encodeURIComponent(req.query.offset)}`;
+    if (req.query.search_after) url += `&search_after=${encodeURIComponent(req.query.search_after)}`;
+    if (req.query.status_item)  url += `&status_item=${encodeURIComponent(req.query.status_item)}`;
+    const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    const d = await r.json();
+    res.status(r.status).json(d);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Titulos + SKU + precio de items (para mostrar lindo y cruzar con costos)
+app.get('/api/promos/titulos', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
+  try {
+    const userId = req.query.user_id || '67619515';
+    const ids = String(req.query.ids || '').split(',').map(s => s.trim()).filter(Boolean);
+    if (!ids.length) return res.json({});
+    const token = await getValidToken(userId);
+    if (!token) return res.status(400).json({ error: 'Sin token ML' });
+    const out = {};
+    for (let i = 0; i < ids.length; i += 20) {
+      const chunk = ids.slice(i, i + 20);
+      const url = 'https://api.mercadolibre.com/items?ids=' + chunk.join(',')
+        + '&attributes=id,title,price,seller_sku,seller_custom_field,available_quantity';
+      try {
+        const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+        const arr = await r.json();
+        (Array.isArray(arr) ? arr : []).forEach(row => {
+          const b = row && row.body;
+          if (b && b.id) out[b.id] = {
+            title: b.title || '',
+            sku: String(b.seller_sku || b.seller_custom_field || '').trim().toUpperCase(),
+            price: b.price || 0,
+            stock: b.available_quantity != null ? b.available_quantity : null
+          };
+        });
+      } catch (e2) {}
+    }
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Promos activas de UN item
+app.get('/api/promos/item/:item_id', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
+  try {
+    const userId = req.query.user_id || '67619515';
+    const token = await getValidToken(userId);
+    if (!token) return res.status(400).json({ error: 'Sin token ML' });
+    const r = await fetch(`https://api.mercadolibre.com/seller-promotions/items/${encodeURIComponent(req.params.item_id)}?app_version=v2`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    const d = await r.json();
+    res.status(r.status).json(d);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Aplicar oferta a un item (campaña o descuento individual PRICE_DISCOUNT)
+app.post('/api/promos/aplicar', requireAuth, soloRoles('admin'), async (req, res) => {
+  try {
+    const userId = (req.body && req.body.user_id) || '67619515';
+    const itemId = req.body && req.body.item_id;
+    if (!itemId) return res.status(400).json({ error: 'Falta item_id' });
+    const token = await getValidToken(userId);
+    if (!token) return res.status(400).json({ error: 'Sin token ML' });
+
+    const body = {};
+    if (req.body.deal_price != null)     body.deal_price = Number(req.body.deal_price);
+    if (req.body.top_deal_price != null) body.top_deal_price = Number(req.body.top_deal_price);
+    if (req.body.promotion_id)           body.promotion_id = String(req.body.promotion_id);
+    if (req.body.promotion_type)         body.promotion_type = String(req.body.promotion_type);
+
+    const url = `https://api.mercadolibre.com/seller-promotions/items/${encodeURIComponent(itemId)}?app_version=v2`;
+    const hdr = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+
+    // POST crea la oferta; si ya existia, ML devuelve error -> probamos PUT (editar)
+    let r = await fetch(url, { method: 'POST', headers: hdr, body: JSON.stringify(body) });
+    let d; try { d = await r.json(); } catch (e2) { d = {}; }
+    if (!r.ok) {
+      const r2 = await fetch(url, { method: 'PUT', headers: hdr, body: JSON.stringify(body) });
+      let d2; try { d2 = await r2.json(); } catch (e3) { d2 = {}; }
+      if (r2.ok) return res.status(r2.status).json(d2);
+      return res.status(r.status).json({ error: (d && (d.message || d.error)) || 'ML rechazo la oferta', detalle: d, detalle_put: d2 });
+    }
+    res.status(r.status).json(d);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Quitar oferta(s) de un item. Con promotion_type+promotion_id saca ESA;
+// sin parametros saca TODAS las que se puedan (delete masivo de ML).
+app.delete('/api/promos/quitar', requireAuth, soloRoles('admin'), async (req, res) => {
+  try {
+    const userId = req.query.user_id || '67619515';
+    const itemId = req.query.item_id;
+    if (!itemId) return res.status(400).json({ error: 'Falta item_id' });
+    const token = await getValidToken(userId);
+    if (!token) return res.status(400).json({ error: 'Sin token ML' });
+    let url = `https://api.mercadolibre.com/seller-promotions/items/${encodeURIComponent(itemId)}?app_version=v2`;
+    if (req.query.promotion_type) url += `&promotion_type=${encodeURIComponent(req.query.promotion_type)}`;
+    if (req.query.promotion_id)   url += `&promotion_id=${encodeURIComponent(req.query.promotion_id)}`;
+    const r = await fetch(url, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
+    let d; try { d = await r.json(); } catch (e2) { d = { ok: r.ok }; }
+    res.status(r.status).json(d);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══ ANALIZADOR v17: cruza campañas de ML contra costos Contabilium ══
+// Cache de costos en memoria (6 hs): la primera corrida tarda ~1 min
+// porque recorre todo Contabilium; las siguientes son instantaneas.
+var _contaMapaCache = { ts: 0, mapa: null };
+async function contabiliumMapaCostos() {
   const ahora = Date.now();
-  const e = _intentosLogin.get(key);
-  if (!e || ahora - e.desde > 15 * 60 * 1000) { _intentosLogin.set(key, { n: 1, desde: ahora }); return true; }
-  e.n++;
-  if (_intentosLogin.size > 10000) _intentosLogin.clear();
-  return e.n <= 5;
-}
-
-// ---- ENDPOINTS DE AUTENTICACION ----
-app.post('/auth/login', async (req, res) => {
-  try {
-    const { email, password } = req.body || {};
-    if (!email || !password) return res.status(400).json({ error: 'falta email o contrasenia' });
-    const ip = (req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '?').toString().split(',')[0].trim();
-    const key = ip + '|' + String(email).toLowerCase().trim();
-    if (!loginPermitido(key)) return res.status(429).json({ error: 'demasiados intentos, proba de nuevo en 15 minutos' });
-    const { data: u } = await db.from('pq_usuarios').select('*').eq('email', String(email).toLowerCase().trim()).single();
-    if (!u || !u.activo || !verificarPassword(password, u.hash, u.sal)) {
-      return res.status(401).json({ error: 'email o contrasenia incorrectos' });
-    }
-    _intentosLogin.delete(key); // login ok: limpiar contador
-    const token = nuevoToken();
-    await db.from('pq_sesiones').insert({
-      token, usuario_id: u.id,
-      expira_at: new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString()
-    });
-    res.json({ ok: true, token, usuario: { email: u.email, nombre: u.nombre, rol: u.rol, permisos: u.permisos, cuenta_id: u.cuenta_id } });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// SSO PONTEC OS: el hub le pasa su sesion de Supabase a la app embebida y este
-// endpoint la verifica. Si el email del hub existe como usuario ACTIVO de
-// RespondIA, se abre una sesion normal (mismo formato que /auth/login).
-app.post('/auth/sso', async (req, res) => {
-  try {
-    const { access_token } = req.body || {};
-    if (!access_token) return res.status(400).json({ error: 'falta access_token' });
-    // verificar el token contra Supabase Auth (el mismo proyecto del hub)
-    const r = await fetch(SUPABASE_URL + '/auth/v1/user', {
-      headers: { apikey: SUPABASE_KEY, Authorization: 'Bearer ' + access_token }
-    });
-    const su = await r.json();
-    const email = (su && su.email ? String(su.email) : '').toLowerCase().trim();
-    if (!email) return res.status(401).json({ error: 'sesion del hub invalida' });
-    const { data: u } = await db.from('pq_usuarios').select('*').eq('email', email).single();
-    if (!u || !u.activo) return res.status(403).json({ error: 'tu usuario del hub (' + email + ') no existe en RespondIA. Pedile al master que te cree con ese mismo email.' });
-    const token = nuevoToken();
-    await db.from('pq_sesiones').insert({
-      token, usuario_id: u.id,
-      expira_at: new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString()
-    });
-    res.json({ ok: true, token, usuario: { email: u.email, nombre: u.nombre, rol: u.rol, permisos: u.permisos, cuenta_id: u.cuenta_id } });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/auth/logout', soloPanel, async (req, res) => {
-  const token = req.query.token || req.headers['x-token'];
-  if (token) await db.from('pq_sesiones').delete().eq('token', token);
-  res.json({ ok: true });
-});
-
-app.get('/auth/me', soloPanel, async (req, res) => {
-  res.json({ usuario: { email: req.usuario.email, nombre: req.usuario.nombre || null, rol: req.usuario.rol, permisos: req.usuario.permisos || {}, cuenta_id: req.usuario.cuenta_id } });
-});
-
-// REGISTRO SELF-SERVICE: un cliente nuevo crea su usuario dueno con un
-// codigo de invitacion (variable CODIGO_REGISTRO en Railway). Despues conecta
-// su Mercado Libre y queda operativo solo, sin intervencion del master.
-app.post('/auth/registro', async (req, res) => {
-  try {
-    const CODIGO = process.env.CODIGO_REGISTRO;
-    if (!CODIGO) return res.status(403).json({ error: 'el registro esta deshabilitado (falta CODIGO_REGISTRO en el servidor)' });
-    const { codigo, email, password, nombre } = req.body || {};
-    if (String(codigo || '').trim() !== CODIGO) return res.status(401).json({ error: 'codigo de invitacion incorrecto' });
-    if (!email || !password || String(password).length < 8) return res.status(400).json({ error: 'email y contrasenia (min 8 caracteres) requeridos' });
-    const { hash, sal } = hashPassword(password);
-    const { data: creado, error } = await db.from('pq_usuarios').insert({
-      email: String(email).toLowerCase().trim(), nombre: nombre || null, hash, sal,
-      rol: 'dueno', cuenta_id: null   // sin cuenta todavia: la vincula con el paso de ML
-    }).select('id').single();
-    if (error) return res.status(500).json({ error: error.message.includes('duplicate') ? 'ese email ya esta registrado' : error.message });
-    const token = nuevoToken();
-    await db.from('pq_sesiones').insert({ token, usuario_id: creado.id, expira_at: new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString() });
-    res.json({ ok: true, token, usuario: { email: String(email).toLowerCase().trim(), nombre: nombre || null, rol: 'dueno', permisos: {}, cuenta_id: null } });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// Crear el PRIMER usuario master (solo con la clave maestra, solo si no existe ninguno)
-app.post('/auth/setup-master', async (req, res) => {
-  try {
-    const clave = req.query.clave || req.headers['x-clave'];
-    if (clave !== CLAVE_PANEL) return res.status(401).json({ error: 'clave invalida' });
-    const { count } = await db.from('pq_usuarios').select('id', { count: 'exact', head: true }).eq('rol', 'master');
-    if (count > 0) return res.status(400).json({ error: 'ya existe un usuario master' });
-    const { email, password, nombre } = req.body || {};
-    if (!email || !password || String(password).length < 8) return res.status(400).json({ error: 'email y contrasenia (min 8 caracteres) requeridos' });
-    const { hash, sal } = hashPassword(password);
-    const { error } = await db.from('pq_usuarios').insert({
-      email: String(email).toLowerCase().trim(), nombre: nombre || null, hash, sal, rol: 'master', cuenta_id: null
-    });
-    if (error) return res.status(500).json({ error: error.message });
-    res.json({ ok: true, msg: 'usuario master creado. Ya podes entrar con email y contrasenia.' });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ---- GESTION DE USUARIOS (solo master y dueno) ----
-app.get('/api/usuarios', soloPanel, requiereRol('master', 'dueno'), async (req, res) => {
-  let q = db.from('pq_usuarios').select('id, cuenta_id, email, nombre, rol, permisos, activo, creado_at').order('creado_at');
-  if (req.usuario.rol === 'dueno') {
-    // el dueno solo ve usuarios de SU cuenta
-    q = q.eq('cuenta_id', req.usuario.cuenta_id);
-  } else {
-    // el master ve los usuarios de la CUENTA SELECCIONADA (+ el propio master, que es global)
-    const cuenta = await resolverCuenta(req);
-    if (cuenta) q = q.or(`cuenta_id.eq.${cuenta.id},rol.eq.master`);
-  }
-  const { data } = await q;
-  res.json(data || []);
-});
-
-app.post('/api/usuarios', soloPanel, requiereRol('master', 'dueno'), async (req, res) => {
-  try {
-    const { email, nombre, password, rol, permisos } = req.body || {};
-    if (!email || !password || String(password).length < 8) return res.status(400).json({ error: 'email y contrasenia (min 8) requeridos' });
-    const rolesPermitidos = req.usuario.rol === 'master' ? ['dueno', 'gerente', 'operador'] : ['gerente', 'operador'];
-    if (!rolesPermitidos.includes(rol)) return res.status(400).json({ error: 'rol invalido: ' + rolesPermitidos.join(' / ') });
-    // el nuevo usuario queda en la cuenta del creador (o la elegida por el master)
-    let cuentaId = req.usuario.cuenta_id;
-    if (req.usuario.rol === 'master') {
-      cuentaId = req.body.cuenta_id || (await resolverCuenta(req))?.id || null;
-    }
-    if (!cuentaId) return res.status(400).json({ error: 'no pude determinar la cuenta del usuario' });
-    const { hash, sal } = hashPassword(password);
-    const { error } = await db.from('pq_usuarios').insert({
-      email: String(email).toLowerCase().trim(), nombre: nombre || null, hash, sal,
-      rol, permisos: permisos || {}, cuenta_id: cuentaId, creado_por: req.usuario.id
-    });
-    if (error) return res.status(500).json({ error: error.message.includes('duplicate') ? 'ese email ya existe' : error.message });
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/usuarios/editar', soloPanel, requiereRol('master', 'dueno'), async (req, res) => {
-  try {
-    const { id, activo, rol, permisos, password, nombre } = req.body || {};
-    const { data: objetivo } = await db.from('pq_usuarios').select('id, cuenta_id, rol').eq('id', id).single();
-    if (!objetivo) return res.status(404).json({ error: 'usuario no encontrado' });
-    if (req.usuario.rol === 'dueno' && objetivo.cuenta_id !== req.usuario.cuenta_id) return res.status(403).json({ error: 'no es un usuario de tu cuenta' });
-    if (objetivo.rol === 'master' && req.usuario.rol !== 'master') return res.status(403).json({ error: 'no podes editar al master' });
-    const upd = {};
-    if (activo !== undefined) upd.activo = !!activo;
-    if (nombre !== undefined) upd.nombre = nombre;
-    const rolesEditables = req.usuario.rol === 'master' ? ['master', 'dueno', 'gerente', 'operador'] : ['dueno', 'gerente', 'operador'];
-    if (rol && rolesEditables.includes(rol)) {
-      upd.rol = rol;
-      if (rol === 'master') upd.cuenta_id = null; // master es global: ve todas las cuentas
-    }
-    if (permisos !== undefined) upd.permisos = permisos;
-    if (password) { const { hash, sal } = hashPassword(password); upd.hash = hash; upd.sal = sal; }
-    const { error } = await db.from('pq_usuarios').update(upd).eq('id', id);
-    if (error) return res.status(500).json({ error: error.message });
-    if (activo === false) await db.from('pq_sesiones').delete().eq('usuario_id', id); // desactivar = cerrar sesiones
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// =====================================================================
-// CUENTAS (tenants)
-// =====================================================================
-async function getCuentaPorMlUser(mlUserId) {
-  const { data } = await db.from('pq_cuentas').select('*').eq('ml_user_id', mlUserId).single();
-  return data || null;
-}
-async function getCuentaPorId(id) {
-  const { data } = await db.from('pq_cuentas').select('*').eq('id', id).single();
-  return data || null;
-}
-async function resolverCuenta(req) {
-  // AISLAMIENTO: un usuario logueado (no master) SIEMPRE opera sobre su propia
-  // cuenta, sin importar que pida por query. Solo el master elige cuenta.
-  if (req.usuario && req.usuario.rol !== 'master' && req.usuario.cuenta_id) {
-    return await getCuentaPorId(req.usuario.cuenta_id);
-  }
-  if (req.query.cuenta_id) return await getCuentaPorId(req.query.cuenta_id);
-  if (ML_USER_ID) return await getCuentaPorMlUser(ML_USER_ID);
-  return null;
-}
-
-// =====================================================================
-// TOKENS DE MERCADO LIBRE (por cuenta)
-// =====================================================================
-async function getAccessToken(cuenta) {
-  if (!cuenta || !cuenta.ml_refresh_token) throw new Error('Cuenta sin autorizar en ML. Entra a /oauth con esa cuenta.');
-  if (cuenta.ml_expires_at && new Date(cuenta.ml_expires_at) > new Date()) return cuenta.ml_access_token;
-  const r = await fetch('https://api.mercadolibre.com/oauth/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
-    body: new URLSearchParams({
-      grant_type: 'refresh_token',
-      client_id: ML_CLIENT_ID,
-      client_secret: ML_CLIENT_SECRET,
-      refresh_token: cuenta.ml_refresh_token
-    })
-  });
-  const nuevo = await r.json();
-  if (!nuevo.access_token) throw new Error('No pude refrescar token ML: ' + JSON.stringify(nuevo));
-  const expires_at = new Date(Date.now() + (nuevo.expires_in - 300) * 1000).toISOString();
-  await db.from('pq_cuentas').update({
-    ml_access_token: nuevo.access_token, ml_refresh_token: nuevo.refresh_token, ml_expires_at: expires_at
-  }).eq('id', cuenta.id);
-  cuenta.ml_access_token = nuevo.access_token; cuenta.ml_refresh_token = nuevo.refresh_token; cuenta.ml_expires_at = expires_at;
-  return nuevo.access_token;
-}
-
-async function mlGet(path, cuenta) {
-  const token = await getAccessToken(cuenta);
-  const url = path.startsWith('http') ? path : 'https://api.mercadolibre.com' + path;
-  const r = await fetch(url, { headers: { Authorization: 'Bearer ' + token } });
-  if (!r.ok) { const txt = await r.text(); throw new Error('ML GET ' + path + ' -> ' + r.status + ' ' + txt); }
-  return r.json();
-}
-
-async function mlPut(path, body, cuenta) {
-  const token = await getAccessToken(cuenta);
-  const r = await fetch('https://api.mercadolibre.com' + path, {
-    method: 'PUT',
-    headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
-  });
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error('ML PUT ' + path + ' -> ' + r.status + ' ' + JSON.stringify(data));
-  return data;
-}
-async function mlDelete(path, cuenta) {
-  const token = await getAccessToken(cuenta);
-  const r = await fetch('https://api.mercadolibre.com' + path, {
-    method: 'DELETE', headers: { Authorization: 'Bearer ' + token }
-  });
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error('ML DELETE ' + path + ' -> ' + r.status + ' ' + JSON.stringify(data));
-  return data;
-}
-async function mlPost(path, body, cuenta) {
-  const token = await getAccessToken(cuenta);
-  const r = await fetch('https://api.mercadolibre.com' + path, {
-    method: 'POST',
-    headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
-  });
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error('ML POST ' + path + ' -> ' + r.status + ' ' + JSON.stringify(data));
-  return data;
-}
-
-// =====================================================================
-// ITEMS / SKU / STOCK (scope por cuenta)
-// =====================================================================
-function sacarSku(obj) {
-  if (!obj) return null;
-  // PRIORIDAD: 1) atributo SELLER_SKU (es el que ML actualiza cuando editas el SKU hoy)
-  //            2) seller_sku  3) seller_custom_field (campo viejo, puede quedar congelado
-  //               con SKUs anteriores cuando se renombra un producto)
-  const a = (obj.attributes || []).find(x => x.id === 'SELLER_SKU');
-  const deAtributo = a ? (a.value_name || a.values?.[0]?.name || null) : null;
-  return deAtributo || obj.seller_sku || obj.seller_custom_field || null;
-}
-
-// SKU madre: agrupa variaciones del mismo producto.
-// Convencion PONTEC: variacion = guion (GRI200-NE -> madre GRI200).
-// SKUs sin guion quedan tal cual; sus variaciones se agrupan por publicacion (item_id).
-function skuMadre(sku) {
-  if (!sku) return null;
-  const s = String(sku).trim();
-  const i = s.indexOf('-');
-  return i > 0 ? s.slice(0, i) : s;
-}
-function descVariante(comb) {
-  // TODOS los atributos que definen la variante (Color, Tapa, Diseno, etc.),
-  // no solo "color": si la publicacion varia por otro atributo, tambien lo vemos.
-  const partes = (comb || []).map(x => {
-    const n = x.name || x.id || '';
-    const v = x.value_name || '';
-    return v ? (n ? n + ': ' + v : v) : null;
-  }).filter(Boolean);
-  return partes.length ? partes.join(', ') : null;
-}
-
-async function traerItem(cuenta, itemId, force = false) {
-  const { data: cache } = await db.from('pq_items').select('*').eq('item_id', itemId).eq('cuenta_id', cuenta.id).single();
-  if (!force && cache && cache.actualizado_at && (Date.now() - new Date(cache.actualizado_at).getTime()) < 6 * 3600 * 1000) return cache;
-
-  let item, desc = '';
-  try { item = await mlGet('/items/' + itemId, cuenta); } catch (e) { return cache || null; }
-  try { const d = await mlGet('/items/' + itemId + '/description', cuenta); desc = d.plain_text || d.text || ''; } catch (e) {}
-
-  let variaciones = (item.variations || []).map(v => ({
-    color: descVariante(v.attribute_combinations), sku: sacarSku(v),
-    stock: v.available_quantity, precio: v.price ?? null
-  }));
-  if (variaciones.length === 0) variaciones = [{ color: null, sku: sacarSku(item), stock: item.available_quantity, precio: item.price ?? null }];
-
-  const skuItem = sacarSku(item) || variaciones[0]?.sku || null;
-  const fila = {
-    item_id: itemId,
-    cuenta_id: cuenta.id,
-    sku: skuItem,
-    sku_madre: skuMadre(skuItem),
-    titulo: item.title || null,
-    imagenes: (item.pictures || []).slice(0, 4).map(p => p.secure_url || p.url).filter(Boolean),
-    descripcion: desc,
-    atributos: (item.attributes || []).reduce((o, a) => { o[a.name || a.id] = a.value_name; return o; }, {}),
-    variaciones,
-    nota_reposicion: cache?.nota_reposicion || null,
-    skus: [...new Set([skuItem, ...variaciones.map(v => v.sku)].filter(Boolean))].join(' ') || null,
-    estado: item.status || null,
-    actualizado_at: new Date().toISOString()
+  if (_contaMapaCache.mapa && (ahora - _contaMapaCache.ts) < 6 * 60 * 60 * 1000) return _contaMapaCache.mapa;
+  const token = await getContabiliumToken();
+  const pageSize = 50;
+  const base = 'https://rest.contabilium.com/api/conceptos/search';
+  const PAUSA = 500;
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const getPage = async (param, n) => {
+    const r = await fetch(`${base}?pageSize=${pageSize}&${param}=${n}`, { headers: { Authorization: `Bearer ${token}` } });
+    return r.json();
   };
-  await db.from('pq_items').upsert(fila);
-  return fila;
-}
-
-// =====================================================================
-// SIMILITUD: rankea el historial por parecido a la pregunta actual
-// =====================================================================
-const STOPWORDS = new Set(['hola','buenas','buenos','dias','tardes','noches','que','como','cual','cuales','por','para','con','sin','una','uno','unos','unas','the','del','las','los','este','esta','estos','estas','ese','esa','tiene','tienen','hay','son','mas','pero','les','pueden','puede','quiero','queria','saber','gracias','favor','consulta','pregunta','tenes','viene','vienen','ser','esta','estan'])
-function tokens(s) {
-  return String(s || '')
-    .toLowerCase()
-    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')   // sin acentos
-    .split(/[^a-z0-9]+/)
-    .filter(w => w.length > 2 && !STOPWORDS.has(w));
-}
-function similitud(tokensPregunta, textoHist) {
-  if (!tokensPregunta.size) return 0;
-  const th = new Set(tokens(textoHist));
-  let comunes = 0;
-  for (const t of tokensPregunta) if (th.has(t)) comunes++;
-  return comunes / Math.sqrt(1 + th.size); // favorece coincidencias, penaliza textos larguisimos
-}
-
-// Decide si una regla aplica a una pregunta segun su "ambito".
-// ambito: global | sku (exacto) | madre | item (publicacion) | prefijo | lista
-function reglaAplica(r, ctx) {
-  const sku = ctx.sku || '';
-  const madre = ctx.madre || '';
-  switch (r.ambito) {
-    case 'global': return true;
-    case 'sku':    return !!sku && sku === r.sku;
-    case 'madre':  return !!madre && madre === (r.sku || skuMadre(r.sku));
-    case 'item':   return !!ctx.item_id && ctx.item_id === r.item_id;
-    case 'prefijo':return !!sku && !!r.sku && String(r.sku).split(',').map(s => s.trim().toUpperCase()).filter(Boolean).some(p => sku.toUpperCase().startsWith(p));
-    case 'lista':  return !!sku && String(r.sku || '').split(',').map(s => s.trim().toUpperCase()).includes(sku.toUpperCase());
-    default:       return !!sku && sku === r.sku; // compatibilidad con reglas viejas
-  }
-}
-
-// =====================================================================
-// MOTOR DE RESPUESTAS (CLAUDE)
-// =====================================================================
-// Todas devuelven { texto, inTok, outTok } para poder medir el costo real.
-// system: string o array de bloques {type:'text', text, cache_control?}
-// userContent: string o array de bloques (texto + imagenes)
-
-async function llamarClaude(modelo, system, userContent, maxTokens = 700) {
-  const body = {
-    model: modelo,
-    max_tokens: maxTokens,
-    system: system,
-    messages: [{ role: 'user', content: userContent }]
+  const primerCod = d => { const it = (d && (d.Items || d.items)) || []; return it.length ? String(it[0].Codigo || it[0].codigo || '').toUpperCase().trim() : ''; };
+  const mapa = {};
+  const add = d => {
+    const it = (d && (d.Items || d.items)) || [];
+    let n = 0;
+    for (const x of it) {
+      const c = String(x.Codigo || x.codigo || '').toUpperCase().trim();
+      if (c && !(c in mapa)) { mapa[c] = Number(x.CostoInterno || x.costoInterno || 0); n++; }
+    }
+    return { n, len: it.length };
   };
+  const d1 = await getPage('pageNumber', 1);
+  const cod1 = primerCod(d1);
+  add(d1);
+  let pageParam = null;
+  for (const cand of ['pageNumber', 'page', 'nroPagina', 'pagina', 'nroPag', 'pageIndex']) {
+    await sleep(PAUSA);
+    const d2 = await getPage(cand, 2);
+    const cod2 = primerCod(d2);
+    if (cod2 && cod2 !== cod1) { pageParam = cand; add(d2); break; }
+  }
+  if (pageParam) {
+    let page = 3;
+    while (true) {
+      await sleep(PAUSA);
+      const d = await getPage(pageParam, page);
+      const { n, len } = add(d);
+      if (len === 0 || n === 0 || len < pageSize) break;
+      page++;
+      if (page > 500) break;
+    }
+  }
+  _contaMapaCache = { ts: Date.now(), mapa };
+  console.log('[ANALISIS] costos Contabilium en cache:', Object.keys(mapa).length);
+  return mapa;
+}
+
+// Titulo + SKU de items en lotes de 20
+async function itemsMini(ids, token) {
+  const out = {};
+  for (let i = 0; i < ids.length; i += 20) {
+    const chunk = ids.slice(i, i + 20);
+    try {
+      const r = await fetch('https://api.mercadolibre.com/items?ids=' + chunk.join(',') + '&attributes=id,title,price,seller_sku,seller_custom_field,attributes', {
+        headers: { Authorization: 'Bearer ' + token }
+      });
+      const arr = await r.json();
+      (Array.isArray(arr) ? arr : []).forEach(row => {
+        const b = row && row.body;
+        if (b && b.id) {
+          let sku = String(b.seller_sku || b.seller_custom_field || '').trim().toUpperCase();
+          if (!sku && Array.isArray(b.attributes)) {
+            const at = b.attributes.find(a => a && a.id === 'SELLER_SKU');
+            if (at) sku = String(at.value_name || at.value_id || '').trim().toUpperCase();
+          }
+          out[b.id] = { title: b.title || '', price: b.price || 0, sku };
+        }
+      });
+    } catch (e) {}
+    await new Promise(r => setTimeout(r, 120));
+  }
+  return out;
+}
+
+// GET /api/promos/analisis -> recorre TODAS las campañas y devuelve
+// cada item con precio actual, sugerido de ML y costo de Contabilium.
+app.get('/api/promos/analisis', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
+  try {
+    const userId = req.query.user_id || '67619515';
+    const maxPag = Math.min(parseInt(req.query.max_paginas) || 4, 10);
+    const token = await getValidToken(userId);
+    if (!token) return res.status(400).json({ error: 'Sin token ML' });
+
+    const rc = await fetch(`https://api.mercadolibre.com/seller-promotions/users/${userId}?app_version=v2`, {
+      headers: { Authorization: 'Bearer ' + token }
+    });
+    const dc = await rc.json();
+    const campanas = (dc.results || []).filter(p => p && p.id && p.type);
+
+    const filas = [];
+    let campOk = 0;
+    for (const p of campanas) {
+      try {
+        for (let pag = 0; pag < maxPag; pag++) {
+          const url = `https://api.mercadolibre.com/seller-promotions/promotions/${encodeURIComponent(p.id)}/items`
+            + `?promotion_type=${encodeURIComponent(p.type)}&app_version=v2&limit=50&offset=${pag * 50}`;
+          const r = await fetch(url, { headers: { Authorization: 'Bearer ' + token } });
+          const d = await r.json();
+          const items = d.results || d.items || [];
+          for (const it of items) {
+            filas.push({
+              item_id: it.id, campana: p.name || p.id, tipo: p.type, promo_id: p.id,
+              estado: it.status || '',
+              precio_actual: it.original_price || it.price || 0,
+              sugerido: it.suggested_discounted_price || null,
+              minimo: it.min_discounted_price || null,
+              maximo: it.max_discounted_price || null
+            });
+            if (filas.length >= 1500) break;
+          }
+          if (items.length < 50 || filas.length >= 1500) break;
+          await new Promise(r => setTimeout(r, 150));
+        }
+        campOk++;
+      } catch (e) { console.error('[ANALISIS] campana', p.id, e.message); }
+      if (filas.length >= 1500) break;
+    }
+
+    const ids = [...new Set(filas.map(f => f.item_id).filter(Boolean))];
+    const mini = await itemsMini(ids, token);
+    const mapa = await contabiliumMapaCostos();
+    let sinCosto = 0;
+    for (const f of filas) {
+      const m = mini[f.item_id] || {};
+      f.titulo = m.title || '';
+      f.sku = m.sku || '';
+      f.costo = (f.sku && (f.sku in mapa) && mapa[f.sku] > 0) ? mapa[f.sku] : null;
+      if (f.costo == null) sinCosto++;
+    }
+
+    console.log(`[ANALISIS] ${campOk} campanas, ${filas.length} items, ${sinCosto} sin costo`);
+    res.json({ filas, campanas: campOk, items: filas.length, sin_costo: sinCosto });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══ ASISTENTE v18: ordenes en lenguaje natural ═════════════════════
+// Interpreta con Claude (ANTHROPIC_API_KEY en Railway), muestra que va
+// a tocar, y SOLO ejecuta cuando el usuario confirma con el boton.
+const ASISTENTE_SYS = `Sos el Asistente de Pontec OS, el sistema interno de PONTEC SA (vendedor grande de MercadoLibre Argentina).
+Tu unico trabajo es interpretar el pedido del usuario y responder SOLO un JSON valido, sin markdown ni texto extra, con esta forma:
+{"accion":"...","parametros":{...},"respuesta":"texto corto para el usuario"}
+
+Acciones disponibles:
+- "quitar_descuento": parametros {"sku":"..."} o {"item_id":"MLA..."} -> saca los descuentos de las publicaciones de ese SKU
+- "aplicar_descuento": parametros {"sku" o "item_id"} mas UNO de estos dos: {"precio": numero} (precio final deseado) o {"porcentaje": numero} (ej "10% de descuento" -> {"porcentaje":10}) -> aplica descuento individual; opcional {"dias": numero} si el usuario dice por cuantos dias
+- "ver_promos": parametros {"sku" o "item_id"} -> lista las promociones activas
+- "buscar": parametros {"sku":"..."} -> lista las publicaciones de un SKU con precio
+- "ventas": parametros {"sku": opcional, "dias": numero opcional (default 30)} -> resumen de MIS ventas: cantidad, unidades, facturacion y ganancia aprox. "cuanto vendi del X este mes" -> {"sku":"X","dias":30}
+- "medidas": parametros {"sku":"..."} -> declara en ML las medidas de embalaje (largo/ancho/alto/peso) que figuran en la planilla de medidas de Pontec
+- "clonar_fotos": parametros {"origen":"MLA... (publicacion de la que copiar)"} y destino {"sku":"..."} (o {"item_id":"MLA..."}) -> copia las fotos de una publicacion a las demas del SKU
+- "smart": parametros {"max_mi_parte": numero} -> busca en las campanas co-participadas (SMART y similares) las propuestas donde TU parte del descuento es hasta ese % y MercadoLibre aporta el resto. "mandame los que me piden hasta 13% de mi parte" -> {"max_mi_parte":13}
+- "quitar_todo": sin parametros -> SOLO cuando el usuario pide explicitamente sacar TODOS los descuentos de TODOS los productos del catalogo
+- "multi": parametros {"acciones":[{"accion":"quitar_descuento","parametros":{...}},{"accion":"aplicar_descuento","parametros":{...}}]} -> cuando el usuario pide VARIAS cosas en un mismo mensaje (solo combina quitar_descuento y aplicar_descuento)
+- "charla": sin parametros -> saludos, dudas, o cuando falta un dato; lo que quieras decir va en "respuesta"
+
+Reglas:
+- Los SKU de Pontec son codigos tipo OFI210-BL o AIR010-NE: letras+numeros y a veces sufijo de color (NE=negro, BL=blanco, AZ=azul, RO=rojo, GR=gris, VE=verde, MA=marron, CO=cobre). Si el usuario dice "la silla ofi 210 blanca", el SKU es OFI210-BL.
+- SKU MASTER/FAMILIA: si el usuario da un SKU SIN sufijo de color (ej: "STL150", "sacale el descuento al BAN005"), NO le pidas los colores: pasa el SKU tal cual (ej: "BAN005") y el sistema lo expande solo a TODA la familia: todas las variantes de color (BAN005-BL, BAN005-NE, etc.) Y TAMBIEN los combos que contienen ese codigo (COMBO 2X BAN005-BL, COMBO 3X BAN005-NE, etc.). Solo agrega el sufijo si el usuario nombro un color especifico.
+- MUY IMPORTANTE: tambien existen SKUs de COMBOS que llevan ESPACIOS adentro, con formato "COMBO 2X BAN002-BL", "COMBO 3X BAN005-NE", "COMBO 4X BAN002-BL", etc. Cada uno de esos es UN SOLO SKU completo: NUNCA lo partas, nunca le saques el "COMBO NX", y usalo entero (con espacios) en el parametro "sku". Si el usuario pega una lista de SKUs (uno por renglon o separados por comas), cada renglon/entrada es un SKU completo. Si en un texto corrido aparece "COMBO", el SKU abarca desde "COMBO" hasta el codigo con sufijo de color inclusive (ej: en "COMBO 2X BAN002-BL COMBO 2X BAN002-NE" hay DOS skus: "COMBO 2X BAN002-BL" y "COMBO 2X BAN002-NE").
+- Si el usuario dice un porcentaje de descuento, mandalo como "porcentaje"; NO le pidas el precio final.\n- Para clonar_fotos hace falta saber DE QUE publicacion copiar (un codigo MLA...). Si el usuario no lo dijo, pedilo con "charla".
+- Duracion del descuento: por defecto 30 dias (no hace falta que el usuario lo diga). Si el usuario pide otra duracion (ej: "por 7 dias", "por 2 meses"), pasa ese valor en "dias" (hasta 365). Si ML no aceptara la duracion, el sistema reintenta solo con 14 dias y lo avisa en el resultado.
+- Si para aplicar_descuento no hay ni precio ni porcentaje, usa "charla" y pedi uno de los dos.
+- Nunca inventes precios ni SKUs que el usuario no dijo.
+- "respuesta" siempre en espanol rioplatense informal y corta.`;
+
+async function asistenteLLM(mensajes) {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) return { error: 'Falta la variable ANTHROPIC_API_KEY en Railway' };
+  const model = process.env.ASISTENTE_MODEL || 'claude-sonnet-4-6';
   const r = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify(body)
+    headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model, max_tokens: 3000, system: ASISTENTE_SYS,
+      messages: mensajes.map(m => ({ role: m.rol === 'user' ? 'user' : 'assistant', content: String(m.texto || '').slice(0, 8000) }))
+    })
   });
-  const data = await r.json();
-  if (!data.content) throw new Error('Claude error: ' + JSON.stringify(data));
-  const texto = data.content.map(c => c.text || '').join('\n').trim();
-  const u = data.usage || {};
-  return { texto, usage: {
-    in:         u.input_tokens || 0,
-    cacheWrite: u.cache_creation_input_tokens || 0,   // primera vez: escribe el cache (1,25x)
-    cacheRead:  u.cache_read_input_tokens || 0,        // repeticiones: lee del cache (barato)
-    out:        u.output_tokens || 0
-  } };
+  const d = await r.json();
+  if (d.error) return { error: 'Anthropic: ' + (d.error.message || JSON.stringify(d.error)) };
+  const txt = (d.content || []).map(c => c.text || '').join('').replace(/```json|```/g, '').trim();
+  try { return { json: JSON.parse(txt) }; }
+  catch (e) { return { json: { accion: 'charla', respuesta: txt || 'No te entendi, proba de nuevo.' } }; }
 }
 
-// Llama a GPT (OpenAI) adaptando el MISMO contexto que usa Claude, para que la
-// comparacion del Duelo sea justa (misma ficha, mismas reglas, mismo historial).
-async function llamarGPT(modelo, system, userContent, maxTokens = 700) {
-  if (!OPENAI_API_KEY) throw new Error('Falta OPENAI_API_KEY en Railway');
-  // system Anthropic (array de bloques) -> un solo texto de sistema
-  const sysText = typeof system === 'string'
-    ? system
-    : (system || []).map(b => b.text || '').join('\n\n');
-  // userContent: string queda igual; array (texto+imagenes) se traduce al formato OpenAI
-  let userMsg;
-  if (typeof userContent === 'string') {
-    userMsg = userContent;
-  } else {
-    userMsg = (userContent || []).map(b => {
-      if (b.type === 'image' && b.source && b.source.type === 'base64' && b.source.data) {
-        return { type: 'image_url', image_url: { url: 'data:' + (b.source.media_type || 'image/jpeg') + ';base64,' + b.source.data } };
-      }
-      if (b.type === 'image' && b.source && b.source.url) {
-        return { type: 'image_url', image_url: { url: b.source.url } };
-      }
-      return { type: 'text', text: b.text || '' };
-    });
+// ¿El SKU candidato pertenece a la familia del codigo base?
+// Matchea el base en CUALQUIER parte, delimitado por inicio/fin/espacio/guion:
+//   base "BAN005" → BAN005 ✓ · BAN005-BL ✓ · COMBO 2X BAN005-NE ✓ · BAN0055 ✗
+function _skuEsFamilia(candidato, base) {
+  const s = String(candidato || '').toUpperCase().trim();
+  const b = String(base || '').toUpperCase().trim();
+  if (!s || !b) return false;
+  let desde = 0;
+  while (true) {
+    const i = s.indexOf(b, desde);
+    if (i < 0) return false;
+    const antes = i === 0 ? '' : s[i - 1];
+    const desp = (i + b.length >= s.length) ? '' : s[i + b.length];
+    const okA = antes === '' || antes === ' ' || antes === '-';
+    const okD = desp === '' || desp === ' ' || desp === '-';
+    if (okA && okD) return true;
+    desde = i + 1;
   }
-  const body = {
-    model: modelo,
-    max_completion_tokens: maxTokens,
-    response_format: { type: 'json_object' },   // nuestro prompt exige JSON valido
-    messages: [
-      { role: 'system', content: sysText },
-      { role: 'user', content: userMsg }
-    ]
-  };
-  const r = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + OPENAI_API_KEY },
-    body: JSON.stringify(body)
-  });
-  const data = await r.json();
-  const texto = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '';
-  if (!texto) throw new Error('GPT error: ' + JSON.stringify(data).slice(0, 300));
-  const u = data.usage || {};
-  // OpenAI cachea el prefijo automaticamente y lo reporta en prompt_tokens_details.cached_tokens
-  const cached = (u.prompt_tokens_details && u.prompt_tokens_details.cached_tokens) || 0;
-  return { texto: texto.trim(), usage: {
-    in:         (u.prompt_tokens || 0) - cached,   // entrada NO cacheada
-    cacheWrite: 0,                                 // OpenAI no cobra escritura de cache
-    cacheRead:  cached,                            // parte servida desde cache (barata)
-    out:        u.completion_tokens || 0
-  } };
 }
 
-// Llama a Gemini (Google) adaptando el MISMO contexto que Claude/GPT.
-// Convierte imagenes-por-URL a inline_data (base64) porque Gemini no toma URLs sueltas.
-async function _urlAInline(url) {
-  const r = await fetch(url);
-  const buf = Buffer.from(await r.arrayBuffer());
-  const mime = r.headers.get('content-type') || 'image/jpeg';
-  return { inline_data: { mime_type: mime, data: buf.toString('base64') } };
-}
-async function llamarGemini(modelo, system, userContent, maxTokens = 700) {
-  if (!GEMINI_API_KEY) throw new Error('Falta GEMINI_API_KEY en Railway');
-  const sysText = typeof system === 'string'
-    ? system
-    : (system || []).map(b => b.text || '').join('\n\n');
-  // partes del mensaje del usuario (texto + imagenes)
-  let parts;
-  if (typeof userContent === 'string') {
-    parts = [{ text: userContent }];
-  } else {
-    parts = [];
-    for (const b of (userContent || [])) {
-      if (b.type === 'image' && b.source && b.source.url) parts.push(await _urlAInline(b.source.url));
-      else parts.push({ text: b.text || '' });
-    }
-  }
-  const genCfg = { maxOutputTokens: maxTokens, responseMimeType: 'application/json' };
-  const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + modelo + ':generateContent?key=' + GEMINI_API_KEY;
-
-  // pide a Gemini; primer intento sin "pensamiento" (mas barato y no corta la respuesta),
-  // y si ese parametro no lo acepta este modelo, reintenta sin el.
-  async function pedir(conThinkingOff) {
-    const gc = conThinkingOff ? Object.assign({}, genCfg, { thinkingConfig: { thinkingBudget: 0 } }) : genCfg;
-    const body = { systemInstruction: { parts: [{ text: sysText }] }, contents: [{ role: 'user', parts }], generationConfig: gc };
-    const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-    return await r.json();
-  }
-  let data = await pedir(true);
-  if (data.error) data = await pedir(false); // reintento sin thinkingConfig
-  const cand = data.candidates && data.candidates[0];
-  const texto = (cand && cand.content && cand.content.parts ? cand.content.parts.map(p => p.text || '').join('') : '').trim();
-  if (!texto) throw new Error('Gemini error: ' + JSON.stringify(data).slice(0, 300));
-  const u = data.usageMetadata || {};
-  const cached = u.cachedContentTokenCount || 0;
-  return { texto, usage: {
-    in:         (u.promptTokenCount || 0) - cached,
-    cacheWrite: 0,
-    cacheRead:  cached,
-    out:        u.candidatesTokenCount || 0
-  } };
-}
-
-// Despachador: elige Claude, GPT o Gemini segun el string del modelo.
-async function llamarIA(modelo, system, userContent, maxTokens = 1024) {
-  if (String(modelo).startsWith('gpt'))    return await llamarGPT(modelo, system, userContent, maxTokens);
-  if (String(modelo).startsWith('gemini')) return await llamarGemini(modelo, system, userContent, maxTokens);
-  return await llamarClaude(modelo, system, userContent, maxTokens);
-}
-function parsearJson(txt) {
-  const limpio = txt.replace(/```json|```/g, '').trim();
-  try { return JSON.parse(limpio); } catch (e) {}
-  // si vino con texto alrededor, extraigo el primer objeto {...} balanceado
-  const i = limpio.indexOf('{');
-  if (i >= 0) {
-    let prof = 0;
-    for (let j = i; j < limpio.length; j++) {
-      if (limpio[j] === '{') prof++;
-      else if (limpio[j] === '}') { prof--; if (prof === 0) {
-        try { return JSON.parse(limpio.slice(i, j + 1)); } catch (e) {} break;
-      } }
-    }
-  }
-  return { respuesta: extraerRespuestaCortada(limpio) || txt, confianza: 'media', fuente: 'desconocida' };
-}
-// Si el JSON vino cortado (sin cerrar), rescata el valor de "respuesta" para no
-// mostrar el JSON crudo al usuario. Devuelve null si no encuentra nada usable.
-function extraerRespuestaCortada(txt) {
-  const m = txt.match(/"respuesta"\s*:\s*"((?:[^"\\]|\\.)*)/);
-  if (!m) return null;
-  return m[1].replace(/\\"/g, '"').replace(/\\n/g, '\n').replace(/\\t/g, ' ').replace(/\\\\/g, '\\').trim();
-}
-
-// Hilo del comprador: consultas previas del MISMO comprador sobre el MISMO producto
-// dentro de la ventana configurada. Se usa como contexto y para el limite anti-pelea.
-async function hiloComprador(cuenta, compradorId, itemId, preguntaId, ventanaDias) {
-  if (!compradorId || !itemId) return [];
-  const desde = new Date(Date.now() - (ventanaDias || 7) * 24 * 3600 * 1000).toISOString();
-  const { data } = await db.from('pq_preguntas')
-    .select('id, texto, ia_respuesta, respuesta_real, correccion, fecha_pregunta, estado')
-    .eq('cuenta_id', cuenta.id)
-    .eq('comprador_id', compradorId)
-    .eq('item_id', itemId)
-    .neq('id', preguntaId)
-    .gte('fecha_pregunta', desde)
-    .order('fecha_pregunta', { ascending: true })
-    .limit(10);
-  return data || [];
-}
-
-// BUSCAR EN EL CATALOGO: publicaciones activas del vendedor que matcheen los
-// terminos, con stock verificado EN VIVO contra ML (nunca cache viejo).
-// Busca publicaciones por SKU exacto o por SKU madre en el CACHE local (pq_items).
-// Esto es lo que resuelve las variantes: trae TODAS las publicaciones de la familia
-// (ej: AGZ52110-NEOS, AGZ52110-BLCL...), cosa que la busqueda de texto de ML no hace.
-// Devuelve [] si no encuentra, para poder caer a la busqueda por texto.
-async function buscarPorSku(cuenta, texto) {
-  const t = String(texto || '').trim().toUpperCase();
-  // ¿parece un SKU? (letras+numeros, un guion opcional). Si es una frase, no aplica.
-  const m = t.match(/^[A-Z0-9]+(?:-[A-Z0-9]+)?$/);
-  if (!m) return [];
-  const madre = skuMadre(t);
-  try {
-    const { data } = await db.from('pq_items')
-      .select('item_id, sku, skus, titulo, estado')
-      .eq('cuenta_id', cuenta.id)
-      .or(`sku.ilike.${t}%,skus.ilike.%${t}%,sku_madre.eq.${madre}`)
-      .limit(12);
-    return data || [];
-  } catch (e) { return []; }
-}
-
-async function buscarEnCatalogo(cuenta, terminos) {
-  const q = String(terminos || '').trim().slice(0, 80);
-  if (!q) return [];
-  const _cuotasTmp = new Map();
-  // 1) si parece SKU, buscamos por SKU en el cache (trae toda la familia, exacto)
-  let ids = (await buscarPorSku(cuenta, q)).map(x => x.item_id);
-  let resultados = [];
-  // 2) completamos (o reemplazamos si no hubo match de SKU) con la busqueda de texto de ML
-  if (ids.length < 3) {
+async function asistenteResolverItems(p, userId, token) {
+  if (p.item_id) return [String(p.item_id).toUpperCase().trim()];
+  const sku = String(p.sku || '').toUpperCase().trim();
+  if (!sku) return [];
+  // 1) Busqueda exacta por seller_sku
+  for (const param of ['seller_sku', 'sku']) {
     try {
-      const d = await mlGet(`/sites/MLA/search?seller_id=${cuenta.ml_user_id}&q=${encodeURIComponent(q)}&limit=6`, cuenta);
-      for (const r of (d.results || [])) {
-        if (ids.indexOf(r.id) === -1) ids.push(r.id);
-        if (r.installments && r.installments.quantity) _cuotasTmp.set(r.id, `${r.installments.quantity} cuotas de $${Math.round(r.installments.amount || 0)}`);
-      }
+      const r = await fetch(`https://api.mercadolibre.com/users/${userId}/items/search?${param}=${encodeURIComponent(sku)}&status=active`, {
+        headers: { Authorization: 'Bearer ' + token }
+      });
+      const d = await r.json();
+      if (Array.isArray(d.results) && d.results.length) return d.results.slice(0, 20);
     } catch (e) {}
   }
-  const candidatos = [];
-  for (const id of ids.slice(0, 6)) {
+  // 2) SKU MASTER/FAMILIA: si no hubo coincidencia exacta, expandir a toda la familia,
+  //    INCLUIDOS los combos que contienen el codigo (ej: "COMBO 2X BAN005-BL").
+  //    Primero buscamos las variantes en NUESTRA base (tabla ventas + catalogo
+  //    dep_productos): es instantaneo y cubre todo el catalogo.
+  try {
+    const variantes = new Set();
+    // 2a) SKUs vistos en ventas (cualquier variante o combo que se haya vendido)
     try {
-      const it = await mlGet(`/items/${id}?attributes=id,title,price,available_quantity,permalink,status`, cuenta);
-      if (it.status !== 'active') continue;
-      candidatos.push({
-        id: it.id, titulo: it.title, precio: await precioRealDe(cuenta, it.id, it.price),
-        cuotas: _cuotasTmp.get(it.id) || null,
-        stock: it.available_quantity || 0,
-        link: it.permalink || ('https://articulo.mercadolibre.com.ar/' + String(it.id).replace(/^MLA/, 'MLA-'))
-      });
-    } catch (e) { /* item puntual fallo, seguimos */ }
-  }
-  return candidatos;
-}
-
-// Averigua si un comprador YA COMPRO este producto y devuelve { compro, ordenId }.
-// Sirve para posventa y para linkear la venta en el panel. Cache 10 min por
-// comprador+item para no pedir a ML dos veces (util en el Duelo, que genera con 3 IA).
-const _compras = new Map();
-// TODAS las compras que este comprador te hizo en los ultimos 60 dias (max 5).
-// Antes buscabamos solo compras de ESTA publicacion y se escapaban casos como
-// "compre la negra y pregunto en la blanca". Cache 10 min.
-async function compradorCompras(cuenta, compradorId) {
-  if (!compradorId) return [];
-  const key = 'lista:' + cuenta.id + ':' + compradorId;
-  const hit = _compras.get(key);
-  if (hit && (Date.now() - hit.t) < 600000) return hit.v;
-  let v = [];
-  try {
-    const d = await mlGet(`/orders/search?seller=${cuenta.ml_user_id}&buyer=${compradorId}&sort=date_desc&limit=15`, cuenta);
-    const corte = Date.now() - 60 * 24 * 3600 * 1000;
-    v = (d.results || [])
-      .filter(o => o.date_created && new Date(o.date_created).getTime() >= corte)
-      .slice(0, 5)
-      .map(o => {
-        const oi = (o.order_items || [])[0] || {};
-        return { id: String(o.id), fecha: o.date_created,
-          sku: oi.item && (oi.item.seller_sku || oi.item.seller_custom_field) || null,
-          titulo: oi.item && oi.item.title ? String(oi.item.title).slice(0, 60) : null,
-          item_id: oi.item && oi.item.id || null };
-      });
-  } catch (e) {}
-  if (_compras.size > 5000) _compras.clear();
-  _compras.set(key, { v, t: Date.now() });
-  return v;
-}
-async function compradorCompro(cuenta, compradorId, itemId) {
-  const compras = await compradorCompras(cuenta, compradorId);
-  const deEste = compras.find(c => c.item_id === itemId);
-  return { compro: compras.length > 0, ordenId: (deEste || compras[0] || {}).id || null };
-}
-
-// Precio REAL de una publicacion: el de lista NO incluye las promociones.
-// Consultamos /prices y usamos la promo vigente si existe (lo que ve el comprador).
-const _precioCache = new Map();
-async function precioRealCached(cuenta, itemId, fallback) {
-  const hit = _precioCache.get(itemId);
-  if (hit && (Date.now() - hit.t) < 600000) return hit.v;
-  const v = await precioRealDe(cuenta, itemId, fallback);
-  if (_precioCache.size > 4000) _precioCache.clear();
-  _precioCache.set(itemId, { v, t: Date.now() });
-  return v;
-}
-async function precioRealDe(cuenta, itemId, fallback) {
-  try {
-    const pr = await mlGet(`/items/${itemId}/prices`, cuenta);
-    const ahora = Date.now();
-    const vigente = p => {
-      const c = p.conditions || {};
-      const st = c.start_time ? new Date(c.start_time).getTime() : -Infinity;
-      const en = c.end_time ? new Date(c.end_time).getTime() : Infinity;
-      return ahora >= st && ahora <= en;
-    };
-    const lista = (pr && pr.prices) || [];
-    const promos = lista.filter(p => p.type === 'promotion' && vigente(p)).map(p => Number(p.amount)).filter(Boolean);
-    if (promos.length) return Math.min(...promos);
-    const std = lista.find(p => p.type === 'standard' && vigente(p));
-    if (std && Number(std.amount)) return Number(std.amount);
-  } catch (e) {}
-  return fallback;
-}
-
-// Verifica EN VIVO los links de publicaciones que aparecen dentro de una regla.
-// Una regla es texto fijo, pero el stock cambia: sin esto, la IA seguiria pasando
-// el link de algo pausado o agotado. Cache 10 min para no castigar a ML.
-const _linksCache = new Map();
-async function estadoDeItem(cuenta, itemId) {
-  const key = cuenta.id + ':' + itemId;
-  const hit = _linksCache.get(key);
-  if (hit && (Date.now() - hit.t) < 600000) return hit.v;
-  let v = { ok: false, motivo: 'no se pudo verificar' };
-  try {
-    const d = await mlGet(`/items/${itemId}?attributes=id,status,available_quantity,title,price`, cuenta);
-    const stock = Number(d.available_quantity) || 0;
-    if (d.status !== 'active') v = { ok: false, motivo: d.status === 'paused' ? 'PAUSADA' : 'no activa (' + d.status + ')' };
-    else if (stock <= 0) v = { ok: false, motivo: 'SIN STOCK' };
-    else v = { ok: true, motivo: stock + ' en stock', titulo: d.title || '', precio: await precioRealDe(cuenta, itemId, d.price || null), stock };
-  } catch (e) { v = { ok: false, motivo: 'no se pudo verificar' }; }
-  if (_linksCache.size > 3000) _linksCache.clear();
-  _linksCache.set(key, { v, t: Date.now() });
-  return v;
-}
-// Devuelve el texto de las reglas con una nota al lado de cada link segun su estado real.
-async function reglasConLinksVerificados(cuenta, reglas) {
-  const linea = (r) => `- [${r.ambito === 'global' ? 'TODOS' : 'este producto'}] ${r.disparador ? '(' + r.disparador + ') ' : ''}${r.respuesta}`;
-  const salida = [];
-  for (const r of (reglas || [])) {
-    let txt = linea(r);
-    const ids = [...new Set((String(r.respuesta || '').match(/MLA-?\d{6,}/g) || []).map(x => x.replace('-', '')))];
-    for (const id of ids) {
-      const e = await estadoDeItem(cuenta, id);
-      txt += e.ok
-        ? `\n  (verificado: el link de ${id} esta DISPONIBLE, ${e.motivo} — podes pasarlo)`
-        : `\n  ATENCION: el link de ${id} esta ${e.motivo}. NO pases ese link ni ofrezcas ese producto. Usa el resto de la regla y, si hace falta, deci que por ahora no esta disponible.`;
-    }
-    salida.push(txt);
-  }
-  return salida.join('\n') || '(ninguna)';
-}
-
-// Bloque de FAMILIA: otras publicaciones nuestras del MISMO producto (por SKU madre),
-// verificadas EN VIVO (estado + stock). Se inyecta en cada pregunta para que la IA
-// pueda decir "si, lo tenemos en blanco, aca esta el link" sin salir a buscar.
-async function bloqueFamilia(cuenta, q, item) {
-  const sku = item?.sku || null;
-  const madre = skuMadre(sku);
-  if (!madre) return '';
-  let hermanas = [];
-  try {
-    const { data } = await db.from('pq_items')
-      .select('item_id, sku, skus, titulo, estado')
-      .eq('cuenta_id', cuenta.id).eq('sku_madre', madre)
-      .neq('item_id', q.item_id).limit(8);
-    hermanas = data || [];
-  } catch (e) {}
-  const lineas = [];
-  // variantes DENTRO de esta misma publicacion (color + stock ya vienen en la ficha)
-  const propias = (item?.variaciones || []).filter(v => v && (v.color || v.sku));
-  if (propias.length > 1) {
-    for (const v of propias) {
-      lineas.push(`- EN ESTA MISMA PUBLICACION: ${v.color || v.sku || 'variante'}${v.sku ? ' (SKU ' + v.sku + ')' : ''} — ${Number(v.stock) > 0 ? (v.stock + ' en stock') : 'SIN STOCK'}`);
-    }
-  }
-  // SKUs que YA estan en esta publicacion (para detectar duplicados de la misma cosa)
-  const skusAca = new Set(
-    [item?.sku, ...propias.map(v => v.sku)].filter(Boolean).map(s => String(s).toUpperCase())
-  );
-  // publicaciones hermanas (verificadas en vivo, con cache de 10 min)
-  for (const h of hermanas.slice(0, 6)) {
-    const e = await estadoDeItem(cuenta, h.item_id);
-    const skusH = h.skus || h.sku || '';
-    const listaH = String(skusH).toUpperCase().split(' ').filter(Boolean);
-    const mismo = listaH.some(s => skusAca.has(s));   // misma cosa publicada aparte (ej: con/sin cuotas)
-    const link = 'https://articulo.mercadolibre.com.ar/' + String(h.item_id).replace(/^MLA/, 'MLA-');
-    if (mismo) {
-      lineas.push(`- MISMO PRODUCTO publicado aparte (suele diferir el precio por cuotas o promos): "${(h.titulo || '').slice(0, 70)}" — ${e.ok ? `${e.motivo}${e.precio ? `, $${e.precio}` : ''}` : e.motivo}. OJO, STOCK COMPARTIDO: el stock que muestra esa publicacion es EL MISMO stock fisico que el de esta — son dos vidrieras del mismo deposito, NO unidades adicionales. JAMAS sumes los stocks de dos publicaciones del mismo SKU: el total disponible es el de UNA sola (la que mas muestre). REGLA: NO la menciones ni pases su link mientras ESTA publicacion tenga stock SUFICIENTE para la cantidad que pide. Si pide MAS unidades de las que muestra esta publicacion, NO prometas cubrirlo con la otra: deci con honestidad cuantas hay disponibles HOY (el stock de una sola publicacion) y sugerile escribirnos por mensajeria para ver plazos de reposicion por el resto. El link de la otra (${link}) va SOLO si esta publicacion esta pausada o sin stock. Si pregunta por diferencias de precio, explicale que varian por cuotas/promociones.`);
-      continue;
-    }
-    lineas.push(e.ok
-      ? `- OTRA PUBLICACION NUESTRA: "${(h.titulo || '').slice(0, 70)}" (SKUs: ${skusH}) — DISPONIBLE, ${e.motivo}${e.precio ? `, $${e.precio}` : ''} — LINK: ${link}`
-      : `- OTRA PUBLICACION NUESTRA: "${(h.titulo || '').slice(0, 70)}" (SKUs: ${skusH}) — ${e.motivo} (NO pasar este link)`);
-  }
-  if (!lineas.length) return '';
-  return `\nCOLORES Y VARIANTES DE ESTE MISMO PRODUCTO (verificado recien, USA ESTO para responder por colores/versiones):\n${lineas.join('\n')}\n- COMPRAS DE VARIOS PRODUCTOS O COLORES JUNTOS: si pregunta como comprar varias unidades o colores distintos, explicale el CARRITO de Mercado Libre: que toque "Agregar al carrito" en cada publicacion/color que quiera y al final haga UNA SOLA compra con todo el carrito. Asi la compra queda agrupada y los envios se combinan: salen mas baratos o incluso gratis segun el monto y la distancia. NUNCA le recomiendes hacer compras separadas.
-- TEXTO PLANO SIEMPRE: nada de markdown, ni asteriscos (**), ni listas con guiones. Mercado Libre muestra esos simbolos tal cual y la respuesta queda desprolija.
-- REGLA DE ORO: el comprador esta parado en ESTA publicacion. Si lo que pide esta disponible ACA (en esta publicacion o sus variantes) EN CANTIDAD SUFICIENTE, responde sobre ESTA y NO pases NINGUN link de otra publicacion. Si pide MAS unidades de las que quedan aca, SOLO ofrece otra publicacion si es de OTRO producto o variante (otro SKU): esas si tienen stock propio.\n- STOCK COMPARTIDO (MUY IMPORTANTE): dos publicaciones con el MISMO SKU muestran el MISMO stock fisico. NUNCA sumes sus stocks ni digas "entre las dos llegamos a X": el disponible real es el de UNA sola. Sumar vidrieras es prometer unidades que no existen.\n- Los links de otras publicaciones son SOLO para: un color/variante que no esta aca, o cuando aca no hay stock.\n- Si preguntan por un color/variante que figura DISPONIBLE en otra publicacion, ofrecelo con su LINK (es una venta).\n- Cuando ofrezcas otra publicacion nuestra, menciona tambien su PRECIO (y las cuotas, si figuran en los datos): al comprador le sirve para decidir.\n- Si NO figura en esta lista ni en la ficha, recien ahi podes decir que por ahora no lo tenemos.\n`;
-}
-
-// PARCHE PUBLICACION PAUSADA: ML no deja responder preguntas de publicaciones
-// pausadas. Truco de vendedor, automatizado: si esta pausada -> le aseguramos
-// 1 de stock -> la activamos un instante -> respondemos -> la volvemos a pausar
-// -> y dejamos el stock como estaba. Si algo falla al volver, avisamos fuerte.
-// Vendedores MULTI-DEPOSITO (como PONTEC): el stock no vive en la publicacion
-// sino en /user-products repartido por deposito. Spec oficial de ML:
-// - GET /user-products/{up}/stock devuelve las ubicaciones Y el header x-version
-// - PUT /user-products/{up}/stock/type/seller_warehouse (header x-version, body
-//   {locations:[{store_id, quantity}]}) modifica SOLO depositos del vendedor.
-async function _upStockGet(cuenta, upId) {
-  const token = await getAccessToken(cuenta);
-  const r = await fetch(`https://api.mercadolibre.com/user-products/${upId}/stock`, {
-    headers: { Authorization: 'Bearer ' + token }
-  });
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error('ML GET /user-products/' + upId + '/stock -> ' + r.status + ' ' + JSON.stringify(data).slice(0, 200));
-  return { data, version: r.headers.get('x-version') };
-}
-async function _upStockSet(cuenta, upId, store, quantity) {
-  // La forma de escribir stock varia segun la configuracion de la cuenta.
-  // Probamos las variantes documentadas EN ORDEN y usamos la que ML acepte:
-  //  1) selling_address {quantity}            <- deposito propio = direccion de venta (stock distribuido)
-  //  2) seller_warehouse {quantity}           <- un solo deposito propio
-  //  3) seller_warehouse {locations:[store]}  <- multi-origen (varios locales)
-  //  4) idem + network_node_id
-  const intentos = [
-    { path: '/stock/type/selling_address', body: { quantity: Number(quantity) } },
-    { path: '/stock/type/seller_warehouse', body: { quantity: Number(quantity) } },
-    { path: '/stock/type/seller_warehouse', body: { locations: [{ store_id: String(store && store.id || ''), quantity: Number(quantity) }] } },
-    { path: '/stock/type/seller_warehouse', body: { locations: [{ store_id: String(store && store.id || ''), network_node_id: store && store.network_node_id || undefined, quantity: Number(quantity) }] } }
-  ];
-  const errores = [];
-  for (const intento of intentos) {
-    for (let vuelta = 0; vuelta < 2; vuelta++) {
-      const { version } = await _upStockGet(cuenta, upId);
-      const token = await getAccessToken(cuenta);
-      const r = await fetch(`https://api.mercadolibre.com/user-products/${upId}${intento.path}`, {
-        method: 'PUT',
-        headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json', 'x-version': String(version || '') },
-        body: JSON.stringify(intento.body)
-      });
-      const data = await r.json().catch(() => ({}));
-      if (r.ok) return data;
-      if (r.status === 409 && vuelta === 0) continue;   // version vieja: refrescar y reintentar
-      errores.push(intento.path.split('/').pop() + ': ' + r.status + ' ' + JSON.stringify(data).slice(0, 120));
-      break;
-    }
-  }
-  throw new Error('ML stock: ninguna variante acepto la escritura -> ' + errores.join(' | '));
-}
-
-async function _bumpStockMultiDeposito(cuenta, itemId) {
-  const info = await mlGet(`/items/${itemId}?attributes=id,user_product_id,variations`, cuenta);
-  const upId = (info.variations && info.variations[0] && info.variations[0].user_product_id) || info.user_product_id;
-  if (!upId) throw new Error('multideposito: no encontre el user_product_id de la publicacion');
-  // 1) TUS depositos reales (Mis depositos en ML): de aca salen los ids validos para escribir
-  const tiendas = await mlGet(`/users/${cuenta.ml_user_id}/stores/search?tags=stock_location`, cuenta);
-  const stores = (tiendas.results || []).filter(s => s.status === 'active');
-  if (!stores.length) throw new Error('multideposito: no encontre depositos propios activos en la cuenta');
-  // 2) stock actual de esta publicacion por ubicacion (solo depositos propios, nunca Full)
-  const { data: st } = await _upStockGet(cuenta, upId);
-  const locs = ((st && st.locations) || []).filter(l => l.type === 'seller_warehouse');
-  if (locs.some(l => Number(l.quantity) > 0)) return null;   // ya hay stock propio en algun deposito
-  // 3) elegir el deposito: el que matchee una ubicacion existente de esta publicacion;
-  //    si la publicacion no tiene ubicaciones inicializadas, el primer deposito activo
-  let store = null;
-  for (const l of locs) {
-    const m = stores.find(s =>
-      String(s.id) === String(l.store_id) ||
-      String(s.network_node_id) === String(l.network_node_id) ||
-      String(s.network_node_id) === String(l.store_id));
-    if (m) { store = m; break; }
-  }
-  if (!store) store = stores[0];
-  await _upStockSet(cuenta, upId, store, 1);
-  return { tipo: 'up', upId, store: { id: String(store.id), network_node_id: store.network_node_id || null }, antes: 0 };
-}
-
-async function responderEnML(cuenta, questionId, texto, itemId) {
-  let textoFinal = String(texto || '').trim();
-  const enviar = () => mlPost('/answers', { question_id: Number(questionId), text: textoFinal }, cuenta);
-  if (!itemId) { await enviar(); return { reactivada: false, texto: textoFinal }; }
-  let it = null;
-  try { it = await mlGet(`/items/${itemId}?attributes=id,status,available_quantity,variations`, cuenta); } catch (e) {}
-  if (!it || it.status !== 'paused') { await enviar(); return { reactivada: false, texto: textoFinal }; }
-
-  // La publicacion esta pausada = sin stock: la respuesta ARRANCA avisandolo,
-  // salvo que el texto ya lo mencione (para no repetirlo).
-  if (!/(sin stock|nos quedamos|agotad|reposici|no tenemos stock|pausad)/i.test(textoFinal)) {
-    const cuerpo = textoFinal.replace(/^\s*[¡!]*hola[\s,!.:-]*/i, '');
-    textoFinal = '¡Hola! Lamentablemente en este momento nos quedamos sin stock de este producto. ' + cuerpo;
-  }
-
-  // 1) armar la activacion: si no hay stock, el stock y el estado van JUNTOS
-  //    en el mismo pedido (ML rechaza "activar sin stock" si van separados)
-  let stockTocado = null;   // que restaurar despues
-  const bodyAct = { status: 'active' };
-  if (it.variations && it.variations.length) {
-    const conStock = it.variations.some(v => Number(v.available_quantity) > 0);
-    if (!conStock) {
-      const v0 = it.variations[0];
-      bodyAct.variations = [{ id: v0.id, available_quantity: 1 }];
-      stockTocado = { tipo: 'var', id: v0.id, antes: Number(v0.available_quantity) || 0 };
-    }
-  } else if (!(Number(it.available_quantity) > 0)) {
-    bodyAct.available_quantity = 1;
-    stockTocado = { tipo: 'item', antes: Number(it.available_quantity) || 0 };
-  }
-  // 2) activar un instante
-  try {
-    await mlPut(`/items/${itemId}`, bodyAct, cuenta);
-  } catch (e1) {
-    if (/not_updatable|multi warehouse/i.test(e1.message)) {
-      // VENDEDOR MULTI-DEPOSITO: el stock no va en el item.
-      // Primero probamos activar sola (quizas hay stock en algun deposito);
-      // si ML dice "sin stock", ponemos 1 unidad en un deposito propio y reintentamos.
-      stockTocado = null;
-      try {
-        await mlPut(`/items/${itemId}`, { status: 'active' }, cuenta);
-      } catch (e2) {
-        if (/without stock|out_of_stock|sin stock/i.test(e2.message)) {
-          stockTocado = await _bumpStockMultiDeposito(cuenta, itemId);
-          await mlPut(`/items/${itemId}`, { status: 'active' }, cuenta);
-        } else { throw e2; }
+      const { data: vs } = await supabase.from('ventas').select('sku')
+        .eq('user_id', String(userId)).ilike('sku', '%' + sku + '%').limit(2000);
+      for (const v of (vs || [])) {
+        const s = String(v.sku || '').toUpperCase().trim();
+        if (_skuEsFamilia(s, sku)) variantes.add(s);
       }
-    } else if (stockTocado) {
-      // plan B clasico: primero el stock, despues el estado
-      if (stockTocado.tipo === 'var') await mlPut(`/items/${itemId}`, { variations: [{ id: stockTocado.id, available_quantity: 1 }] }, cuenta);
-      else await mlPut(`/items/${itemId}`, { available_quantity: 1 }, cuenta);
-      await mlPut(`/items/${itemId}`, { status: 'active' }, cuenta);
-    } else { throw e1; }
-  }
-  // ML tarda en propagar la activacion. En vez de adivinar el tiempo,
-  // VERIFICAMOS: consultamos la publicacion hasta que ML la muestre ACTIVA
-  // (hasta 30s), y recien ahi respondemos, con reintentos (hasta ~25s mas).
-  const dormir = (ms) => new Promise(r => setTimeout(r, ms));
-  for (let i = 0; i < 6; i++) {
-    await dormir(5000);
-    try {
-      const chk = await mlGet(`/items/${itemId}?attributes=id,status`, cuenta);
-      if (chk && chk.status === 'active') break;   // ML ya la ve activa: adelante
     } catch (e) {}
-  }
-  let errEnvio = null;
-  for (let intento = 1; intento <= 5; intento++) {
-    try { await enviar(); errEnvio = null; break; }
-    catch (e) {
-      errEnvio = e;
-      // solo reintentamos si el motivo es que ML aun la ve inactiva
-      if (!/not_active_item/i.test(e.message) || intento === 5) break;
-      await dormir(5000);
+    // 2b) Catalogo de productos de App Deposito (incluye variantes nunca vendidas)
+    try {
+      const { data: ps } = await supabase.from('dep_productos').select('sku').ilike('sku', '%' + sku + '%').limit(2000);
+      for (const v of (ps || [])) {
+        const s = String(v.sku || '').toUpperCase().trim();
+        if (_skuEsFamilia(s, sku)) variantes.add(s);
+      }
+    } catch (e) {}
+
+    if (variantes.size) {
+      // Resolver cada variante exacta contra ML (en paralelo, solo activas)
+      const lista = Array.from(variantes).slice(0, 30);
+      const porVariante = await Promise.all(lista.map(async (vs) => {
+        try {
+          const r = await fetch(`https://api.mercadolibre.com/users/${userId}/items/search?seller_sku=${encodeURIComponent(vs)}&status=active`, {
+            headers: { Authorization: 'Bearer ' + token }
+          });
+          const d = await r.json();
+          return Array.isArray(d.results) ? d.results : [];
+        } catch (e) { return []; }
+      }));
+      const ids = new Set();
+      porVariante.forEach(arr => arr.forEach(id => ids.add(String(id).toUpperCase())));
+      if (ids.size) {
+        console.log(`[ASIS-FAMILIA] "${sku}" expandio via base a ${variantes.size} variante(s) → ${ids.size} publicacion(es) activas`);
+        return Array.from(ids).slice(0, 20);
+      }
     }
-  }
-  // 3) volver a pausar SIEMPRE (aunque el envio haya fallado)
-  let repausada = true;
-  try { await mlPut(`/items/${itemId}`, { status: 'paused' }, cuenta); } catch (e) { repausada = false; }
-  // 4) restaurar el stock original si lo tocamos
-  if (stockTocado) {
-    try {
-      if (stockTocado.tipo === 'var') await mlPut(`/items/${itemId}`, { variations: [{ id: stockTocado.id, available_quantity: stockTocado.antes }] }, cuenta);
-      else if (stockTocado.tipo === 'up') await _upStockSet(cuenta, stockTocado.upId, stockTocado.store, stockTocado.antes);
-      else await mlPut(`/items/${itemId}`, { available_quantity: stockTocado.antes }, cuenta);
-    } catch (e) {}
-  }
-  if (errEnvio) {
-    if (!repausada) errEnvio.message += ' | ATENCION: la publicacion ' + itemId + ' quedo ACTIVA (no pude volver a pausarla). Pausala a mano.';
-    throw errEnvio;
-  }
-  if (!repausada) throw new Error('La respuesta SE ENVIO, pero no pude volver a pausar la publicacion ' + itemId + ': quedo ACTIVA. Pausala a mano.');
-  return { reactivada: true, texto: textoFinal };
-}
+  } catch (e) { console.error('[ASIS-FAMILIA-BASE] error:', e.message); }
 
-async function generarRespuesta(cuenta, q, item, hilo, modeloOverride, esPrueba) {
-  const cfg = configDe(cuenta);
-  // que IA usar: override (Duelo) o la elegida para la cuenta (worker normal)
-  const modelo = modeloOverride || modeloDe(cfg.ia_responde);
-  const _u = { in: 0, cacheWrite: 0, cacheRead: 0, out: 0 }; // acumula tokens de todas las pasadas
-  const _acc = (r) => { _u.in += r.usage.in; _u.cacheWrite += r.usage.cacheWrite; _u.cacheRead += r.usage.cacheRead; _u.out += r.usage.out; return r.texto; };
-  const sku = item?.sku || null;
-  const madre = skuMadre(sku);
-
-  // reglas: traigo las de la cuenta y filtro en JS por el modo de cada una
-  // (soporta: exacto, madre, publicacion/item, prefijo "empieza con", lista con comas, global)
-  const { data: reglasTodas } = await db.from('pq_reglas')
-    .select('*').eq('cuenta_id', cuenta.id).eq('activa', true)
-    .order('prioridad', { ascending: false });
-  const reglas = (reglasTodas || []).filter(r => reglaAplica(r, { sku, madre, item_id: q.item_id }));
-
-  // HISTORIAL INTELIGENTE: traigo hasta 80 candidatos de la familia y me quedo
-  // con los 12 mas parecidos a la pregunta actual (por palabras en comun)
-  let historial = [];
-  if (madre || q.item_id) {
-    const condsHist = [];
-    if (madre) condsHist.push('sku_madre.eq.' + madre);
-    if (q.item_id) condsHist.push('item_id.eq.' + q.item_id);
-    const { data: h } = await db.from('pq_preguntas')
-      .select('texto, ia_respuesta, respuesta_real, correccion, calificacion')
-      .eq('cuenta_id', cuenta.id)
-      .or(condsHist.join(','))
-      .or('respuesta_real.not.is.null,calificacion.eq.bien,correccion.not.is.null')
-      .order('fecha_pregunta', { ascending: false })
-      .limit(80);
-    const cand = h || [];
-    const tp = new Set(tokens(q.texto));
-    historial = cand
-      .map(x => ({ x, s: similitud(tp, x.texto) }))
-      .sort((a, b) => b.s - a.s)
-      .slice(0, 12)
-      .map(e => e.x);
-  }
-
-  const estilo = cuenta.estilo_venta || '';
-  const preciosDifieren = new Set((item?.variaciones || []).map(v => v.precio).filter(p => p != null)).size > 1;
-  const stockTxt = (item?.variaciones || [])
-    .map(v => `- ${v.color || 'unica variante'}: ${v.stock > 0 ? v.stock + ' en stock' : 'SIN STOCK'}${v.sku ? ' (SKU ' + v.sku + ')' : ''}${preciosDifieren && v.precio != null ? ' — $' + v.precio : ''}`).join('\n');
-  const reglasTxt = await reglasConLinksVerificados(cuenta, reglas);
-  const histTxt = historial.map(h => `P: ${h.texto}\nR: ${h.correccion || h.respuesta_real || h.ia_respuesta}`).join('\n---\n') || '(sin historial todavia)';
-  const hiloTxt = (hilo || []).map(h => `Comprador: ${h.texto}\nVendedor: ${h.correccion || h.respuesta_real || h.ia_respuesta || '(sin respuesta aun)'}`).join('\n---\n');
-  const atributosTxt = item?.atributos
-    ? Object.entries(item.atributos).slice(0, 40).map(([k, v]) => `- ${k}: ${v}`).join('\n')
-    : '';
-
-  // PROMPT EN BLOQUES CON CACHE:
-  //  bloque 1 (por cuenta, estable): instrucciones + estilo + saludos
-  //  bloque 2 (por producto, estable mientras no cambie): ficha + stock + reglas + historial
-  //  user (varia siempre): hilo del comprador + pregunta
-  const bloqueInstrucciones = {
-    type: 'text',
-    text:
-`Sos el asistente de respuestas de un vendedor de Mercado Libre en Argentina.
-Redacta la respuesta a una pregunta de un comprador, como la escribiria el vendedor.
-REGLAS:
-- Usa SOLO la informacion que te paso (producto, ficha tecnica, stock, reglas, historial, conversacion previa). No inventes datos ni precios.
-- Respeta SIEMPRE las reglas fijas.
-- Si preguntan por un color/variante, mira el stock real: si hay, ofrecelo; si no, decilo y ofrece alternativa.
-- Las VARIANTES listadas abajo son TODAS las opciones existentes de esta publicacion (colores, modelos, acabados). ANTES de negar que exista una opcion, verifica esa lista: si el comprador pregunta por una opcion que figura ahi, existe.
-- Si hay CONVERSACION PREVIA con este comprador, LEE TODO EL HILO y entende de que venia hablando ANTES de responder. No te enganches con una sola palabra: identifica de que PARTE o TEMA del producto habla (ej: capota, manija, rueda, freno, tela) y responde a ESO. Si no te queda claro a que parte se refiere, NO adivines: marca confianza "baja" y pedile amablemente que aclare a que parte del producto se refiere.
-- Si el comprador parece molesto o insatisfecho con respuestas anteriores, marca confianza "baja" para que lo atienda una persona.
-- POSVENTA: si el comprador reporta un PROBLEMA FISICO del producto (algo no engancha, no entra, se cae, vino fallado, roto, incompleto, le falta una pieza, no puede armar/colocar una parte), eso NO se resuelve con informacion: marca "necesita_posventa": true. NO afirmes que "es asi de fabrica" ni cierres el tema; hay que derivarlo a atencion.
-- LINKS: siempre que ofrezcas un producto NUESTRO DISPONIBLE que NO esta en esta publicacion, pasa su LINK completo (copiado TAL CUAL te lo damos, nunca inventado). PERO si lo que pide esta disponible EN ESTA publicacion, no pases links de otras: que compre aca mismo. Si un link viene marcado como SIN STOCK o PAUSADA, NO lo pases.
-- IMPORTANTISIMO (colores y variantes): en esta cuenta cada color o variante suele estar en una PUBLICACION SEPARADA. NUNCA afirmes que un color/medida/variante "no existe", "no lo tenemos" o "no hay version en X" mirando solo esta publicacion: primero completa "busca_producto" para revisar el catalogo. Que no este en ESTA publicacion NO significa que no lo vendamos.
-- Si la info no alcanza para responder con seguridad, decilo con honestidad y marca confianza "baja". NUNCA adivines.
-- MENSAJERIA INTERNA (NO derivar): quien hace una PREGUNTA todavia no compro, y la mensajeria interna de Mercado Libre SOLO existe DESPUES de la compra. Por eso NUNCA le digas que te escriba "por la mensajeria interna" ni "desde el detalle de tu compra/publicacion": no tiene ese canal. Si te falta un dato o no podes confirmar algo, decilo con honestidad y ofrece confirmarlo por ACA (respondiendo su consulta); nunca lo mandes a un canal que no puede usar.
-${(cfg.msg_sin_dato || '').trim() ? `- IMPORTANTE: si te falta un dato del producto para responder, basa tu respuesta en esta plantilla del vendedor: "${cfg.msg_sin_dato.trim()}"${/mensajer|detalle de (tu|su|la) (compra|publicaci)/i.test(cfg.msg_sin_dato) ? '. PERO como es una PREGUNTA (preventa) y el comprador NO tiene mensajeria interna, OMITI la parte de la plantilla que lo manda a escribir por la mensajeria interna o al detalle de la compra, y en su lugar ofrece confirmar el dato por ACA.' : ' (podes usarla tal cual).'}` : ''}
-- SALUDO DE INICIO: ${(cfg.saludo_inicial || '').trim()
-    ? `empeza la respuesta EXACTAMENTE con "${cfg.saludo_inicial.trim()}" y segui directo con la respuesta. NO agregues ninguna presentacion tuya extra al principio (no digas "soy el asistente...", no te presentes de nuevo, no pongas otro saludo).`
-    : `arranca directo con la respuesta, sin ningun saludo al principio.`}
-- CIERRE: ${(cfg.saludo_final || '').trim()
-    ? `termina la respuesta EXACTAMENTE con "${cfg.saludo_final.trim()}". No repitas el saludo del inicio ni firmes dos veces.`
-    : `no agregues ningun cierre ni firma al final.`}
-- Estilo de venta: ${estilo}
-Responde UNICAMENTE con un JSON valido, sin texto extra:
-{"respuesta":"...","confianza":"alta|media|baja","fuente":"regla|historial|descripcion|ficha|stock|conversacion|imagenes|general|catalogo|posventa","dato_faltante":"si confianza es baja por falta de un dato del producto, nombra ESE dato en pocas palabras (ej: peso que soporta, medidas, si incluye X, compatibilidad). Si no aplica, deja \\"\\".","busca_producto":"2-5 palabras para buscar en el catalogo del vendedor. Usalo en DOS casos: (1) pide OTRO producto distinto (otro modelo, un repuesto, un combo); (2) pide OTRO COLOR, MEDIDA o VARIANTE de ESTE MISMO producto que no figura en esta publicacion (ej: pregunta si lo hay en blanco pero aca solo esta el negro). En el caso (2) busca por el nombre corto del producto + el color pedido (ej: rack tv blanco). Si no aplica, deja \\"\\".","necesita_posventa":"true SOLO si el comprador reporta un problema fisico del producto (no engancha/no entra/se cae/vino fallado/roto/incompleto/falta pieza/no puede armar una parte). Si no aplica, false.","pide_cantidad":"si el comprador pide o pregunta por una CANTIDAD concreta de unidades de ESTE producto (ej: 'necesito 4', 'tenes 10?', 'quiero llevar 6'), pone aca SOLO el numero. Si no menciona cantidad, deja \\"\\"."}`,
-    cache_control: { type: 'ephemeral' }
-  };
-
-  const bloqueProducto = {
-    type: 'text',
-    text:
-`PRODUCTO: ${item?.titulo || '(desconocido)'} (SKU ${sku || 's/d'})
-FICHA TECNICA:
-${atributosTxt || '(sin ficha)'}
-DESCRIPCION:
-${(item?.descripcion || '').slice(0, 1500)}
-
-VARIANTES DE ESTA PUBLICACION (todas las opciones que existen) Y SU STOCK:
-${stockTxt || '(sin datos)'}
-NOTA DE REPOSICION: ${item?.nota_reposicion || '(ninguna)'}
-
-REGLAS FIJAS:
-${reglasTxt}
-
-ASI RESPONDIMOS ANTES EN ESTE PRODUCTO (lo mas parecido a la pregunta actual):
-${histTxt}`,
-    cache_control: { type: 'ephemeral' }
-  };
-
-  const famTxt = await bloqueFamilia(cuenta, q, item);
-  // ¿la publicacion tiene OFERTA vigente? -> motivador de venta
-  let ofertaTxt = '';
+  // 2c) Ultimo recurso: barrido del catalogo activo de ML (lento, tope 1000 publicaciones)
   try {
-    const base = await mlGet(`/items/${q.item_id}?attributes=price`, cuenta);
-    const real = await precioRealDe(cuenta, q.item_id, base.price);
-    if (base && base.price && real && Number(real) < Number(base.price)) {
-      ofertaTxt = `OFERTA VIGENTE EN ESTA PUBLICACION: hoy $${real} (precio de lista $${base.price}). Mencionala como motivacion para cerrar la venta cuando sume (ej: "aprovecha que justo ahora esta con descuento"), SIN inventar porcentajes ni plazos ni decir hasta cuando dura.\n\n`;
-    }
-  } catch (e) {}
-  const userTexto =
-`${hiloTxt ? `CONVERSACION PREVIA CON ESTE COMPRADOR (mismo producto, ultimos dias):\n${hiloTxt}\n\n` : ''}${famTxt}${ofertaTxt}PREGUNTA DEL COMPRADOR:
-${q.texto}`;
-
-  const systemBlocks = [bloqueInstrucciones, bloqueProducto];
-
-  // PRIMERA PASADA: solo texto
-  let ia = parsearJson(_acc(await llamarIA(modelo, systemBlocks, userTexto)));
-  let usoImagenes = 0;
-
-  // CASCADA DE CATALOGO: el comprador pide OTRO producto -> lo buscamos en el
-  // catalogo con stock en vivo y regeneramos la respuesta con esa info.
-  if (ia.busca_producto && String(ia.busca_producto).trim()) {
-    try {
-      const candidatos = await buscarEnCatalogo(cuenta, ia.busca_producto);
-      const conStock = candidatos.filter(c => c.stock > 0);
-      const sinStock = candidatos.filter(c => c.stock <= 0);
-      const catTxt = [
-        conStock.length ? 'DISPONIBLES AHORA (podes ofrecerlos CON su link):\n' + conStock.map(c => `- ${c.titulo} — $${c.precio}${c.cuotas ? ` (${c.cuotas})` : ''} — ${c.stock} en stock — LINK: ${c.link}`).join('\n') : '',
-        sinStock.length ? 'SIN STOCK (NO pasar link; si es lo que pide, decir que por ahora no esta disponible y que van a reponer):\n' + sinStock.map(c => `- ${c.titulo}`).join('\n') : '',
-        !candidatos.length ? '(no se encontro ese producto en el catalogo: decir con honestidad que no lo tenemos publicado por ahora)' : ''
-      ].filter(Boolean).join('\n\n');
-      const contenidoCat = userTexto + `\n\nEL COMPRADOR PIDE OTRO PRODUCTO O UNA VARIANTE (otro color/medida) QUE NO ESTA EN ESTA PUBLICACION. BUSQUE EN EL CATALOGO DEL VENDEDOR (stock verificado recien):\n${catTxt}\n\nREGLAS PARA ESTA RESPUESTA:\n- SOLO ofrece y pasa el LINK de productos de la lista DISPONIBLES AHORA (copia el link tal cual).\n- NUNCA pases link de algo sin stock ni inventes links.\n- Si el producto exacto que pide esta sin stock o no aparece, decilo con honestidad (\"por ahora no lo tenemos disponible\") e invita a seguir la publicacion o consultar mas adelante. Si hay una alternativa MUY similar con stock, podes ofrecerla.\n- Si el comprador preguntaba por un COLOR o VARIANTE y aparece en DISPONIBLES AHORA, ofrecelo y pasale el link: es una venta. Solo deci que no lo tenemos si de verdad no aparece.\n- Si no estas seguro de que el producto encontrado sea EXACTAMENTE lo que pide, confianza \"media\".`;
-      const ia3 = parsearJson(_acc(await llamarIA(modelo, systemBlocks, contenidoCat)));
-      if (ia3 && ia3.respuesta) { ia = ia3; ia.fuente = 'catalogo'; }
-    } catch (e) { /* si falla la busqueda, queda la primera respuesta */ }
-  }
-
-  // CASCADA DE STOCK HERMANO: el comprador pide MAS unidades de las que tiene
-  // ESTA publicacion (tipico: publicacion Full con pocas unidades, pero hay
-  // otra publicacion nuestra del mismo producto con stock de deposito).
-  // Buscamos publicaciones hermanas EN VIVO y ofrecemos el link de la que alcanza.
-  const _cant = parseInt(ia.pide_cantidad, 10) || 0;
-  if (_cant > 0 && item) {
-    const stockAca = (item.variantes || []).reduce((s, v) => s + (Number(v.stock) || 0), 0);
-    if (stockAca >= 0 && _cant > stockAca) {
-      try {
-        const terminos = (item.titulo || '').split(' ').slice(0, 5).join(' ') || (item.sku || '');
-        const candidatos = (await buscarEnCatalogo(cuenta, terminos))
-          .filter(c => c.id !== q.item_id && c.stock > 0)
-          .sort((a, b) => b.stock - a.stock);
-        const alcanza = candidatos.filter(c => c.stock >= _cant);
-        const parcial = candidatos.filter(c => c.stock < _cant);
-        if (candidatos.length) {
-          const lista = (arr) => arr.map(c => `- ${c.titulo} — $${c.precio} — ${c.stock} en stock — LINK: ${c.link}`).join('\n');
-          const guiaStock = userTexto + `\n\nSITUACION DE STOCK: el comprador pide ${_cant} unidades y ESTA publicacion tiene solo ${stockAca}. PERO tenemos OTRAS publicaciones nuestras del mismo producto (stock verificado recien):\n` +
-            (alcanza.length ? `\nCON STOCK SUFICIENTE (ofrece ESTA opcion con su link, copialo tal cual):\n${lista(alcanza)}\n` : '') +
-            (!alcanza.length && parcial.length ? `\nCON STOCK PARCIAL (entre esta publicacion y estas puede llegar a juntar las ${_cant}):\n${lista(parcial)}\n` : '') +
-            `\nREGLAS PARA ESTA RESPUESTA:\n- Primero deci con claridad cuantas hay en ESTA publicacion (${stockAca}).\n- Despues ofrece la publicacion hermana CON SU LINK para completar las ${_cant} unidades (solo si tiene stock suficiente o ayuda a completar).\n- NUNCA inventes links ni stock. Solo usa los de la lista.\n- Tono vendedor y resolutivo: la idea es NO perder la venta de ${_cant} unidades. Confianza "alta" si la solucion es clara.`;
-          const iaS = parsearJson(_acc(await llamarIA(modelo, systemBlocks, guiaStock)));
-          if (iaS && iaS.respuesta) { ia = iaS; ia.fuente = 'stock_hermano'; }
+    const familia = new Set();
+    let offset = 0;
+    while (offset < 1000) { // recorre el catalogo activo (paginado de a 100)
+      const r = await fetch(`https://api.mercadolibre.com/users/${userId}/items/search?status=active&limit=100&offset=${offset}`, {
+        headers: { Authorization: 'Bearer ' + token }
+      });
+      const d = await r.json();
+      const ids = Array.isArray(d.results) ? d.results : [];
+      if (!ids.length) break;
+      // Traer los seller_sku de este lote (multiget de a 20)
+      for (let i = 0; i < ids.length; i += 20) {
+        const lote = ids.slice(i, i + 20);
+        const rm = await fetch(`https://api.mercadolibre.com/items?ids=${lote.join(',')}&attributes=id,seller_custom_field,attributes,variations`, {
+          headers: { Authorization: 'Bearer ' + token }
+        });
+        const dm = await rm.json();
+        for (const it of (Array.isArray(dm) ? dm : [])) {
+          const b = it.body || {};
+          // seller_sku puede venir en seller_custom_field, en attributes (SELLER_SKU) o en las variantes
+          const skus = [];
+          if (b.seller_custom_field) skus.push(String(b.seller_custom_field));
+          if (Array.isArray(b.attributes)) {
+            const a = b.attributes.find(x => x.id === 'SELLER_SKU');
+            if (a && a.value_name) skus.push(String(a.value_name));
+          }
+          if (Array.isArray(b.variations)) {
+            for (const v of b.variations) {
+              if (Array.isArray(v.attributes)) {
+                const av = v.attributes.find(x => x.id === 'SELLER_SKU');
+                if (av && av.value_name) skus.push(String(av.value_name));
+              }
+            }
+          }
+          const esFam = skus.some(s => _skuEsFamilia(s, sku));
+          if (esFam && b.id) familia.add(String(b.id).toUpperCase());
         }
-      } catch (e) { /* si falla la busqueda, queda la respuesta anterior */ }
-    }
-  }
-
-  // CASCADA DE POSVENTA: el comprador reporta un problema fisico (no se resuelve
-  // con info). Chequeamos si YA COMPRO este producto para derivarlo bien:
-  //  - si compro  -> mensajeria interna DESDE EL DETALLE DE SU COMPRA
-  //  - si no compro -> NO existe "su compra": respondemos sin mandarlo ahi
-  const pideePosventa = ia.necesita_posventa === true || String(ia.necesita_posventa) === 'true';
-  if (pideePosventa) {
-    try {
-      const { compro } = await compradorCompro(cuenta, q.comprador_id, q.item_id);
-      const guia = compro
-        ? `EL COMPRADOR YA COMPRO ESTE PRODUCTO. Es un tema de posventa. Redacta una respuesta con TACTO:\n- Reconoce su problema (no lo minimices ni digas "es asi de fabrica").\n- Explicale que para resolverlo, nos escriba por la MENSAJERIA INTERNA de Mercado Libre DESDE EL DETALLE DE SU COMPRA, que ahi lo ayudamos.\n- No prometas resultados; solo abri el canal de ayuda. Confianza "alta".`
-        : `EL COMPRADOR NO FIGURA COMO COMPRADOR (es una pregunta publica, todavia no compro). NO lo mandes a "el detalle de tu compra" porque no tiene ninguna. Redacta con TACTO:\n- Reconoce su consulta y responde lo mejor posible con la info del producto.\n- Si el problema requiere tener el producto en la mano (armado, una pieza que no engancha, un posible defecto), aclarale que una vez realizada la compra podra escribirnos por la mensajeria interna desde el detalle de su compra y lo ayudamos. Confianza "media".`;
-      const contenidoPv = userTexto + `\n\n${guia}`;
-      const iaPv = parsearJson(_acc(await llamarIA(modelo, systemBlocks, contenidoPv)));
-      if (iaPv && iaPv.respuesta) { ia = iaPv; ia.fuente = 'posventa'; }
-    } catch (e) { /* si falla el chequeo, queda la respuesta anterior */ }
-  }
-
-  // CASCADA CON IMAGENES: si la confianza quedo baja y el producto tiene fotos,
-  // segunda pasada mirando las imagenes (solo cuando hace falta, para cuidar costo)
-  const fotos = (item?.imagenes || []).slice(0, 3);
-  if (ia.confianza === 'baja' && fotos.length) {
-    try {
-      const contenidoConFotos = [
-        ...fotos.map(u => ({ type: 'image', source: { type: 'url', url: u } })),
-        { type: 'text', text: userTexto + '\n\n(La informacion de texto no alcanzo. MIRA LAS IMAGENES del producto: si en ellas se ve la respuesta (color, forma, que incluye, medidas visibles, detalles), usala. Si tampoco se ve, confianza "baja".)' }
-      ];
-      const ia2 = parsearJson(_acc(await llamarIA(modelo, systemBlocks, contenidoConFotos)));
-      usoImagenes = 1;
-      const rango = { alta: 3, media: 2, baja: 1 };
-      if ((rango[ia2.confianza] || 0) > (rango[ia.confianza] || 0)) {
-        ia = ia2; ia.fuente = 'imagenes';
       }
-    } catch (e) { /* si falla la pasada con fotos, queda la primera */ }
-  }
-
-  // registrar consumo (control de costo por cuenta; si falla no rompe nada)
-  // en pruebas (Duelo / Comparador) NO se registra, para no ensuciar contadores
-  if (!esPrueba) {
-    try { await db.rpc('pq_sumar_uso', { p_cuenta: cuenta.id, p_imagenes: usoImagenes }); } catch (e) {}
-  }
-
-  // META de costo: modelo + tokens (con desglose de cache) + costo real de ESTA respuesta
-  ia._meta = {
-    modelo,
-    inTok: _u.in + _u.cacheWrite + _u.cacheRead,  // total de entrada (para mostrar)
-    outTok: _u.out,
-    cacheRead: _u.cacheRead,
-    costo: costoUSD(modelo, _u)
-  };
-  return ia;
+      offset += 100;
+      const total = (d.paging && d.paging.total) || 0;
+      if (offset >= total) break;
+    }
+    if (familia.size) {
+      console.log(`[ASIS-FAMILIA] "${sku}" expandio a ${familia.size} publicacion(es)`);
+      return Array.from(familia).slice(0, 20);
+    }
+  } catch (e) { console.error('[ASIS-FAMILIA] error:', e.message); }
+  return [];
 }
 
-// Procesa una pregunta: arma hilo, genera respuesta y decide su destino
-// (demo/revision o programada para envio automatico).
-// Apodo publico del comprador (cache en memoria para no repetir llamadas)
-const _nicks = new Map();
-async function nickComprador(cuenta, compradorId) {
-  if (!compradorId) return null;
-  if (_nicks.has(compradorId)) return _nicks.get(compradorId);
+// Consulta de ventas propias (solo lectura, desde la base de MargenML)
+async function asistenteVentas(p, userId) {
   try {
-    const u = await mlGet('/users/' + compradorId, cuenta);
-    const nick = u.nickname || null;
-    if (_nicks.size > 5000) _nicks.clear();
-    _nicks.set(compradorId, nick);
-    return nick;
+    const dias = Math.min(Math.max(parseInt(p.dias) || 30, 1), 365);
+    const desde = new Date(Date.now() - dias * 864e5).toISOString();
+    const sku = p.sku ? String(p.sku).toUpperCase().trim() : null;
+    let rows = [], off = 0;
+    while (off < 6000) {
+      let q = supabase.from('ventas')
+        .select('sku,unidades,precio,comision,costo_envio,precio_comprador_envio,costo_congelado,costo_financiero,estado')
+        .eq('user_id', String(userId)).gte('fecha', desde).range(off, off + 999);
+      if (sku) q = q.ilike('sku', sku);
+      const { data: d, error } = await q;
+      if (error) return 'Error consultando ventas: ' + error.message;
+      rows = rows.concat(d || []);
+      if (!d || d.length < 1000) break;
+      off += 1000;
+    }
+    const validas = rows.filter(x => x.estado !== 'cancelled');
+    if (!validas.length) return 'No encontre ventas' + (sku ? ' de ' + sku : '') + ' en los ultimos ' + dias + ' dias.';
+    let un = 0, fact = 0, gan = 0, conCosto = 0;
+    for (const x of validas) {
+      un += Number(x.unidades) || 0;
+      fact += Number(x.precio) || 0;
+      if (x.costo_congelado != null) {
+        gan += (Number(x.precio) || 0) - (Number(x.comision) || 0)
+          - ((Number(x.costo_envio) || 0) - (Number(x.precio_comprador_envio) || 0))
+          - (Number(x.costo_congelado) || 0) - (Number(x.costo_financiero) || 0);
+        conCosto++;
+      }
+    }
+    const canc = rows.length - validas.length;
+    let txt = 'Ultimos ' + dias + ' dias' + (sku ? ' de ' + sku : '') + ':\n- ' + validas.length + ' venta(s), ' + un + ' unidad(es)\n- Facturacion: $' + Math.round(fact).toLocaleString();
+    if (conCosto) txt += '\n- Ganancia aprox (' + conCosto + ' ventas con costo): $' + Math.round(gan).toLocaleString() + (fact > 0 ? ' (' + (gan / fact * 100).toFixed(1) + '% s/facturacion)' : '');
+    txt += '\n(aprox: no descuenta IIBB ni publicidad' + (canc ? '; ' + canc + ' cancelada(s) excluidas' : '') + ')';
+    return txt;
+  } catch (e) { return 'Error: ' + e.message; }
+}
+
+// Medidas de un SKU desde la planilla publicada (misma fuente que /api/medidas)
+async function medidasDeSku(sku) {
+  try {
+    const ahora = Date.now();
+    if (!_medidasCache || (ahora - _medidasTs) > 5 * 60 * 1000) {
+      const r = await fetch(MEDIDAS_CSV_URL);
+      const text = await r.text();
+      const map = buildMedidas(text);
+      if (Object.keys(map).length > 0) { _medidasCache = map; _medidasTs = ahora; }
+    }
+    return (_medidasCache && _medidasCache[String(sku).toUpperCase().trim()]) || null;
   } catch (e) { return null; }
 }
 
-// USO DEL MES: RESPUESTAS ENVIADAS POR EL BOT este mes (la unidad facturable).
-// El modo sombra (generar sugerencias para calificar) NO consume del pack.
-async function usoDelMes(cuentaId) {
-  // el mes del pack corta el 1ro a las 00:00 de ARGENTINA (00:00 BA = 03:00 UTC)
-  const hoyBA = new Intl.DateTimeFormat('sv-SE', { timeZone: 'America/Argentina/Buenos_Aires' }).format(new Date());
-  const inicio = new Date(hoyBA.slice(0, 8) + '01T03:00:00Z');
-  const { count } = await db.from('pq_preguntas')
-    .select('id', { count: 'exact', head: true })
-    .eq('cuenta_id', cuentaId)
-    .eq('respondida_por', 'RespondIA')
-    .gte('enviada_at', inicio.toISOString());
-  return count || 0;
+// Fecha en formato local de ML (sin zona horaria; solo cuenta el dia)
+function fechaLocalAR(masDias) {
+  const t = new Date(Date.now() - 3 * 3600 * 1000 + (masDias || 0) * 864e5);
+  const p = n => String(n).padStart(2, '0');
+  return t.getUTCFullYear() + '-' + p(t.getUTCMonth() + 1) + '-' + p(t.getUTCDate()) + 'T00:00:00';
 }
 
-async function procesarPregunta(cuenta, qml) {
-  const cfg = configDe(cuenta);
-
-  // ESTADO REAL EN ML: solo procesamos preguntas vivas.
-  // ML marca: ANSWERED, UNANSWERED, DELETED, DISABLED, BANNED, CLOSED_UNANSWERED, UNDER_REVIEW.
-  const st = (qml.status || '').toUpperCase();
-  const muerta = ['DELETED', 'DISABLED', 'BANNED', 'CLOSED_UNANSWERED', 'UNDER_REVIEW'].includes(st);
-  if (muerta) {
-    // pregunta borrada/cerrada/baneada: la guardamos como historico para que NO
-    // aparezca en "sin responder" ni gaste IA. Preserva el registro sin ensuciar la bandeja.
-    await db.from('pq_preguntas').upsert({
-      id: qml.id, cuenta_id: cuenta.id, item_id: qml.item_id || null,
-      comprador_id: qml.from?.id || null, texto: qml.text || '',
-      fecha_pregunta: qml.date_created || null,
-      estado: 'historico', revisada: true,
-      respuesta_real: qml.answer?.text || null
-    });
-    return;
+// Errores de ML: el motivo real viene en el array "cause", no en el mensaje
+function mlErrDetalle(d) {
+  if (!d) return 'ML lo rechazo sin detalle';
+  let t = d.message || d.error || 'ML lo rechazo sin detalle';
+  if (Array.isArray(d.cause) && d.cause.length) {
+    const cs = d.cause.map(c => (c && (c.message || c.code)) || '').filter(Boolean).slice(0, 3);
+    if (cs.length) t += ': ' + cs.join(' | ');
   }
-
-  const item = qml.item_id ? await traerItem(cuenta, qml.item_id) : null;
-  const q = {
-    id: qml.id, item_id: qml.item_id || null, sku: item?.sku || null,
-    comprador_id: qml.from?.id || null, texto: qml.text || '',
-    fecha_pregunta: qml.date_created || null, respuesta_real: qml.answer?.text || null
-  };
-
-  // ya respondida en ML (por answer o por status ANSWERED)
-  const yaRespondida = !!q.respuesta_real || st === 'ANSWERED';
-  const hilo = await hiloComprador(cuenta, q.comprador_id, q.item_id, q.id, cfg.ventana_hilo_dias);
-
-  let ia = { respuesta: null, confianza: null, fuente: null };
-  try { ia = await generarRespuesta(cuenta, q, item, hilo); }
-  catch (e) { ia = { respuesta: 'ERROR IA: ' + e.message, confianza: 'baja', fuente: 'error' }; }
-
-  // Destino de la respuesta
-  let estado = yaRespondida ? 'historico' : 'demo';
-  let enviar_at = null;
-
-  if (!yaRespondida && cfg.auto_responder) {
-    const respuestasPrevias = (hilo || []).length;
-    const faltaDato = ia.confianza === 'baja' && !!ia.dato_faltante && String(ia.dato_faltante).trim() !== '';
-    if (respuestasPrevias >= (cfg.max_respuestas_seguidas ?? 2)) {
-      estado = 'demo'; // limite anti-pelea: derivar a humano
-    } else if (faltaDato && cfg.auto_sin_dato && (cfg.msg_sin_dato || '').trim()
-               && !/mensajer|detalle de (tu|su|la) (compra|publicaci)/i.test(cfg.msg_sin_dato)) {
-      // FALTA UN DATO y el usuario configuro respuesta automatica para ese caso:
-      // se envia SU plantilla (texto exacto, determineistico), no lo que redacto la IA.
-      // OJO: si la plantilla manda a la MENSAJERIA INTERNA, NO la auto-enviamos (el
-      // que pregunta no tiene ese canal): cae a revision humana con el borrador ya
-      // corregido por la IA. Editando la plantilla en Ajustes (sacando esa parte) el
-      // auto-envio vuelve a funcionar.
-      ia.respuesta = cfg.msg_sin_dato.trim();
-      ia.fuente = 'sin_dato';
-      const envio = calcularEnvio(cfg);
-      if (envio.enviar_at) { estado = 'programada'; enviar_at = envio.enviar_at.toISOString(); }
-      else estado = 'demo';
-    } else if ((({ alta: 3, media: 2, baja: 1 })[ia.confianza] || 0) < (({ alta: 3, media: 2 })[cfg.confianza_minima] || 3)) {
-      estado = 'demo'; // por debajo de la precision minima configurada -> revision humana
-    } else {
-      const envio = calcularEnvio(cfg);
-      if (envio.enviar_at) { estado = 'programada'; enviar_at = envio.enviar_at.toISOString(); }
-      else estado = 'demo';
-    }
-    // LIMITE DE PLAN: el pack cuenta respuestas ENVIADAS por el bot. Si se agoto,
-    // la sugerencia queda igual (para revisar/responder a mano) pero no se auto-envia.
-    if (estado === 'programada' && cuenta.limite_mensual != null) {
-      const usadas = await usoDelMes(cuenta.id);
-      if (usadas >= cuenta.limite_mensual) {
-        estado = 'demo'; enviar_at = null;
-        ia.fuente = (ia.fuente || '') + '|pack_agotado';
-      }
-    }
-  }
-
-  const nick = await nickComprador(cuenta, q.comprador_id);
-  let precioRef = null;
-  try { precioRef = await precioRealDe(cuenta, q.item_id, null); } catch (e) {}
-  await db.from('pq_preguntas').upsert({
-    id: q.id, cuenta_id: cuenta.id, item_id: q.item_id, sku: q.sku, sku_madre: skuMadre(q.sku),
-    comprador_id: q.comprador_id, comprador_nick: nick,
-    ...(await (async () => {
-      // TODAS las compras del comprador (60 dias): badge por cada una + link
-      try {
-        const compras = await compradorCompras(cuenta, q.comprador_id);
-        const deEste = compras.find(c => c.item_id === q.item_id);
-        return { orden_previa_id: (deEste || compras[0] || {}).id || null,
-                 ordenes_previas: compras.length ? compras : null };
-      } catch (e) { return { orden_previa_id: null, ordenes_previas: null }; }
-    })()),
-    precio_ref: precioRef,
-    texto: q.texto, fecha_pregunta: q.fecha_pregunta, estado,
-    ia_respuesta: ia.respuesta, ia_confianza: ia.confianza, ia_fuente: ia.fuente,
-    dato_faltante: (ia.confianza === 'baja' && ia.dato_faltante) ? String(ia.dato_faltante).slice(0, 120) : null,
-    respuesta_real: q.respuesta_real, enviar_at
-  });
+  return String(t).slice(0, 240);
 }
 
-// =====================================================================
-// WORKER DE ENVIO PROGRAMADO
-// Cada 60s: busca respuestas programadas cuya hora llego y las envia.
-// Solo actua si la cuenta sigue con auto ON en ese momento.
-// =====================================================================
-let workerOcupado = false;
-async function workerEnvios() {
-  if (workerOcupado) return;
-  workerOcupado = true;
-  try {
-    const ahora = new Date().toISOString();
-    const { data: pendientes } = await db.from('pq_preguntas')
-      .select('id, cuenta_id, ia_respuesta, item_id')
-      .eq('estado', 'programada')
-      .lte('enviar_at', ahora)
-      .limit(20);
-
-    for (const p of (pendientes || [])) {
-      // RECLAMO ATOMICO: solo este proceso pasa la pregunta a 'enviando'.
-      // Si otra instancia (o un redeploy solapado) ya la reclamo, el update
-      // no matchea ninguna fila y la salteamos -> imposible enviar duplicado.
-      const { data: reclamada } = await db.from('pq_preguntas')
-        .update({ estado: 'enviando' })
-        .eq('id', p.id).eq('estado', 'programada')
-        .select('id');
-      if (!reclamada || reclamada.length === 0) continue; // otro proceso la tomo
-
-      const cuenta = await getCuentaPorId(p.cuenta_id);
-      const cfg = configDe(cuenta);
-      if (!cuenta || !cfg.auto_responder) {
-        // apagaron el automatico mientras esperaba -> vuelve a revision
-        await db.from('pq_preguntas').update({ estado: 'demo', enviar_at: null }).eq('id', p.id);
-        continue;
-      }
-      // LIMITE DE PLAN (chequeo final, autoritativo): si el pack se agoto,
-      // la respuesta vuelve a revision con el motivo visible. No se envia.
-      if (cuenta.limite_mensual != null) {
-        const usadas = await usoDelMes(cuenta.id);
-        if (usadas >= cuenta.limite_mensual) {
-          await db.from('pq_preguntas').update({
-            estado: 'demo', enviar_at: null,
-            envio_error: 'PACK AGOTADO: ' + usadas + '/' + cuenta.limite_mensual + ' respuestas del bot este mes. Ampliar el plan para que siga respondiendo solo.'
-          }).eq('id', p.id);
-          continue;
-        }
-      }
-      try {
-        const _rw = await responderEnML(cuenta, p.id, p.ia_respuesta, p.item_id);
-        await db.from('pq_preguntas').update({
-          estado: 'enviada', enviada_at: new Date().toISOString(), envio_error: null,
-          respondida_por: 'RespondIA',
-          ...(_rw.reactivada ? { ia_respuesta: _rw.texto } : {})
-        }).eq('id', p.id);
-      } catch (e) {
-        // ¿ML dice que YA estaba respondida (desde otro lado)? La sincronizamos sola.
-        if (/not_unanswered_question|question_already_answered/i.test(e.message)) {
-          try {
-            const qml = await mlGet('/questions/' + p.id, cuenta);
-            const real = qml && qml.answer && qml.answer.text ? String(qml.answer.text).trim() : null;
-            if (real) {
-              await db.from('pq_preguntas').update({
-                estado: 'enviada', respuesta_real: real, envio_error: null, enviar_at: null,
-                enviada_at: (qml.answer.date_created || new Date().toISOString()),
-                respondida_por: 'Mercado Libre', revisada: true, revisada_at: new Date().toISOString()
-              }).eq('id', p.id);
-              continue;
-            }
-          } catch (e2) {}
-        }
-        // si falla (ej: falta permiso de escritura), queda para revision con el error visible
-        await db.from('pq_preguntas').update({
-          estado: 'demo', enviar_at: null, envio_error: e.message.slice(0, 500)
-        }).eq('id', p.id);
-      }
-    }
-
-    // RECUPERACION: si un proceso murio a mitad de envio, la pregunta queda en
-    // 'enviando' colgada. Tras 10 min la pasamos a revision humana con aviso
-    // (NUNCA reenvio automatico: pudo haberse enviado justo antes del crash).
-    const hace10 = new Date(Date.now() - 10 * 60 * 1000).toISOString();
-    const { data: colgadas } = await db.from('pq_preguntas')
-      .select('id').eq('estado', 'enviando').lte('enviar_at', hace10).limit(20);
-    for (const c of (colgadas || [])) {
-      await db.from('pq_preguntas').update({
-        estado: 'demo', enviar_at: null,
-        envio_error: 'envio interrumpido: VERIFICA EN ML si salio antes de responder a mano'
-      }).eq('id', c.id).eq('estado', 'enviando');
-    }
-  } catch (e) { console.error('worker error:', e.message); }
-  finally { workerOcupado = false; }
-}
-setInterval(workerEnvios, 60 * 1000);
-
-// =====================================================================
-// OAUTH ML
-// =====================================================================
-app.get('/oauth', (req, res) => {
-  const state = req.query.token ? '&state=' + encodeURIComponent(String(req.query.token).slice(0, 128)) : '';
-  res.redirect('https://auth.mercadolibre.com.ar/authorization?response_type=code&client_id=' + ML_CLIENT_ID
-    + '&redirect_uri=' + encodeURIComponent(ML_REDIRECT_URI) + state);
-});
-
-app.get('/oauth/callback', async (req, res) => {
-  try {
-    const r = await fetch('https://api.mercadolibre.com/oauth/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
-      body: new URLSearchParams({
-        grant_type: 'authorization_code', client_id: ML_CLIENT_ID, client_secret: ML_CLIENT_SECRET,
-        code: req.query.code, redirect_uri: ML_REDIRECT_URI
-      })
-    });
-    const tok = await r.json();
-    if (!tok.access_token) return res.status(400).send('Error: ' + JSON.stringify(tok));
-    const expires_at = new Date(Date.now() + (tok.expires_in - 300) * 1000).toISOString();
-
-    let nombre = 'Cuenta ' + tok.user_id;
-    try { const me = await fetch('https://api.mercadolibre.com/users/me', { headers: { Authorization: 'Bearer ' + tok.access_token } }).then(x => x.json()); if (me.nickname) nombre = me.nickname; } catch (e) {}
-
-    // pack de regalo para cuentas NUEVAS (no pisa el plan de las existentes)
-    const { data: existente } = await db.from('pq_cuentas').select('id').eq('ml_user_id', tok.user_id).single();
-    const regalo = existente ? {} : { limite_mensual: parseInt(process.env.PACK_GRATIS || '10') };
-    await db.from('pq_cuentas').upsert(Object.assign({
-      ml_user_id: tok.user_id, nombre,
-      ml_access_token: tok.access_token, ml_refresh_token: tok.refresh_token, ml_expires_at: expires_at
-    }, regalo), { onConflict: 'ml_user_id' });
-
-    // VINCULO AUTOMATICO: si vino con sesion (state), atamos la cuenta al usuario.
-    // Es seguro: ML acaba de probar que esa persona ES duenia de esa cuenta de ML.
-    let vinculado = false;
-    if (req.query.state) {
-      const u = await usuarioPorToken(String(req.query.state));
-      if (u && !u.cuenta_id) {
-        const { data: cta } = await db.from('pq_cuentas').select('*').eq('ml_user_id', tok.user_id).single();
-        if (cta) {
-          await db.from('pq_usuarios').update({ cuenta_id: cta.id }).eq('id', u.id);
-          vinculado = true;
-          // ENTRENAMIENTO INICIAL: si la cuenta esta vacia, traemos SOLO las
-          // ultimas 30 preguntas (tope de costo) para que tenga que calificar.
-          const { count } = await db.from('pq_preguntas').select('id', { count: 'exact', head: true }).eq('cuenta_id', cta.id);
-          if (!count) entrenamientoInicial(cta).catch(() => {});
-        }
-      }
-    }
-
-    res.send(`<!doctype html><meta charset="utf-8"><body style="font-family:sans-serif;display:grid;place-items:center;min-height:90vh;background:#f4f6fb"><div style="background:#fff;border-radius:18px;padding:36px;max-width:400px;text-align:center;box-shadow:0 10px 30px rgba(0,0,0,.1)"><div style="font-size:40px">\u2705</div><h2>\u00a1Cuenta de Mercado Libre conectada!</h2><p style="color:#666">${vinculado ? 'Tu usuario qued\u00f3 vinculado. Volv\u00e9 al panel para empezar.' : 'La cuenta qued\u00f3 autorizada.'}</p><a href="https://respondia-frontend.vercel.app" style="display:inline-block;background:#2f6bff;color:#fff;padding:12px 24px;border-radius:11px;text-decoration:none;font-weight:700;margin-top:8px">Ir al panel</a></div></body>`);
-  } catch (e) { res.status(500).send(e.message); }
-});
-
-// ENTRENAMIENTO INICIAL de una cuenta recien conectada: procesa SOLO las
-// ultimas N preguntas (tope de tokens) para que el cliente tenga material
-// que calificar apenas entra. N configurable con ENTRENAMIENTO_INICIAL.
-async function entrenamientoInicial(cuenta) {
-  const max = parseInt(process.env.ENTRENAMIENTO_INICIAL || '30');
-  try {
-    const data = await mlGet(`/questions/search?seller_id=${cuenta.ml_user_id}&api_version=4&sort_fields=date_created&sort_types=DESC&limit=${Math.min(max, 50)}&offset=0`, cuenta);
-    for (const qml of (data.questions || []).slice(0, max)) {
-      await procesarPregunta(cuenta, qml);
-      await new Promise(r => setTimeout(r, 300));
-    }
-  } catch (e) { console.error('entrenamiento inicial:', e.message); }
-}
-
-// =====================================================================
-// WEBHOOK
-// =====================================================================
-app.post('/webhook', (req, res) => {
-  res.sendStatus(200);
-  (async () => {
+async function asistenteEjecutar(acc, userId, token) {
+  const p = acc.parametros || {};
+  const ids = Array.isArray(acc.items) && acc.items.length ? acc.items : await asistenteResolverItems(p, userId, token);
+  if (!ids.length) return { texto: 'No encontre publicaciones para ese SKU/item.' };
+  const mini = await itemsMini(ids, token);
+  const lineas = [];
+  for (const id of ids) {
+    const t = (mini[id] && mini[id].title) ? mini[id].title.slice(0, 42) : id;
     try {
-      const n = req.body || {};
-      if (n.topic !== 'questions') return;
-      const cuenta = await getCuentaPorMlUser(n.user_id);
-      if (!cuenta) return;
-      const qid = String(n.resource || '').split('/').pop();
-      if (!qid) return;
-      const qml = await mlGet('/questions/' + qid + '?api_version=4', cuenta);
-      await procesarPregunta(cuenta, qml);
-    } catch (e) { console.error('webhook error:', e.message); }
-  })();
-});
-
-// =====================================================================
-// BACKFILL  ->  /backfill?dias=30&clave=...&cuenta_id=...   (dias=0 = todo)
-// =====================================================================
-app.get('/backfill', soloPanel, requiereRol('master', 'dueno'), async (req, res) => {
-  if (backfill.corriendo) return res.json({ ok: false, msg: 'ya hay un backfill corriendo', backfill });
-
-  const cuenta = await resolverCuenta(req);
-  if (!cuenta) return res.status(400).send('no encontre la cuenta');
-
-  const dias = req.query.dias !== undefined ? parseInt(req.query.dias) : 30;
-  const corte = dias > 0 ? new Date(Date.now() - dias * 24 * 3600 * 1000) : null;
-  backfill = { corriendo: true, procesadas: 0, total: 0, desde: corte ? corte.toISOString() : 'todo', error: null, cuenta: cuenta.nombre };
-  res.json({ ok: true, msg: 'backfill arrancado', cuenta: cuenta.nombre, dias });
-
-  (async () => {
-    try {
-      const force = req.query.force === '1';
-      const topeNoMaster = parseInt(process.env.ENTRENAMIENTO_INICIAL || '30');
-      const esMaster = req.usuario && req.usuario.rol === 'master';
-      let offset = 0; const limit = 50; let seguir = true;
-      while (seguir) {
-        const data = await mlGet(`/questions/search?seller_id=${cuenta.ml_user_id}&api_version=4&sort_fields=date_created&sort_types=DESC&limit=${limit}&offset=${offset}`, cuenta);
-        const qs = data.questions || [];
-        if (qs.length === 0) break;
-
-        // saltear las que ya tienen respuesta de IA generada (ahorra costo), salvo force=1
-        let yaHechas = new Set();
-        if (!force) {
-          const { data: exist } = await db.from('pq_preguntas').select('id')
-            .in('id', qs.map(x => x.id)).not('ia_respuesta', 'is', null);
-          yaHechas = new Set((exist || []).map(e => e.id));
-        }
-
-        for (const qml of qs) {
-          if (corte && qml.date_created && new Date(qml.date_created) < corte) { seguir = false; break; }
-          if (!esMaster && backfill.procesadas >= topeNoMaster) { seguir = false; break; } // tope de tokens para clientes
-          if (yaHechas.has(qml.id)) continue;
-          await procesarPregunta(cuenta, qml);
-          backfill.procesadas++;
-          await new Promise(r => setTimeout(r, 250));
-        }
-        offset += limit;
-        if (offset > 20000) break;
-      }
-    } catch (e) { backfill.error = e.message; console.error('backfill error:', e.message); }
-    finally { backfill.corriendo = false; }
-  })();
-});
-
-// =====================================================================
-// SUGERENCIAS (por cuenta)
-// =====================================================================
-app.post('/api/sugerencias/generar', soloPanel, async (req, res) => {
-  try {
-    const cuenta = await resolverCuenta(req);
-    if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-
-    const { data: pregs } = await db.from('pq_preguntas').select('sku, texto, item_id')
-      .eq('cuenta_id', cuenta.id).not('sku', 'is', null).limit(800);
-    const porSku = {};
-    (pregs || []).forEach(p => { (porSku[p.sku] = porSku[p.sku] || { item_id: p.item_id, textos: [] }).textos.push(p.texto); });
-    const candidatos = Object.entries(porSku).filter(([, v]) => v.textos.length >= 3)
-      .sort((a, b) => b[1].textos.length - a[1].textos.length).slice(0, 10);
-
-    await db.from('pq_sugerencias').delete().eq('cuenta_id', cuenta.id).eq('estado', 'pendiente');
-
-    for (const [sku, v] of candidatos) {
-      const system = `Sos analista de un vendedor de Mercado Libre. Te paso preguntas frecuentes de un producto.
-Detecta que conviene mejorar en la publicacion para que dejen de preguntar lo mismo.
-Responde SOLO un JSON array (puede ser vacio): {"tipo":"descripcion|foto|video|stock|titulo|otro","motivo":"...","tarea":"..."}.`;
-      const userText = `SKU ${sku}. Preguntas:\n` + v.textos.slice(0, 40).map(t => '- ' + t).join('\n');
-      let arr = [];
-      try { const _sg = await llamarClaude(MODELO_IA, system, userText); arr = parsearJson(_sg.texto); } catch (e) {}
-      if (!Array.isArray(arr)) arr = [];
-      for (const s of arr) {
-        await db.from('pq_sugerencias').insert({
-          cuenta_id: cuenta.id, tipo: s.tipo || 'otro', sku, item_id: v.item_id,
-          motivo: s.motivo, tarea: s.tarea, frecuencia: v.textos.length, estado: 'pendiente'
+      if (acc.accion === 'quitar_descuento') {
+        // Mira que promos activas tiene y las baja UNA POR UNA por tipo+campana
+        const rp = await fetch(`https://api.mercadolibre.com/seller-promotions/items/${id}?app_version=v2`, {
+          headers: { Authorization: 'Bearer ' + token }
         });
-      }
-    }
-    res.json({ ok: true, skus_analizados: candidatos.length });
-  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
-});
-
-// =====================================================================
-// ENDPOINTS DEL PANEL
-// (el middleware soloPanel esta definido arriba, en USUARIOS Y SESIONES)
-// =====================================================================
-
-app.get('/api/cuentas', soloPanel, async (req, res) => {
-  const { data } = await db.from('pq_cuentas').select('id, nombre, ml_user_id, plan, activa').order('creado_at');
-  res.json(data || []);
-});
-
-// PLAN DE LA CUENTA (solo master): fija el limite mensual de preguntas con IA
-app.post('/api/cuenta/limite', soloPanel, requiereRol('master'), async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-  const lim = req.body.limite_mensual;
-  const valor = (lim === null || lim === '' || lim === undefined) ? null : Math.max(0, parseInt(lim) || 0);
-  const { error } = await db.from('pq_cuentas').update({ limite_mensual: valor }).eq('id', cuenta.id);
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ ok: true, limite_mensual: valor });
-});
-
-app.get('/api/estado', soloPanel, async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-  const c = cuenta.id;
-  // Las estadisticas respetan el MISMO rango de fechas que la lista (dias de Argentina).
-  // "En cola" y la campana quedan sin filtrar: son estado operativo actual.
-  const rango = (q) => {
-    if (req.query.desde) q = q.gte('fecha_pregunta', req.query.desde + 'T00:00:00-03:00');
-    if (req.query.hasta) q = q.lte('fecha_pregunta', req.query.hasta + 'T23:59:59-03:00');
-    return q;
-  };
-  const total  = await rango(db.from('pq_preguntas').select('id', { count: 'exact', head: true }).eq('cuenta_id', c));
-  const sinRev = await rango(db.from('pq_preguntas').select('id', { count: 'exact', head: true }).eq('cuenta_id', c).eq('revisada', false));
-  const malas  = await rango(db.from('pq_preguntas').select('id', { count: 'exact', head: true }).eq('cuenta_id', c).eq('calificacion', 'mal'));
-  const buenas = await rango(db.from('pq_preguntas').select('id', { count: 'exact', head: true }).eq('cuenta_id', c).eq('calificacion', 'bien'));
-  const prog   = await db.from('pq_preguntas').select('id', { count: 'exact', head: true }).eq('cuenta_id', c).eq('estado', 'programada');
-  const env    = await rango(db.from('pq_preguntas').select('id', { count: 'exact', head: true }).eq('cuenta_id', c).eq('estado', 'enviada'));
-  const vend   = await rango(db.from('pq_preguntas').select('id', { count: 'exact', head: true }).eq('cuenta_id', c).eq('convirtio', true));
-  const verif  = await rango(db.from('pq_preguntas').select('id', { count: 'exact', head: true }).eq('cuenta_id', c).not('convirtio', 'is', null));
-  // conversion DE LA IA: de las que respondio RespondIA (y ya se verificaron), cuantas terminaron en compra POSTERIOR a la pregunta
-  const vendIa  = await rango(db.from('pq_preguntas').select('id', { count: 'exact', head: true }).eq('cuenta_id', c).eq('convirtio', true).eq('respondida_por', 'RespondIA'));
-  const verifIa = await rango(db.from('pq_preguntas').select('id', { count: 'exact', head: true }).eq('cuenta_id', c).not('convirtio', 'is', null).eq('respondida_por', 'RespondIA'));
-  // cuanto trabajo saca la IA: respondidas SOLA por RespondIA vs total respondidas
-  const autoIa = await rango(db.from('pq_preguntas').select('id', { count: 'exact', head: true }).eq('cuenta_id', c).eq('respondida_por', 'RespondIA'));
-  const respTot = await rango(db.from('pq_preguntas').select('id', { count: 'exact', head: true }).eq('cuenta_id', c).not('respuesta_real', 'is', null));
-  const hace7 = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
-  const sinResp = await db.from('pq_preguntas').select('id', { count: 'exact', head: true })
-    .eq('cuenta_id', c).is('respuesta_real', null).not('estado', 'in', '(enviada,historico,enviando,programada)').gte('fecha_pregunta', hace7);
-  const cfg = configDe(cuenta);
-  res.json({
-    cuenta: cuenta.nombre, preguntas: total.count || 0, sin_revisar: sinRev.count || 0,
-    buenas: buenas.count || 0, malas: malas.count || 0,
-    programadas: prog.count || 0, enviadas: env.count || 0,
-    vendidas: vend.count || 0, conv_verificadas: verif, vend_ia: vendIa, conv_verificadas_ia: verifIa.count || 0,
-    sin_responder: sinResp.count || 0,
-    auto_ia: autoIa.count || 0, respondidas: respTot.count || 0,
-    auto_responder: !!cfg.auto_responder,
-    limite_mensual: cuenta.limite_mensual ?? null,
-    uso_mes: await usoDelMes(c),
-    backfill, conversiones, refresco, sincro, encolado, nicksJob
-  });
-});
-
-app.get('/api/ranking', soloPanel, async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-  const dias = req.query.dias !== undefined ? parseInt(req.query.dias) : 90;
-  const { data, error } = await db.rpc('pq_ranking', { p_cuenta: cuenta.id, p_dias: dias });
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data || []);
-});
-
-app.get('/api/metricas', soloPanel, async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-  const { data, error } = await db.rpc('pq_metricas', { p_cuenta: cuenta.id });
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data || {});
-});
-
-app.get('/api/evolucion', soloPanel, async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-  const { data, error } = await db.rpc('pq_evolucion', { p_cuenta: cuenta.id });
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data || {});
-});
-
-// CHEQUEO DE SALUD: verifica cada pieza del sistema y dice como arreglar lo que falle
-app.get('/api/salud', soloPanel, async (req, res) => {
-  const checks = [];
-  const add = (nombre, ok, detalle, solucion) => checks.push({ nombre, ok, detalle, solucion: ok ? null : solucion });
-
-  const cuenta = await resolverCuenta(req);
-  add('Cuenta configurada', !!cuenta, cuenta ? cuenta.nombre : 'no encontrada', 'Verifica ML_USER_ID en Railway o autoriza en /oauth');
-
-  // base de datos
-  try { await db.from('pq_preguntas').select('id', { head: true, count: 'exact' }).limit(1); add('Base de datos', true, 'conectada'); }
-  catch (e) { add('Base de datos', false, e.message, 'Verifica SUPABASE_URL y SUPABASE_SERVICE_KEY en Railway'); }
-
-  // funciones SQL
-  for (const fn of ['pq_ranking', 'pq_metricas', 'pq_sumar_uso']) {
-    try {
-      const args = fn === 'pq_sumar_uso' ? { p_cuenta: cuenta?.id || 0, p_imagenes: 0 } : (fn === 'pq_ranking' ? { p_cuenta: cuenta?.id || 0, p_dias: 1 } : { p_cuenta: cuenta?.id || 0 });
-      const { error } = await db.rpc(fn, args);
-      add('Funcion SQL ' + fn, !error, error ? error.message : 'ok', 'Corre el SQL correspondiente en Supabase (ranking/metricas)');
-    } catch (e) { add('Funcion SQL ' + fn, false, e.message, 'Corre el SQL correspondiente en Supabase'); }
-  }
-
-  if (cuenta) {
-    // token ML + permisos
-    try { const me = await mlGet('/users/me', cuenta); add('Token de Mercado Libre', true, 'autorizado como ' + (me.nickname || me.id)); }
-    catch (e) { add('Token de Mercado Libre', false, e.message.slice(0, 120), 'Entra a /oauth logueado con la cuenta y reautoriza'); }
-
-    try {
-      const { data: unItem } = await db.from('pq_items').select('item_id').eq('cuenta_id', cuenta.id).limit(1).single();
-      if (unItem) { await mlGet('/items/' + unItem.item_id, cuenta); add('Permiso: leer publicaciones', true, 'ok'); }
-      else add('Permiso: leer publicaciones', true, 'sin items cacheados aun para probar');
-    } catch (e) { add('Permiso: leer publicaciones', false, e.message.slice(0, 120), 'En el DevCenter: permiso de publicaciones en Lectura + reautorizar en /oauth'); }
-
-    try { await mlGet(`/orders/search?seller=${cuenta.ml_user_id}&limit=1`, cuenta); add('Permiso: leer ventas (conversiones)', true, 'ok'); }
-    catch (e) { add('Permiso: leer ventas (conversiones)', false, e.message.slice(0, 120), 'En el DevCenter: "Venta y envios" en Lectura + reautorizar en /oauth'); }
-  }
-
-  // IA
-  try {
-    await llamarClaude(MODELO_IA, 'Responde solo la palabra ok', 'ok', 5);
-    add('IA (Anthropic)', true, 'clave valida y con credito');
-  } catch (e) {
-    const msg = e.message.toLowerCase();
-    add('IA (Anthropic)', false, e.message.slice(0, 140),
-      msg.includes('credit') || msg.includes('billing') ? 'Carga credito en console.anthropic.com -> Billing'
-      : 'Verifica ANTHROPIC_API_KEY en Railway (console.anthropic.com -> API Keys)');
-  }
-
-  const cfg = cuenta ? configDe(cuenta) : null;
-  if (cfg) add('Modo actual', true, cfg.auto_responder ? 'AUTOMATICO encendido' : 'SOMBRA (solo sugiere)');
-
-  res.json({ ok: checks.every(c => c.ok), checks });
-});
-
-app.post('/api/regla', soloPanel, async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  const { ambito, sku, item_id, disparador, respuesta, tipo, origen } = req.body;
-  // ANTI-DUPLICADOS: si ya existe una regla identica (mismo alcance y texto),
-  // no creamos otra. Protege contra doble-click y re-guardados.
-  const skuVal = (ambito && ambito !== 'global' && ambito !== 'item') ? (sku || null) : null;
-  const itemVal = ambito === 'item' ? (item_id || null) : null;
-  let qd = db.from('pq_reglas').select('id')
-    .eq('cuenta_id', cuenta.id).eq('ambito', ambito || 'global')
-    .eq('respuesta', respuesta).eq('activa', true);
-  qd = skuVal === null ? qd.is('sku', null) : qd.eq('sku', skuVal);
-  qd = itemVal === null ? qd.is('item_id', null) : qd.eq('item_id', itemVal);
-  const { data: dup } = await qd.limit(1);
-  if (dup && dup.length) return res.json({ ok: true, duplicada: true });
-  const { error } = await db.from('pq_reglas').insert({
-    cuenta_id: cuenta.id, ambito: ambito || 'global',
-    sku: (ambito && ambito !== 'global' && ambito !== 'item') ? sku : null,
-    item_id: ambito === 'item' ? item_id : null,
-    disparador: disparador || null, respuesta, tipo: tipo || 'texto', origen: origen || 'manual'
-  });
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ ok: true });
-});
-
-// SKUs de una publicacion (para el modo "todos los SKUs de esta publicacion")
-app.get('/api/skus-publicacion', soloPanel, async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  const { data } = await db.from('pq_items').select('variaciones, sku').eq('cuenta_id', cuenta.id).eq('item_id', req.query.item_id).single();
-  if (!data) return res.json({ skus: [] });
-  const skus = [...new Set([data.sku, ...((data.variaciones || []).map(v => v.sku))].filter(Boolean))];
-  res.json({ skus });
-});
-
-// ---- TAREAS (datos faltantes) ----
-app.get('/api/tareas', soloPanel, async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  const orden = { alta: 0, media: 1, baja: 2 };
-  const { data } = await db.from('pq_tareas').select('*').eq('cuenta_id', cuenta.id).eq('estado', 'pendiente');
-  const lista = (data || []).sort((a, b) => (orden[a.prioridad] - orden[b.prioridad]) || (b.frecuencia - a.frecuencia));
-  res.json(lista);
-});
-
-app.post('/api/tareas/generar', soloPanel, async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  const { data, error } = await db.rpc('pq_generar_tareas', { p_cuenta: cuenta.id });
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ ok: true, tareas: data });
-});
-
-app.post('/api/tarea', soloPanel, async (req, res) => {
-  // crear/actualizar tarea manual, o cambiar prioridad/estado de una existente
-  const cuenta = await resolverCuenta(req);
-  const { id, sku, item_id, dato, prioridad, estado, origen } = req.body;
-  if (id) {
-    const upd = {}; if (prioridad) upd.prioridad = prioridad; if (estado) upd.estado = estado;
-    upd.actualizado_at = new Date().toISOString();
-    const { error } = await db.from('pq_tareas').update(upd).eq('id', id).eq('cuenta_id', cuenta.id);
-    if (error) return res.status(500).json({ error: error.message });
-  } else {
-    const { error } = await db.from('pq_tareas').insert({
-      cuenta_id: cuenta.id, sku: sku || null, item_id: item_id || null,
-      dato: dato || 'dato faltante', prioridad: prioridad || 'media', origen: origen || 'manual'
-    });
-    if (error) return res.status(500).json({ error: error.message });
-  }
-  res.json({ ok: true });
-});
-
-// HILO DEL COMPRADOR (para el panel): preguntas previas del mismo comprador
-// en la misma publicacion + si ya compro alguna vez.
-app.get('/api/hilo', soloPanel, async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-  const { comprador_id, item_id, excluir } = req.query;
-  if (!comprador_id) return res.json({ hilo: [], compro_antes: false });
-
-  let q = db.from('pq_preguntas')
-    .select('id, texto, respuesta_real, ia_respuesta, correccion, fecha_pregunta, estado, convirtio, respondida_por')
-    .eq('cuenta_id', cuenta.id).eq('comprador_id', comprador_id)
-    .order('fecha_pregunta', { ascending: true }).limit(20);
-  if (item_id) q = q.eq('item_id', item_id);
-  if (excluir) q = q.neq('id', excluir);
-  const { data } = await q;
-
-  const { count } = await db.from('pq_preguntas').select('id', { count: 'exact', head: true })
-    .eq('cuenta_id', cuenta.id).eq('comprador_id', comprador_id).eq('convirtio', true);
-
-  res.json({ hilo: data || [], compro_antes: (count || 0) > 0 });
-});
-
-app.get('/api/preguntas', soloPanel, async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-  // anti fuga masiva: solo el master puede pedir paginas grandes
-  const cap = (req.usuario && req.usuario.rol === 'master') ? 1000 : 60;
-  const lim = Math.min(parseInt(req.query.limit) || 60, cap);
-  const off = parseInt(req.query.offset) || 0;
-  let q = db.from('pq_preguntas').select('*').eq('cuenta_id', cuenta.id)
-    .order('fecha_pregunta', { ascending: false }).range(off, off + lim - 1);
-  if (req.query.sku)   q = q.eq('sku', req.query.sku);
-  if (req.query.calif) q = q.eq('calificacion', req.query.calif);
-  if (req.query.estado) q = q.eq('estado', req.query.estado);
-  if (req.query.sin_revisar === '1') q = q.eq('revisada', false);
-  if (req.query.vendidas === '1') q = q.eq('convirtio', true);
-  if (req.query.auto === '1') q = q.eq('respondida_por', 'RespondIA');
-  if (req.query.sin_responder === '1') q = q.is('respuesta_real', null).not('estado', 'in', '(enviada,historico,enviando,programada)');
-  if (req.query.busca) {
-    const t = String(req.query.busca).replace(/[%_,()]/g, ' ').trim();
-    if (t) q = q.or(`texto.ilike.%${t}%,ia_respuesta.ilike.%${t}%,sku.ilike.%${t}%,item_id.ilike.%${t}%`);
-  }
-  // los dias del filtro son dias de ARGENTINA (-03:00, sin horario de verano)
-  if (req.query.desde) q = q.gte('fecha_pregunta', req.query.desde + 'T00:00:00-03:00');
-  if (req.query.hasta) q = q.lte('fecha_pregunta', req.query.hasta + 'T23:59:59-03:00');
-  const { data, error } = await q;
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
-});
-
-// MINIATURAS: primera foto de cada publicacion, desde el cache pq_items (0 llamadas a ML)
-// BUSCAR PUBLICACIONES: para el autocompletado con "#" al escribir una respuesta.
-// Busca por SKU o por titulo. Primero en el cache (instantaneo) y, si hace falta,
-// completa con una busqueda en vivo en ML (asi encuentra publicaciones que nunca
-// tuvieron preguntas). Devuelve el link listo para pegar.
-const linkDe = (id) => 'https://articulo.mercadolibre.com.ar/' + String(id).replace(/^MLA/, 'MLA-');
-// SINCRONIZAR CATALOGO COMPLETO: trae TODAS las publicaciones del vendedor a
-// pq_items (id, sku, sku_madre, titulo, foto, estado). Asi el buscador con "#" y
-// la busqueda de variantes encuentran cualquier producto, aunque nunca haya
-// tenido una pregunta. Se corre a mano desde el panel o cada tanto.
-async function sincronizarCatalogo(cuenta, opts) {
-  opts = opts || {};
-  const incremental = !!opts.desde;   // si viene 'desde', solo traemos lo modificado despues
-  let scroll = '', total = 0, guardados = 0, vueltas = 0;
-  do {
-    // Orden por ultima actualizacion, para poder cortar apenas llegamos a lo ya conocido.
-    const base = `/users/${cuenta.ml_user_id}/items/search?limit=100&orders=last_updated_desc`;
-    const url = incremental
-      ? base + (scroll ? '&offset=' + scroll : '')            // paginado por offset (incremental es corto)
-      : `/users/${cuenta.ml_user_id}/items/search?search_type=scan&limit=100` + (scroll ? '&scroll_id=' + encodeURIComponent(scroll) : '');
-    const d = await mlGet(url, cuenta);
-    total = (d.paging && d.paging.total) || total;
-    const ids = d.results || [];
-    if (!ids.length) break;
-    scroll = incremental ? String((Number(scroll) || 0) + ids.length) : (d.scroll_id || '');
-
-    let cortar = false;
-    for (let i = 0; i < ids.length; i += 20) {
-      const lote = ids.slice(i, i + 20);
-      let items = [];
-      try {
-        const mg = await mlGet(`/items?ids=${lote.join(',')}&attributes=id,title,seller_sku,seller_custom_field,attributes,variations,status,thumbnail,last_updated`, cuenta);
-        items = (mg || []).map(x => x.body).filter(Boolean);
-      } catch (e) { continue; }
-      // en incremental, si ya llegamos a un item mas viejo que 'desde', cortamos
-      const filas = [];
-      for (const it of items) {
-        if (incremental && it.last_updated && it.last_updated < opts.desde) { cortar = true; continue; }
-        // SKUs de TODAS las variantes (en ML el SKU vive en cada variante, no en la publicacion)
-        const skusVar = (it.variations || []).map(v => sacarSku(v)).filter(Boolean);
-        const sku = sacarSku(it) || skusVar[0] || null;
-        const todos = [...new Set([sku, ...skusVar].filter(Boolean))];
-        filas.push({
-          cuenta_id: cuenta.id, item_id: it.id, sku, sku_madre: skuMadre(sku),
-          skus: todos.join(' ') || null,
-          titulo: it.title || '', estado: it.status || null,
-          imagenes: it.thumbnail ? [it.thumbnail.replace(/^http:/, 'https:')] : []
-        });
-      }
-      if (filas.length) { try { await db.from('pq_items').upsert(filas); guardados += filas.length; } catch (e) {} }
-      if (cortar) break;
-    }
-    vueltas++;
-    if (cortar) break;                                        // incremental: ya alcanzamos lo conocido
-  } while (scroll && vueltas < 200);
-  return { total, guardados, incremental };
-}
-
-// AUTO: una vez al dia, sincroniza el catalogo de cada cuenta SOLO con lo nuevo/modificado.
-async function autoSyncCatalogos() {
-  try {
-    const { data: cuentas } = await db.from('pq_cuentas').select('id, ml_user_id, config').eq('activa', true);
-    for (const cuenta of (cuentas || [])) {
-      try {
-        const cfg = cuenta.config || {};
-        const ult = cfg.ult_sync_catalogo || null;
-        // la primera vez trae todo; despues, solo lo modificado desde la ultima corrida
-        const r = await sincronizarCatalogo(cuenta, ult ? { desde: ult } : {});
-        const nuevoCfg = Object.assign({}, cfg, { ult_sync_catalogo: new Date().toISOString() });
-        await db.from('pq_cuentas').update({ config: nuevoCfg }).eq('id', cuenta.id);
-        console.log(`[auto-sync] cuenta ${cuenta.id}: ${r.guardados} publicaciones (${r.incremental ? 'incremental' : 'completo'})`);
-      } catch (e) { console.log('[auto-sync] error cuenta', cuenta.id, e.message); }
-    }
-  } catch (e) { console.log('[auto-sync] error general', e.message); }
-}
-// corre una vez por dia; primer disparo 2 min despues de arrancar (para no pegarle a ML en el boot)
-setTimeout(autoSyncCatalogos, 2 * 60 * 1000);
-setInterval(autoSyncCatalogos, 24 * 60 * 60 * 1000);
-
-app.post('/api/sync-catalogo', soloPanel, requiereRol('master', 'dueno', 'gerente'), async (req, res) => {
-  try {
-    const cuenta = await resolverCuenta(req);
-    if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-    const r = await sincronizarCatalogo(cuenta);
-    res.json({ ok: true, ...r });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/api/buscar-items', soloPanel, async (req, res) => {
-  try {
-    const cuenta = await resolverCuenta(req);
-    if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-    const q = String(req.query.q || '').replace(/[%_,()]/g, ' ').trim().slice(0, 60);
-    if (q.length < 2) return res.json([]);
-
-    const salida = [], vistos = new Set();
-    // 1) cache local: si parece SKU, buscamos por SKU madre (trae TODA la familia,
-    //    incluidas las variantes que la busqueda de texto de ML no encuentra)
-    try {
-      const t = q.toUpperCase();
-      const esSku = /^[A-Z0-9]+(?:-[A-Z0-9]+)?$/.test(t);
-      const filtro = esSku
-        ? `sku.ilike.${t}%,skus.ilike.%${t}%,sku_madre.eq.${skuMadre(t)}`
-        : `sku.ilike.%${q}%,skus.ilike.%${q}%,sku_madre.ilike.%${q}%,titulo.ilike.%${q}%`;
-      const { data } = await db.from('pq_items')
-        .select('item_id, sku, skus, titulo, imagenes, estado').eq('cuenta_id', cuenta.id)
-        .or(filtro).limit(10);
-      for (const it of (data || [])) {
-        if (vistos.has(it.item_id)) continue;
-        vistos.add(it.item_id);
-        // si lo que escribiste matchea el SKU de una variante, mostramos ESE
-        const lista = String(it.skus || it.sku || '').split(' ').filter(Boolean);
-        const match = lista.find(s => s.toUpperCase().startsWith(q.toUpperCase())) || it.sku || lista[0] || null;
-        const extra = lista.length > 1 ? (' (+' + (lista.length - 1) + ' var.)') : '';
-        salida.push({
-          id: it.item_id, sku: match ? (match + extra) : null, titulo: it.titulo || '',
-          foto: (it.imagenes && it.imagenes[0]) || null,
-          pausada: it.estado && it.estado !== 'active',
-          link: linkDe(it.item_id)
-        });
-      }
-    } catch (e) {}
-
-    // 2) si el cache trajo poco, completamos con ML en vivo
-    if (salida.length < 5) {
-      try {
-        const d = await mlGet(`/sites/MLA/search?seller_id=${cuenta.ml_user_id}&q=${encodeURIComponent(q)}&limit=8`, cuenta);
-        for (const r of (d.results || [])) {
-          if (vistos.has(r.id) || salida.length >= 8) continue;
-          vistos.add(r.id);
-          salida.push({
-            id: r.id, sku: r.seller_custom_field || null, titulo: r.title || '',
-            foto: r.thumbnail || null,
-            pausada: r.status && r.status !== 'active',
-            link: r.permalink || linkDe(r.id)
-          });
-        }
-      } catch (e) {}
-    }
-    // precio real (con descuento) + cuotas para cada candidato — referencia del vendedor
-    const finales = salida.slice(0, 8);
-    let cuotasMap = new Map();
-    try {
-      const s = await mlGet(`/sites/MLA/search?seller_id=${cuenta.ml_user_id}&q=${encodeURIComponent(q)}&limit=20`, cuenta);
-      for (const r of (s.results || [])) {
-        if (r.installments && r.installments.quantity) {
-          cuotasMap.set(r.id, `${r.installments.quantity}x $${Math.round(r.installments.amount || 0).toLocaleString('es-AR')}`);
-        }
-      }
-    } catch (e) {}
-    await Promise.all(finales.map(async f => {
-      try { f.precio = await precioRealCached(cuenta, f.id, null); } catch (e) { f.precio = null; }
-      f.cuotas = cuotasMap.get(f.id) || null;
-    }));
-    res.json(finales);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/api/thumbs', soloPanel, async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-  const ids = String(req.query.items || '').split(',').map(s => s.trim()).filter(Boolean).slice(0, 100);
-  if (!ids.length) return res.json({});
-  const { data } = await db.from('pq_items').select('item_id, imagenes').eq('cuenta_id', cuenta.id).in('item_id', ids);
-  const out = {};
-  for (const it of (data || [])) out[it.item_id] = (it.imagenes && it.imagenes[0]) || null;
-  res.json(out);
-});
-
-// LATIDO: endpoint liviano para el "en vivo" del panel. Devuelve cuantas preguntas
-// sin responder hay y el id mas nuevo, para detectar novedades sin bajar todo.
-app.get('/api/latido', soloPanel, async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-  // MISMO criterio que la campana del panel (ultimos 7 dias), para que el numero
-  // del hub y el del panel coincidan siempre.
-  const hace7d = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
-  const { count } = await db.from('pq_preguntas')
-    .select('id', { count: 'exact', head: true })
-    .eq('cuenta_id', cuenta.id)
-    .is('respuesta_real', null)
-    .not('estado', 'in', '(enviada,historico,enviando,programada)')
-    .gte('fecha_pregunta', hace7d);
-  const { data: ult } = await db.from('pq_preguntas')
-    .select('id, texto, sku').eq('cuenta_id', cuenta.id)
-    .order('id', { ascending: false }).limit(1);
-  // pendientes de POSVENTA: conversaciones en "Nuevos" (esperan respuesta nuestra)
-  let pvCount = 0;
-  try {
-    const { count: pc } = await db.from('pq_conversaciones')
-      .select('id', { count: 'exact', head: true })
-      .eq('cuenta_id', cuenta.id).eq('estado', 'nuevo');
-    pvCount = pc || 0;
-  } catch (e) {}
-  res.json({ sin_responder: count || 0, pv_sin_responder: pvCount, ultima_id: ult && ult[0] ? ult[0].id : 0, ultima_texto: ult && ult[0] ? (ult[0].texto || '').slice(0, 80) : '', ultima_sku: ult && ult[0] ? ult[0].sku : null });
-});
-
-// ELIMINAR PREGUNTA: la borra en Mercado Libre y del panel.
-// Permiso: master y dueno siempre; gerente/operador solo si tienen el tilde
-// "eliminar" en sus permisos (se activa por usuario en Ajustes > Usuarios).
-app.post('/api/eliminar-pregunta', soloPanel, async (req, res) => {
-  try {
-    const u = req.usuario || {};
-    const puede = u.rol === 'master'
-      || (u.rol === 'dueno' ? !(u.permisos && u.permisos.eliminar === false) : !!(u.permisos && u.permisos.eliminar));
-    if (!puede) return res.status(403).json({ error: 'Tu usuario no tiene permiso para eliminar preguntas. Pediselo al dueño en Ajustes → Usuarios.' });
-    const { id } = req.body || {};
-    if (!id) return res.status(400).json({ error: 'falta el id' });
-    const { data: preg } = await db.from('pq_preguntas').select('id, cuenta_id').eq('id', id).single();
-    if (!preg) return res.status(404).json({ error: 'pregunta no encontrada' });
-    const cuenta = await getCuentaPorId(preg.cuenta_id);
-    if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-    await mlDelete(`/questions/${id}`, cuenta);           // primero en ML
-    await db.from('pq_preguntas').delete().eq('id', id);  // despues aca
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message.slice(0, 400) }); }
-});
-
-app.post('/api/calificar', soloPanel, async (req, res) => {
-  const { id, calificacion, correccion, enviar } = req.body;
-  const { error } = await db.from('pq_preguntas').update({
-    calificacion: calificacion || null, correccion: correccion || null,
-    revisada: true, revisada_at: new Date().toISOString()
-  }).eq('id', id);
-  if (error) return res.status(500).json({ error: error.message });
-
-  // Si la aprobaste ("bien"), pediste enviar, y la pregunta AUN NO se respondio,
-  // mandamos la respuesta de la IA al comprador en Mercado Libre.
-  let enviada = false, envio_error = null;
-  if (calificacion === 'bien' && enviar) {
-    try {
-      const { data: preg } = await db.from('pq_preguntas')
-        .select('id, cuenta_id, estado, ia_respuesta, respuesta_real, item_id').eq('id', id).single();
-      if (preg && preg.estado !== 'enviada' && !preg.respuesta_real
-          && preg.ia_respuesta && !String(preg.ia_respuesta).startsWith('ERROR')) {
-        const cuenta = await getCuentaPorId(preg.cuenta_id);
-        let texto = String(preg.ia_respuesta).trim();
-        const _ra = await responderEnML(cuenta, id, texto, preg.item_id);
-        if (_ra && _ra.reactivada) texto = _ra.texto;
-        await db.from('pq_preguntas').update({
-          estado: 'enviada', enviada_at: new Date().toISOString(), envio_error: null,
-          respondida_por: 'RespondIA', respuesta_real: texto, enviar_at: null
-        }).eq('id', id);
-        enviada = true;
-      }
-    } catch (e) { envio_error = e.message.slice(0, 300); }
-  }
-  res.json({ ok: true, enviada, envio_error });
-});
-
-// FRENAR: saca una respuesta de la cola de envio automatico -> queda para humano
-app.post('/api/frenar', soloPanel, requierePermiso('responder'), async (req, res) => {
-  const { error } = await db.from('pq_preguntas').update({
-    estado: 'demo', enviar_at: null
-  }).eq('id', req.body.id).eq('estado', 'programada');
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ ok: true });
-});
-
-// RESPONDER YO: envia AHORA la respuesta escrita por el humano a Mercado Libre
-app.post('/api/responder', soloPanel, requierePermiso('responder'), async (req, res) => {
-  try {
-    const { id, texto } = req.body;
-    if (!texto || !String(texto).trim()) return res.status(400).json({ error: 'falta el texto' });
-    const { data: preg } = await db.from('pq_preguntas').select('id, cuenta_id, estado, item_id').eq('id', id).single();
-    if (!preg) return res.status(404).json({ error: 'pregunta no encontrada' });
-    if (preg.estado === 'enviada') return res.status(400).json({ error: 'esta pregunta ya fue respondida' });
-    const cuenta = await getCuentaPorId(preg.cuenta_id);
-    if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-
-    const _rea = await responderEnML(cuenta, id, String(texto).trim(), preg.item_id);
-
-    await db.from('pq_preguntas').update({
-      estado: 'enviada', enviada_at: new Date().toISOString(), envio_error: null,
-      respondida_por: (req.usuario && req.usuario.email !== 'master') ? req.usuario.email : 'panel',
-      respuesta_real: (_rea && _rea.texto) || String(texto).trim(), enviar_at: null,
-      revisada: true, revisada_at: new Date().toISOString()
-    }).eq('id', id);
-
-    res.json({ ok: true, reactivada: !!(_rea && _rea.reactivada) });
-  } catch (e) {
-    const msg = String(e.message || '');
-    // ML avisa que esa pregunta YA estaba respondida (se respondio por fuera del
-    // panel). En vez de dejar el error, traemos la respuesta real de ML y
-    // sincronizamos la ficha: la tarjeta deja de figurar como pendiente.
-    if (msg.includes('not_unanswered_question') || msg.includes('question_already_answered')) {
-      try {
-        const { data: p2 } = await db.from('pq_preguntas').select('cuenta_id').eq('id', req.body.id).single();
-        const cta = p2 && await getCuentaPorId(p2.cuenta_id);
-        const qml = cta && await mlGet('/questions/' + req.body.id, cta);
-        const real = qml && qml.answer && qml.answer.text ? String(qml.answer.text).trim() : null;
-        if (real) {
-          await db.from('pq_preguntas').update({
-            estado: 'enviada', respuesta_real: real, envio_error: null, enviar_at: null,
-            enviada_at: (qml.answer.date_created || new Date().toISOString()),
-            respondida_por: 'Mercado Libre', revisada: true, revisada_at: new Date().toISOString()
-          }).eq('id', req.body.id);
-          return res.json({ ok: false, ya_respondida: true, respuesta: real });
-        }
-      } catch (e2) { /* si no la pudimos traer, cae al error normal */ }
-      return res.json({ ok: false, ya_respondida: true });
-    }
-    // tipico: falta el permiso de escritura en ML
-    res.status(500).json({ error: e.message.slice(0, 400) });
-  }
-});
-
-app.get('/api/reglas', soloPanel, async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  const { data } = await db.from('pq_reglas').select('*').eq('cuenta_id', cuenta.id).order('creado_at', { ascending: false });
-  res.json(data || []);
-});
-
-app.post('/api/regla', soloPanel, async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  const { ambito, sku, disparador, respuesta, tipo, origen } = req.body;
-  const { error } = await db.from('pq_reglas').insert({
-    cuenta_id: cuenta.id, ambito: ambito || 'global', sku: ambito === 'sku' ? sku : null,
-    disparador: disparador || null, respuesta, tipo: tipo || 'texto', origen: origen || 'manual'
-  });
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ ok: true });
-});
-
-app.post('/api/regla/editar', soloPanel, async (req, res) => {
-  const { id, respuesta, disparador, ambito, sku } = req.body;
-  if (!id || !respuesta || !String(respuesta).trim()) return res.status(400).json({ error: 'falta la respuesta' });
-  const { error } = await db.from('pq_reglas').update({
-    respuesta: String(respuesta).trim(),
-    disparador: disparador || null,
-    ambito: ambito || 'global',
-    sku: ambito === 'sku' ? (sku || null) : null
-  }).eq('id', id);
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ ok: true });
-});
-
-app.post('/api/regla/borrar', soloPanel, async (req, res) => {
-  await db.from('pq_reglas').delete().eq('id', req.body.id);
-  res.json({ ok: true });
-});
-
-// ---- CONFIG COMPLETA (estilo + todos los ajustes nuevos) ----
-app.get('/api/config', soloPanel, async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-  res.json({ estilo: cuenta.estilo_venta || '', config: configDe(cuenta) });
-});
-
-app.post('/api/config', soloPanel, requiereRol('master','dueno','gerente'), async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-  const upd = {};
-  if (req.body.estilo !== undefined) upd.estilo_venta = req.body.estilo || '';
-  if (req.body.config !== undefined) {
-    // merge sobre lo existente para no perder claves
-    upd.config = Object.assign({}, configDe(cuenta), req.body.config);
-    // sanidad de franjas: filtrar filas incompletas
-    if (Array.isArray(upd.config.franjas)) {
-      upd.config.franjas = upd.config.franjas.filter(f => f && f.desde && f.hasta);
-    }
-  }
-  const { error } = await db.from('pq_cuentas').update(upd).eq('id', cuenta.id);
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ ok: true, config: upd.config || configDe(cuenta) });
-});
-
-app.get('/api/sugerencias', soloPanel, async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  const { data } = await db.from('pq_sugerencias').select('*').eq('cuenta_id', cuenta.id)
-    .eq('estado', 'pendiente').order('frecuencia', { ascending: false });
-  res.json(data || []);
-});
-
-app.post('/api/sugerencia/estado', soloPanel, async (req, res) => {
-  await db.from('pq_sugerencias').update({ estado: req.body.estado }).eq('id', req.body.id);
-  res.json({ ok: true });
-});
-
-app.post('/api/item/nota', soloPanel, async (req, res) => {
-  await db.from('pq_items').update({ nota_reposicion: req.body.nota || null }).eq('item_id', req.body.item_id);
-  res.json({ ok: true });
-});
-
-// =====================================================================
-// DIAGNOSTICO: /diag/item?id=MLA...&clave=...
-// =====================================================================
-app.get('/diag/item', soloPanel, async (req, res) => {
-  try {
-    const cuenta = await resolverCuenta(req);
-    if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-    const id = req.query.id;
-    if (!id) return res.status(400).json({ error: 'falta ?id=MLA...' });
-
-    const item = await mlGet('/items/' + id, cuenta);
-    const attrSku = (item.attributes || []).find(a => a.id === 'SELLER_SKU');
-
-    res.json({
-      item_id: item.id,
-      titulo: item.title,
-      seller_custom_field: item.seller_custom_field || null,
-      seller_sku: item.seller_sku || null,
-      atributo_SELLER_SKU: attrSku ? attrSku.value_name : null,
-      variaciones: (item.variations || []).map(v => ({
-        color: descVariante(v.attribute_combinations), sku: sacarSku(v),
-        stock: v.available_quantity, precio: v.price ?? null
-      })),
-      todos_los_atributos: (item.attributes || []).map(a => ({ id: a.id, nombre: a.name, valor: a.value_name }))
-    });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// IMPORTAR HISTORICO: POST /api/importar {filas:[{id,item_id,texto,respuesta,fecha,vendio}]}
-// Viene del panel (CSV de GoBots parseado). Inserta sin pisar lo existente.
-app.post('/api/importar', soloPanel, async (req, res) => {
-  try {
-    const cuenta = await resolverCuenta(req);
-    if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-    const filas = Array.isArray(req.body.filas) ? req.body.filas : [];
-    if (!filas.length) return res.status(400).json({ error: 'sin filas' });
-    if (filas.length > 500) return res.status(400).json({ error: 'maximo 500 filas por lote' });
-
-    // mapear item_id -> sku con el cache que ya tenemos
-    const itemIds = [...new Set(filas.map(f => f.item_id).filter(Boolean))];
-    const { data: items } = await db.from('pq_items').select('item_id, sku').eq('cuenta_id', cuenta.id).in('item_id', itemIds);
-    const skuDe = {}; (items || []).forEach(i => skuDe[i.item_id] = i.sku);
-
-    const registros = filas
-      .filter(f => f.id && String(f.id).match(/^\d+$/))
-      .map(f => {
-        const sku = skuDe[f.item_id] || null;
-        return {
-          id: Number(f.id),
-          cuenta_id: cuenta.id,
-          item_id: f.item_id || null,
-          sku, sku_madre: skuMadre(sku),
-          texto: (f.texto || '').slice(0, 4000),
-          respuesta_real: (f.respuesta || '').slice(0, 4000) || null,
-          fecha_pregunta: f.fecha ? String(f.fecha).replace(' ', 'T') + '-03:00' : null,
-          estado: 'historico',
-          revisada: true,
-          convirtio: f.vendio === true ? true : (f.vendio === false ? false : null)
-        };
-      });
-
-    const { error, count } = await db.from('pq_preguntas')
-      .upsert(registros, { onConflict: 'id', ignoreDuplicates: true, count: 'exact' });
-    if (error) return res.status(500).json({ error: error.message });
-    res.json({ ok: true, recibidas: filas.length, insertadas: count ?? registros.length });
-  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
-});
-
-// MANTENIMIENTO: /admin/refrescar-skus?clave=... -> relee todos los productos de ML
-// con la prioridad de SKU correcta y corrige items + preguntas guardadas.
-let refresco = { corriendo: false, items: 0, corregidos: 0, error: null };
-app.get('/admin/refrescar-skus', soloPanel, async (req, res) => {
-  if (refresco.corriendo) return res.json({ ok: false, msg: 'ya esta corriendo', refresco });
-  const cuenta = await resolverCuenta(req);
-  if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-  refresco = { corriendo: true, items: 0, corregidos: 0, error: null };
-  res.json({ ok: true, msg: 'refresco de SKUs arrancado. Mira el avance en /api/estado o repitiendo esta URL.' });
-
-  (async () => {
-    try {
-      const { data: items } = await db.from('pq_items').select('item_id, sku').eq('cuenta_id', cuenta.id);
-      const conocidos = new Set((items || []).map(i => i.item_id));
-      // sumar items que aparecen en preguntas (ej. historico importado) y no estan cacheados
-      const { data: sinSku } = await db.from('pq_preguntas').select('item_id')
-        .eq('cuenta_id', cuenta.id).is('sku', null).not('item_id', 'is', null).limit(8000);
-      const faltantes = [...new Set((sinSku || []).map(p => p.item_id))].filter(i => !conocidos.has(i));
-      const lista = [...(items || []), ...faltantes.map(i => ({ item_id: i, sku: null }))];
-
-      for (const it of lista) {
-        try {
-          const nuevo = await traerItem(cuenta, it.item_id, true); // force: relee de ML
-          refresco.items++;
-          if (nuevo && nuevo.sku && nuevo.sku !== it.sku) {
-            await db.from('pq_preguntas').update({ sku: nuevo.sku, sku_madre: skuMadre(nuevo.sku) })
-              .eq('cuenta_id', cuenta.id).eq('item_id', it.item_id);
-            refresco.corregidos++;
-          }
-          await new Promise(r => setTimeout(r, 150));
-        } catch (e) { /* item puntual fallo, seguimos */ }
-      }
-    } catch (e) { refresco.error = e.message; }
-    finally { refresco.corriendo = false; }
-  })();
-});
-
-// MANTENIMIENTO: /admin/verificar-conversiones?clave=... -> cruza preguntas con ventas de ML.
-// Marca convirtio=true cuando el mismo comprador compro ese producto DESPUES de preguntar.
-let conversiones = { corriendo: false, revisadas: 0, convertidas: 0, error: null };
-app.get('/admin/verificar-conversiones', soloPanel, async (req, res) => {
-  if (conversiones.corriendo) return res.json({ ok: false, msg: 'ya esta corriendo', conversiones });
-  const cuenta = await resolverCuenta(req);
-  if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-  conversiones = { corriendo: true, revisadas: 0, convertidas: 0, error: null };
-  res.json({ ok: true, msg: 'verificacion de conversiones arrancada. Repeti esta URL para ver el avance.' });
-
-  (async () => {
-    try {
-      // pendientes: nunca verificadas, o no-convertidas recientes (el comprador pudo comprar despues)
-      const hace30 = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();
-      const { data: pendientes } = await db.from('pq_preguntas')
-        .select('id, comprador_id, item_id, fecha_pregunta')
-        .eq('cuenta_id', cuenta.id)
-        .not('comprador_id', 'is', null)
-        .not('item_id', 'is', null)
-        .or(`conv_check_at.is.null,and(convirtio.eq.false,fecha_pregunta.gte.${hace30})`)
-        .order('fecha_pregunta', { ascending: false })
-        .limit(500);
-
-      // cache por comprador para no pedir dos veces las mismas ordenes
-      const ordenesDe = {};
-      for (const p of (pendientes || [])) {
-        try {
-          if (!(p.comprador_id in ordenesDe)) {
-            const d = await mlGet(`/orders/search?seller=${cuenta.ml_user_id}&buyer=${p.comprador_id}`, cuenta);
-            ordenesDe[p.comprador_id] = d.results || [];
-            await new Promise(r => setTimeout(r, 200));
-          }
-          const ordenes = ordenesDe[p.comprador_id];
-          const desde = p.fecha_pregunta ? new Date(p.fecha_pregunta) : null;
-          const match = ordenes.find(o =>
-            (o.order_items || []).some(oi => oi.item && oi.item.id === p.item_id) &&
-            (!desde || new Date(o.date_created) >= desde)
-          );
-          await db.from('pq_preguntas').update({
-            convirtio: !!match,
-            orden_id: match ? match.id : null,
-            convirtio_at: match ? match.date_created : null,
-            conv_check_at: new Date().toISOString()
-          }).eq('id', p.id);
-          conversiones.revisadas++;
-          if (match) conversiones.convertidas++;
-        } catch (e) { /* pregunta puntual fallo (ej. permiso), seguimos */ conversiones.error = e.message.slice(0, 200); }
-      }
-    } catch (e) { conversiones.error = e.message; }
-    finally { conversiones.corriendo = false; }
-  })();
-});
-
-// SINCRONIZAR SIN-RESPONDER: pregunta a ML el estado real de cada una marcada
-// como sin responder. Si ML dice que ya esta respondida, la sincroniza y la saca.
-let sincro = { corriendo: false, revisadas: 0, sincronizadas: 0, siguen: 0, error: null };
-app.get('/admin/sincronizar-preguntas', soloPanel, async (req, res) => {
-  if (sincro.corriendo) return res.json({ ok: false, msg: 'ya esta corriendo', sincro });
-  const cuenta = await resolverCuenta(req);
-  if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-  sincro = { corriendo: true, revisadas: 0, sincronizadas: 0, siguen: 0, error: null };
-  res.json({ ok: true, msg: 'sincronizacion arrancada. Repeti esta URL para ver el avance.' });
-
-  (async () => {
-    try {
-      const { data: pend } = await db.from('pq_preguntas')
-        .select('id')
-        .eq('cuenta_id', cuenta.id)
-        .is('respuesta_real', null).neq('estado', 'enviada').neq('estado', 'historico')
-        .limit(2000);
-
-      for (const p of (pend || [])) {
-        try {
-          const qml = await mlGet('/questions/' + p.id + '?api_version=4', cuenta);
-          const respondida = qml.status === 'ANSWERED' || !!qml.answer;
-          if (respondida) {
-            await db.from('pq_preguntas').update({
-              respuesta_real: qml.answer?.text || '(respondida en ML)',
-              estado: 'historico',
-              revisada: true
-            }).eq('id', p.id);
-            sincro.sincronizadas++;
-          } else if (['DELETED','DISABLED','BANNED','CLOSED_UNANSWERED','UNDER_REVIEW'].includes(qml.status)) {
-            // pregunta que ya no se puede responder (borrada/cerrada): la archivamos
-            await db.from('pq_preguntas').update({ estado: 'historico', revisada: true }).eq('id', p.id);
-            sincro.sincronizadas++;
-          } else {
-            sincro.siguen++;
-          }
-          sincro.revisadas++;
-          await new Promise(r => setTimeout(r, 120));
-        } catch (e) {
-          // si ML da 404 (pregunta borrada) o similar, la archivamos para sacarla de la bandeja
-          if (String(e.message).includes('404') || String(e.message).includes('not_found')) {
-            await db.from('pq_preguntas').update({ estado: 'historico', revisada: true }).eq('id', p.id);
-            sincro.sincronizadas++;
-          }
-          sincro.revisadas++;
-        }
-      }
-    } catch (e) { sincro.error = e.message; }
-    finally { sincro.corriendo = false; }
-  })();
-});
-
-// PROCESAR PENDIENTES: reprocesa las preguntas sin responder que quedaron de
-// antes. Verifica contra ML que sigan vivas, regenera respuesta con el contexto
-// actual y las encola al automatico (solo confianza ALTA; media/baja a revision).
-let encolado = { corriendo: false, revisadas: 0, encoladas: 0, revision: 0, archivadas: 0, error: null };
-app.get('/admin/procesar-pendientes', soloPanel, requiereRol('master', 'dueno', 'gerente'), async (req, res) => {
-  if (encolado.corriendo) return res.json({ ok: false, msg: 'ya esta corriendo', encolado });
-  const cuenta = await resolverCuenta(req);
-  if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-  const cfg = configDe(cuenta);
-  if (!cfg.auto_responder) return res.json({ ok: false, msg: 'el automatico esta APAGADO: prendelo primero en Ajustes para que esto tenga efecto' });
-  encolado = { corriendo: true, revisadas: 0, encoladas: 0, revision: 0, archivadas: 0, error: null };
-  res.json({ ok: true, msg: 'procesando pendientes. Repeti esta URL o mira el panel para el avance.' });
-
-  (async () => {
-    try {
-      const { data: pend } = await db.from('pq_preguntas')
-        .select('id')
-        .eq('cuenta_id', cuenta.id)
-        .is('respuesta_real', null)
-        .not('estado', 'in', '(enviada,historico,programada,enviando)')
-        .order('fecha_pregunta', { ascending: false })
-        .limit(200);
-
-      for (const p of (pend || [])) {
-        try {
-          const qml = await mlGet('/questions/' + p.id + '?api_version=4', cuenta);
-          await procesarPregunta(cuenta, qml); // aplica status ML + auto + franjas + anti-pelea
-          const { data: fila } = await db.from('pq_preguntas').select('estado').eq('id', p.id).single();
-          if (fila?.estado === 'programada') encolado.encoladas++;
-          else if (fila?.estado === 'historico') encolado.archivadas++;
-          else encolado.revision++;
-          encolado.revisadas++;
-          await new Promise(r => setTimeout(r, 300));
-        } catch (e) {
-          if (String(e.message).includes('404')) {
-            await db.from('pq_preguntas').update({ estado: 'historico', revisada: true }).eq('id', p.id);
-            encolado.archivadas++;
-          }
-          encolado.revisadas++;
-        }
-      }
-    } catch (e) { encolado.error = e.message; }
-    finally { encolado.corriendo = false; }
-  })();
-});
-
-// RELLENO DE APODOS: completa comprador_nick en preguntas viejas (pre v4.1).
-let nicksJob = { corriendo: false, revisadas: 0, completadas: 0, error: null };
-app.get('/admin/rellenar-nicks', soloPanel, requiereRol('master'), async (req, res) => {
-  if (nicksJob.corriendo) return res.json({ ok: false, msg: 'ya esta corriendo', nicksJob });
-  const cuenta = await resolverCuenta(req);
-  if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-  nicksJob = { corriendo: true, revisadas: 0, completadas: 0, error: null };
-  res.json({ ok: true, msg: 'relleno de apodos arrancado. Repeti esta URL para ver el avance.' });
-
-  (async () => {
-    try {
-      // en tandas hasta agotar (compradores repetidos salen del cache: rapido)
-      for (let vuelta = 0; vuelta < 40; vuelta++) {
-        const { data: filas } = await db.from('pq_preguntas')
-          .select('id, comprador_id')
-          .eq('cuenta_id', cuenta.id)
-          .is('comprador_nick', null)
-          .not('comprador_id', 'is', null)
-          .limit(500);
-        if (!filas || !filas.length) break;
-        for (const f of filas) {
-          const nick = await nickComprador(cuenta, f.comprador_id);
-          await db.from('pq_preguntas').update({ comprador_nick: nick || '(sin apodo)' }).eq('id', f.id);
-          nicksJob.revisadas++;
-          if (nick) nicksJob.completadas++;
-          if (!_nicks.has(f.comprador_id)) await new Promise(r => setTimeout(r, 80));
-        }
-      }
-    } catch (e) { nicksJob.error = e.message; }
-    finally { nicksJob.corriendo = false; }
-  })();
-});
-
-// DIAGNOSTICO de config/franjas: /diag/envio?clave=... -> que haria ahora mismo
-app.get('/diag/envio', soloPanel, async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-  const cfg = configDe(cuenta);
-  const envio = calcularEnvio(cfg);
-  res.json({
-    cuenta: cuenta.nombre,
-    auto_responder: !!cfg.auto_responder,
-    hora_local: horaLocal(cfg.timezone),
-    timezone: cfg.timezone,
-    decision_ahora: envio.enviar_at ? { enviar_at: envio.enviar_at, motivo: envio.motivo } : { enviar_at: null, motivo: envio.motivo },
-    franjas: cfg.franjas,
-    max_respuestas_seguidas: cfg.max_respuestas_seguidas,
-    ventana_hilo_dias: cfg.ventana_hilo_dias
-  });
-});
-
-// =====================================================================
-// =====================================================================
-// DUELO DE IAs (Claude vs GPT) + COMPARADOR + selector de IA por cuenta
-// =====================================================================
-
-// Elige una pregunta real de la cuenta (o una puntual por id) y genera la
-// respuesta con AMBAS IA sobre el MISMO contexto (ficha/reglas/historial).
-async function armarPelea(cuenta, preguntaId, excluir) {
-  const skip = new Set((excluir || []).map(String));
-  let fila = null;
-  if (preguntaId) {
-    const { data } = await db.from('pq_preguntas').select('*')
-      .eq('id', preguntaId).eq('cuenta_id', cuenta.id).single();
-    fila = data || null;
-  } else {
-    const { data } = await db.from('pq_preguntas')
-      .select('*').eq('cuenta_id', cuenta.id)
-      .not('item_id', 'is', null).not('texto', 'is', null)
-      .order('fecha_pregunta', { ascending: false }).limit(200);
-    // dedupe por texto (preguntas iguales de distintos compradores colapsan a una)
-    const vistas = new Set(); const unicas = [];
-    for (const x of (data || [])) {
-      const t = (x.texto || '').trim();
-      if (t.length < 3) continue;
-      const k = t.toLowerCase();
-      if (vistas.has(k)) continue;
-      vistas.add(k); unicas.push(x);
-    }
-    // sacar las ya mostradas en esta sesion; si no queda ninguna, empezar de nuevo
-    let pool = unicas.filter(x => !skip.has(String(x.id)));
-    if (!pool.length) pool = unicas;
-    if (pool.length) fila = pool[Math.floor(Math.random() * pool.length)];
-  }
-  if (!fila) throw new Error('No hay preguntas reales con producto para pelear. Sincroniza preguntas primero.');
-
-  const item = fila.item_id ? await traerItem(cuenta, fila.item_id) : null;
-  const q = {
-    id: fila.id, item_id: fila.item_id || null, sku: item?.sku || fila.sku || null,
-    comprador_id: fila.comprador_id || null, texto: fila.texto || '',
-    fecha_pregunta: fila.fecha_pregunta || null, respuesta_real: fila.respuesta_real || null
-  };
-  const cfg = configDe(cuenta);
-  const hilo = await hiloComprador(cuenta, q.comprador_id, q.item_id, q.id, cfg.ventana_hilo_dias);
-
-  // las TRES IA en PARALELO, mismo contexto, marcado como prueba (no consume pack)
-  const [claudeIa, gptIa, gemIa] = await Promise.all([
-    generarRespuesta(cuenta, q, item, hilo, MODELO_IA, true),
-    generarRespuesta(cuenta, q, item, hilo, MODELO_GPT, true),
-    generarRespuesta(cuenta, q, item, hilo, MODELO_GEMINI, true)
-  ]);
-
-  const pack = (ia, clave) => ({
-    ia: clave, modelo: ia._meta.modelo, respuesta: ia.respuesta,
-    confianza: ia.confianza, fuente: ia.fuente,
-    costo: ia._meta.costo, inTok: ia._meta.inTok, outTok: ia._meta.outTok
-  });
-
-  return {
-    pregunta: { id: q.id, texto: q.texto, item_id: q.item_id, titulo: item?.titulo || null, respuesta_real: q.respuesta_real },
-    claude: pack(claudeIa, 'claude'),
-    gpt: pack(gptIa, 'gpt'),
-    gemini: pack(gemIa, 'gemini')
-  };
-}
-
-// --- DUELO A CIEGAS (solo master): A/B/C mezclados, se revela al votar ---
-app.get('/api/duelo/generar', soloPanel, requiereRol('master'), async (req, res) => {
-  try {
-    const cuenta = await resolverCuenta(req);
-    if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-    const excluir = (req.query.excluir || '').split(',').map(s => s.trim()).filter(Boolean);
-    const pelea = await armarPelea(cuenta, req.query.pregunta_id, excluir);
-
-    // mezclar los 3 al azar en A/B/C (a ciegas)
-    const baraja = [pelea.claude, pelea.gpt, pelea.gemini].sort(() => Math.random() - 0.5);
-    const [A, B, C] = baraja;
-
-    const { data: row, error } = await db.from('pq_duelo').insert({
-      cuenta_id: cuenta.id, pregunta_id: pelea.pregunta.id, pregunta_texto: pelea.pregunta.texto,
-      item_id: pelea.pregunta.item_id,
-      modelo_a: A.ia, modelo_b: B.ia, modelo_c: C.ia,
-      resp_a: A.respuesta, resp_b: B.respuesta, resp_c: C.respuesta,
-      costo_a: A.costo, costo_b: B.costo, costo_c: C.costo,
-      in_a: A.inTok, out_a: A.outTok, in_b: B.inTok, out_b: B.outTok, in_c: C.inTok, out_c: C.outTok
-    }).select('id').single();
-    if (error) return res.status(500).json({ error: error.message });
-
-    // A CIEGAS: no se manda ni modelo ni costo todavia. Se manda pregunta.id para no repetir.
-    res.json({
-      duelo_id: row.id,
-      pregunta: { id: pelea.pregunta.id, texto: pelea.pregunta.texto, titulo: pelea.pregunta.titulo, respuesta_real: pelea.pregunta.respuesta_real },
-      A: { respuesta: A.respuesta, confianza: A.confianza },
-      B: { respuesta: B.respuesta, confianza: B.confianza },
-      C: { respuesta: C.respuesta, confianza: C.confianza }
-    });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// --- VOTAR: registra el voto y RECIEN AHI revela quien fue quien ---
-app.post('/api/duelo/votar', soloPanel, requiereRol('master'), async (req, res) => {
-  try {
-    const { duelo_id, voto } = req.body; // 'A' | 'B' | 'C' | 'empate'
-    if (!duelo_id || !['A', 'B', 'C', 'empate'].includes(voto)) return res.status(400).json({ error: 'voto invalido' });
-    const { data: d } = await db.from('pq_duelo').select('*').eq('id', duelo_id).single();
-    if (!d) return res.status(404).json({ error: 'duelo no encontrado' });
-    const mapa = { A: d.modelo_a, B: d.modelo_b, C: d.modelo_c };
-    const ganador = voto === 'empate' ? 'empate' : mapa[voto];
-    await db.from('pq_duelo').update({ voto, ganador, votado_at: new Date().toISOString() }).eq('id', duelo_id);
-    res.json({ ok: true, ganador, revelado: {
-      A: { ia: d.modelo_a, costo: d.costo_a },
-      B: { ia: d.modelo_b, costo: d.costo_b },
-      C: { ia: d.modelo_c, costo: d.costo_c }
-    } });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// --- TANTEADOR: marcador acumulado + costo promedio + proyeccion mensual ---
-app.get('/api/duelo/tanteador', soloPanel, requiereRol('master'), async (req, res) => {
-  try {
-    const cuenta = await resolverCuenta(req);
-    if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-    const volumen = Number(req.query.volumen) || 20000;
-    const { data: filas } = await db.from('pq_duelo').select('*').eq('cuenta_id', cuenta.id);
-    const todas = filas || [];
-    const votadas = todas.filter(d => d.ganador);
-    const ganan = (g) => votadas.filter(d => d.ganador === g).length;
-
-    const costos = { claude: [], gpt: [], gemini: [] };
-    for (const d of todas) {
-      if (costos[d.modelo_a]) costos[d.modelo_a].push(Number(d.costo_a) || 0);
-      if (costos[d.modelo_b]) costos[d.modelo_b].push(Number(d.costo_b) || 0);
-      if (costos[d.modelo_c]) costos[d.modelo_c].push(Number(d.costo_c) || 0);
-    }
-    const prom = (a) => a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0;
-    const pC = prom(costos.claude), pG = prom(costos.gpt), pM = prom(costos.gemini);
-
-    res.json({
-      total_peleas: todas.length, votadas: votadas.length,
-      gana_claude: ganan('claude'), gana_gpt: ganan('gpt'), gana_gemini: ganan('gemini'), empates: ganan('empate'),
-      costo_prom_claude: pC, costo_prom_gpt: pG, costo_prom_gemini: pM,
-      volumen, proy_claude: pC * volumen, proy_gpt: pG * volumen, proy_gemini: pM * volumen,
-      modelo_claude: MODELO_IA, modelo_gpt: MODELO_GPT, modelo_gemini: MODELO_GEMINI
-    });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// --- COMPARADOR (cliente nuevo): a CARA DESCUBIERTA, con costo y recomendacion ---
-app.get('/api/comparador/generar', soloPanel, async (req, res) => {
-  try {
-    const cuenta = await resolverCuenta(req);
-    if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-    const excluir = (req.query.excluir || '').split(',').map(s => s.trim()).filter(Boolean);
-    const pelea = await armarPelea(cuenta, req.query.pregunta_id, excluir);
-    try {
-      await db.from('pq_duelo').insert({
-        cuenta_id: cuenta.id, pregunta_id: pelea.pregunta.id, pregunta_texto: pelea.pregunta.texto,
-        item_id: pelea.pregunta.item_id,
-        modelo_a: 'claude', modelo_b: 'gpt', modelo_c: 'gemini',
-        resp_a: pelea.claude.respuesta, resp_b: pelea.gpt.respuesta, resp_c: pelea.gemini.respuesta,
-        costo_a: pelea.claude.costo, costo_b: pelea.gpt.costo, costo_c: pelea.gemini.costo,
-        in_a: pelea.claude.inTok, out_a: pelea.claude.outTok, in_b: pelea.gpt.inTok, out_b: pelea.gpt.outTok,
-        in_c: pelea.gemini.inTok, out_c: pelea.gemini.outTok,
-        origen: 'comparador'
-      });
-    } catch (e) {}
-    const trio = [pelea.claude, pelea.gpt, pelea.gemini];
-    const mas_barato = trio.slice().sort((a, b) => a.costo - b.costo)[0].ia;
-    res.json({
-      pregunta: { id: pelea.pregunta.id, texto: pelea.pregunta.texto, titulo: pelea.pregunta.titulo, respuesta_real: pelea.pregunta.respuesta_real },
-      claude: pelea.claude, gpt: pelea.gpt, gemini: pelea.gemini,
-      mas_barato
-    });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// --- ELEGIR QUE IA RESPONDE ESTA CUENTA (master elige por cuenta; el dueno la suya) ---
-app.post('/api/cuenta/ia', soloPanel, requiereRol('master', 'dueno', 'gerente'), async (req, res) => {
-  try {
-    const cuenta = await resolverCuenta(req);
-    if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-    const ia = req.body.ia === 'gpt' ? 'gpt' : 'claude';
-    const nuevaConfig = Object.assign({}, configDe(cuenta), { ia_responde: ia });
-    const { error } = await db.from('pq_cuentas').update({ config: nuevaConfig }).eq('id', cuenta.id);
-    if (error) return res.status(500).json({ error: error.message });
-    res.json({ ok: true, ia_responde: ia });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// =====================================================================
-// MODULO POSVENTA: mensajeria de ML + embudo + IA + adjuntos (manuales)
-// =====================================================================
-const PV_ESTADOS = ['nuevo', 'encurso', 'esperando', 'resuelto'];
-const PV_MOTIVOS = ['manual', 'pieza', 'armado', 'envio', 'factura', 'devolucion', 'otro'];
-
-// Candidatos de SKU madre para matchear archivos de la biblioteca:
-// el SKU completo, el madre (hasta el 1er guion) y los dos primeros tramos
-// (para familias con guion en el nombre, ej: AL-120-NE -> AL-120).
-function pvCandidatosSku(sku) {
-  const s = String(sku || '').trim().toUpperCase();
-  if (!s) return [];
-  const partes = s.split('-');
-  const c = new Set([s, partes[0]]);
-  if (partes.length >= 2) c.add(partes[0] + '-' + partes[1]);
-  return [...c].filter(Boolean);
-}
-
-// ¿Este archivo de la biblioteca aplica a este SKU? (mismo criterio que las reglas)
-function pvArchivoAplica(a, sku) {
-  const s = String(sku || '').trim().toUpperCase();
-  const pat = String(a.patron || a.sku_madre || '').trim().toUpperCase();
-  const amb = a.ambito || (a.sku_madre ? 'madre' : 'global');
-  if (amb === 'global') return true;
-  if (!s || !pat) return false;
-  const cands = pvCandidatosSku(s);
-  if (amb === 'sku')     return s === pat;
-  if (amb === 'madre')   return cands.includes(pat);
-  if (amb === 'prefijo') return s.startsWith(pat);
-  if (amb === 'lista')   return pat.split(',').map(x => x.trim()).filter(Boolean)
-                                 .some(x => x === s || cands.includes(x));
-  return false;
-}
-
-// Sube un archivo a la mensajeria de ML y devuelve el id del adjunto
-async function mlSubirAdjunto(cuenta, buf, nombre, mime) {
-  const token = await getAccessToken(cuenta);
-  const fd = new FormData();
-  fd.append('file', new Blob([buf], { type: mime || 'application/pdf' }), nombre);
-  const r = await fetch('https://api.mercadolibre.com/messages/attachments?tag=post_sale&site_id=MLA', {
-    method: 'POST', headers: { Authorization: 'Bearer ' + token }, body: fd
-  });
-  const d = await r.json().catch(() => ({}));
-  if (!r.ok || !d.id) throw new Error('ML adjunto -> ' + r.status + ' ' + JSON.stringify(d).slice(0, 200));
-  return d.id;
-}
-
-// Baja un archivo de la biblioteca (Supabase Storage, bucket "manuales")
-async function bajarArchivo(ruta) {
-  const r = await fetch(`${SUPABASE_URL}/storage/v1/object/manuales/${ruta}`, {
-    headers: { Authorization: 'Bearer ' + SUPABASE_KEY, apikey: SUPABASE_KEY }
-  });
-  if (!r.ok) throw new Error('No pude bajar el archivo de la biblioteca (' + r.status + ')');
-  return Buffer.from(await r.arrayBuffer());
-}
-
-// estado de envio de ML -> criollo
-function pvEnvioTxt(s) {
-  return ({ pending: 'pendiente de preparar', handling: 'en preparacion', ready_to_ship: 'listo para despachar',
-    shipped: 'en camino', delivered: 'ya entregado', not_delivered: 'con problema de entrega (no entregado)',
-    cancelled: 'cancelado' })[String(s || '').toLowerCase()] || s || null;
-}
-
-// Baja un adjunto de la mensajeria de ML en base64, para que la IA lo MIRE
-async function bajarAdjuntoMLB64(cuenta, attId) {
-  const token = await getAccessToken(cuenta);
-  const r = await fetch(`https://api.mercadolibre.com/messages/attachments/${attId}?tag=post_sale&site_id=MLA`, {
-    headers: { Authorization: 'Bearer ' + token }
-  });
-  if (!r.ok) throw new Error('adjunto ' + r.status);
-  const buf = Buffer.from(await r.arrayBuffer());
-  if (buf.length > 4 * 1024 * 1024) throw new Error('adjunto muy grande para analizar');
-  return { mime: r.headers.get('content-type') || 'image/jpeg', b64: buf.toString('base64') };
-}
-
-// IA de posventa: clasifica el motivo y redacta un borrador (SIEMPRE a revision)
-async function generarBorradorPV(cuenta, conv, mensajes) {
-  const cfg = configDe(cuenta);
-  let item = null;
-  try { if (conv.item_id) item = await traerItem(cuenta, conv.item_id); } catch (e) {}
-  let archivos = [];
-  try {
-    const { data } = await db.from('pq_archivos').select('id, nombre, sku_madre, ambito, patron, disparador')
-      .eq('cuenta_id', cuenta.id).limit(200);
-    archivos = (data || []).filter(a => pvArchivoAplica(a, conv.sku || item?.sku)).slice(0, 12);
-  } catch (e) {}
-  const hiloTxt = (mensajes || []).slice(-12)
-    .map(m => `${m.de === 'comprador' ? 'COMPRADOR' : 'NOSOTROS'}: ${(m.texto || '').slice(0, 400)}`).join('\n');
-  // REGLAS DE RESPUESTA del vendedor (la lista de Ajustes de posventa): entran
-  // solo las que aplican a este SKU, con el mismo criterio que los archivos.
-  const reglasPV = (Array.isArray(cfg.pv_reglas_lista) ? cfg.pv_reglas_lista : [])
-    .filter(r => r && r.activa !== false && String(r.texto || '').trim())
-    .filter(r => (r.ambito || 'global') === 'global' || pvArchivoAplica(r, conv.sku || item?.sku))
-    .slice(0, 25);
-  const sys = `Sos el asistente de POSVENTA de ${cuenta.nombre || 'la tienda'} en Mercado Libre. El comprador YA COMPRO (orden ${conv.orden_id || conv.pack_id}). Tu unico objetivo es RESOLVER su problema con empatia y sin vueltas.
-REGLAS:
-- LIMITE DURO: la mensajeria de ML corta en 350 caracteres. Tu "respuesta" DEBE tener MENOS de 330 caracteres. Se breve, directo y resolutivo: un solo parrafo, sin rodeos.
-- Tono calido, humano y resolutivo. Reconoce el problema, nunca lo minimices ni culpes al comprador.
-- NUNCA prometas reembolsos, cambios ni plazos que no puedas cumplir. Si pide devolver, explicale que la devolucion se gestiona desde su compra en Mercado Libre.
-- PROTOCOLO FALTANTES/DANOS: si reporta pieza faltante, rota o producto danado: (1) si NO mando fotos, pedile foto del producto/la pieza Y SIEMPRE preguntale en que condiciones llego el EMBALAJE (caja golpeada, abierta, mojada): ese dato define el reclamo al transporte; (2) si YA mando fotos, MIRALAS y responde sobre lo que se ve, SIN volver a pedirselas; decile que lo resolvemos, sin prometer plazos.
-- Si mando FOTOS de comprobantes (constancia de inscripcion, factura, CUIT): LEE los datos de la foto y usalos. NUNCA le pidas datos que ya te paso en una imagen.
-- MANUALES Y ARCHIVOS, REGLA ESTRICTA: solo se adjunta un archivo si el comprador reporta un FALTANTE (le falta una pieza o parte) o si PIDE EXPLICITAMENTE el manual/instructivo. En CUALQUIER otro caso (dudas de armado, envio, factura, devolucion, consultas generales) el campo "adjunto" va VACIO, aunque un archivo parezca relacionado. Ademas debe coincidir el "cuando" del archivo. Cuando adjuntes, avisale que se lo mandas aca mismo.
-- Si pregunta por el ENVIO, decile que el estado se ve en su compra de ML; no inventes fechas.
-- Firma al final: "${(cfg.pv_firma || cfg.saludo_final || 'Saludos.').trim()}"
-${cfg.pv_reglas ? `REGLAS DEL VENDEDOR PARA POSVENTA (respetalas SIEMPRE):\n${String(cfg.pv_reglas).slice(0, 2000)}` : ''}
-${reglasPV.length ? `REGLAS DE RESPUESTA DEL VENDEDOR (OBLIGATORIAS; todas aplican a ESTE producto):\n${reglasPV.map(r => '- ' + String(r.texto).slice(0, 300)).join('\n')}` : ''}
-${item ? `PRODUCTO: ${item.titulo} (SKU ${conv.sku || item.sku || 's/d'})` : ''}
-${conv.envio_estado ? `ENVIO: el estado ACTUAL del envio de esta venta es "${pvEnvioTxt(conv.envio_estado)}" (dato real de ML, usalo si pregunta por su pedido).` : ''}
-${conv.fact_doc_nro ? `FACTURACION: la venta esta cargada con ${conv.fact_doc_tipo || 'documento'} ${conv.fact_doc_nro}.` : ''}${conv.fact_cuit_msg ? ` El comprador paso por mensaje el CUIT ${conv.fact_cuit_msg}${conv.fact_doc_nro && String(conv.fact_cuit_msg).replace(/\D/g, '') !== String(conv.fact_doc_nro).replace(/\D/g, '') ? ' que es DISTINTO al cargado en la venta: pide FACTURA A con esos datos; confirmale que la emitimos con ese CUIT.' : ' (coincide con el de la venta).'}` : ''}
-ARCHIVOS DISPONIBLES PARA ADJUNTAR (id | nombre | cuando se envia):
-${archivos.map(a => `- ${a.id} | ${a.nombre} | cuando: ${a.disparador || 'pide el manual o instrucciones'}`).join('\n') || '(ninguno)'}
-Responde SOLO este JSON:
-{"motivo":"manual|pieza|armado|envio|factura|devolucion|otro","respuesta":"...","adjunto":"id del archivo elegido o vacio","confianza":"alta|media|baja","cuit_detectado":"CUIT visible en el texto o en las fotos (solo numeros) o vacio"}`;
-  // fotos que mando el comprador (hasta 3, las ultimas): la IA las MIRA
-  const bloquesImg = [];
-  try {
-    const conFotos = (mensajes || []).filter(m => m.de === 'comprador' && m.adjuntos && m.adjuntos.length).slice(-3);
-    for (const m of conFotos) for (const a of m.adjuntos) {
-      if (bloquesImg.length >= 3 || !a.id) continue;
-      if (!/\.(jpe?g|png|webp)$/i.test(a.nombre || '')) continue;
-      try {
-        const f = await bajarAdjuntoMLB64(cuenta, a.id);
-        bloquesImg.push({ type: 'image', source: { type: 'base64', media_type: f.mime, data: f.b64 } });
-      } catch (e) {}
-    }
-  } catch (e) {}
-  const userTxt = `CONVERSACION:\n${hiloTxt}\n\nRedacta la mejor respuesta para el ultimo mensaje del comprador.`;
-  const contenido = bloquesImg.length
-    ? [...bloquesImg, { type: 'text', text: userTxt + '\nMIRA LAS FOTOS ADJUNTAS: pueden traer el CUIT de un comprobante, la pieza rota o el estado del embalaje.' }]
-    : userTxt;
-  const r = await llamarIA(modeloDe(cfg.pv_ia || cfg.ia_responde), sys, contenido, 800);
-  const j = parsearJson(r.texto);
-  const adjOk = archivos.find(a => a.id === String(j.adjunto || '').trim());
-  const cuitDig = String(j.cuit_detectado || '').replace(/\D/g, '');
-  return {
-    motivo: PV_MOTIVOS.includes(j.motivo) ? j.motivo : 'otro',
-    borrador: j.respuesta || null,
-    adjunto_id: adjOk ? adjOk.id : null,
-    confianza: j.confianza || 'media',
-    cuit: /^\d{11}$/.test(cuitDig) ? cuitDig : null
-  };
-}
-
-// Sincroniza la mensajeria: packs con mensajes sin leer -> conversaciones + borrador IA
-let _pvSyncOcupado = false;
-const _pvSalud = { fin: null, packs: 0, unread_err: null, error: null };
-async function sincronizarMensajesPV(cuenta) {
-  const uid = cuenta.ml_user_id;
-  let noLeidos = [];
-  try {
-    for (let off = 0; off < 150; off += 50) {
-      const d = await mlGet(`/messages/unread?role=seller&tag=post_sale&limit=50&offset=${off}`, cuenta);
-      const rs = (d.results || []);
-      noLeidos.push(...rs.map(x => String(x.resource || '').match(/\d{6,}/)?.[0]).filter(Boolean));
-      if (rs.length < 50) break;
-    }
-    _pvSalud.no_leidos = noLeidos.length;
-  } catch (e) {
-    _pvSalud.unread_err = String(e.message).slice(0, 150);
-    // plan B: el modo simple de siempre (por si ML rechaza limit/offset aca)
-    try {
-      const d = await mlGet(`/messages/unread?role=seller&tag=post_sale`, cuenta);
-      noLeidos = (d.results || []).map(x => String(x.resource || '').match(/\d{6,}/)?.[0]).filter(Boolean);
-      _pvSalud.no_leidos = noLeidos.length;
-      _pvSalud.unread_err = null;
-    } catch (e2) {}
-  }
-  // Ademas de lo sin leer, re-leemos las conversaciones ABIERTAS: asi captamos
-  // las respuestas que mandaste desde ML web (esas nunca figuran como "sin leer").
-  // ROTACION: re-leemos las abiertas ordenadas por "hace cuanto no las miro"
-  // (actualizado_at asc). Asi TODAS las conversaciones abiertas se refrescan
-  // en pocos ciclos, aunque haya muchas — ML marca leidos los mensajes cuando
-  // seguis el caso desde su web y dejan de figurar en "sin leer".
-  let abiertas = [];
-  try {
-    const { data } = await db.from('pq_conversaciones').select('pack_id')
-      .eq('cuenta_id', cuenta.id).neq('estado', 'resuelto')
-      .order('actualizado_at', { ascending: true }).limit(50);
-    abiertas = (data || []).map(x => x.pack_id);
-  } catch (e) {}
-  let procesados = 0;
-  let fallidos = 0;
-  let ultFallo = null;
-  let borradoresHechos = 0;
-  const TOPE_BORRADORES = 8;                    // la IA redacta de a 8 por ciclo: la INGESTA nunca espera
-  const topeTiempo = Date.now() + 150 * 1000;   // 150s por ciclo: corta prolijo y sigue en el proximo
-  for (const pack of [...new Set([...noLeidos, ...abiertas])].slice(0, 50)) {
-    if (Date.now() > topeTiempo) break;
-    try {
-      let hilo = await mlGet(`/messages/packs/${pack}/sellers/${uid}?tag=post_sale&mark_as_read=false&limit=40`, cuenta);
-      // ML devuelve los mensajes MAS VIEJOS primero: si la conversacion tiene
-      // mas de 40 (tipico con el bot del menu), los nuevos quedaban AFUERA.
-      // Pedimos la ultima pagina para tener siempre los 40 MAS RECIENTES.
-      const totalMsgs = (hilo && hilo.paging && Number(hilo.paging.total)) || 0;
-      if (totalMsgs > 40) {
-        try {
-          hilo = await mlGet(`/messages/packs/${pack}/sellers/${uid}?tag=post_sale&mark_as_read=false&limit=40&offset=${totalMsgs - 40}`, cuenta);
-        } catch (e) {}
-      }
-      const msgs = (hilo.messages || []).map(m => ({
-        ml_msg_id: String(m.id || m.message_id || ''),
-        de: String(m.from?.user_id) === String(uid) ? 'vendedor' : 'comprador',
-        texto: m.text || '',
-        adjuntos: (m.message_attachments || []).map(a => ({ nombre: a.original_filename || a.filename || 'archivo', id: a.filename || null })),
-        fecha: (m.message_date && (m.message_date.received || m.message_date.created)) || null
-      })).filter(m => m.texto || (m.adjuntos && m.adjuntos.length));
-      if (!msgs.length) continue;
-
-      // La conversacion que YA tenemos guardada (si existe). Se lee ACA, antes
-      // de usarla. OJO: si esta declaracion se baja despues del calculo de
-      // "enriquecer", cada vuelta del for muere con "Cannot access 'conv'
-      // before initialization" y el catch del final se lo come en silencio:
-      // el sync termina con 0 conversaciones y no entra NINGUN mensaje.
-      let { data: conv } = await db.from('pq_conversaciones').select('*')
-        .eq('cuenta_id', cuenta.id).eq('pack_id', String(pack)).single();
-
-      // datos de la orden (mejor esfuerzo). Si el pack no es una orden directa
-      // (compra de carrito), lo resolvemos via /packs -> orden real.
-      let orden = null;
-      try { orden = await mlGet(`/orders/${pack}`, cuenta); } catch (e) {}
-      if (!orden || !orden.order_items) {
-        try {
-          const pk = await mlGet(`/packs/${pack}`, cuenta);
-          const oid = pk && pk.orders && pk.orders[0] && pk.orders[0].id;
-          if (oid) orden = await mlGet(`/orders/${oid}`, cuenta);
-        } catch (e) {}
-      }
-      const oi = orden && orden.order_items && orden.order_items[0];
-      // Solo vale la pena re-consultar reclamos/envio/facturacion si hay
-      // mensajes sin leer, si faltan datos, o si pasaron 20+ min de la ultima
-      // pasada. Ahorra ~3 llamadas a ML por conversacion en cada ciclo.
-      const enriquecer = !conv || noLeidos.includes(pack) || !conv.envio_estado
-        || (Date.now() - new Date(conv.actualizado_at || 0).getTime()) > 20 * 60000;
-      // ¿tiene un reclamo abierto en ML? (se refresca cuando corresponde)
-      let reclamo = null;
-      if (enriquecer) try {
-        if (orden && orden.id) {
-          const cl = await mlGet(`/post-purchase/v1/claims/search?resource=order&resource_id=${orden.id}`, cuenta);
-          const abierto = (cl.data || cl.results || []).find(x => x.status && String(x.status).toLowerCase() !== 'closed');
-          if (abierto) reclamo = String(abierto.stage || abierto.status || 'abierto');
-        }
-      } catch (e) {}
-      // estado del envio (para el panel y para que la IA responda con datos reales)
-      let envioEstado = null;
-      if (enriquecer) try {
-        const shipId = orden && orden.shipping && orden.shipping.id;
-        if (shipId) {
-          const sh = await mlGet(`/shipments/${shipId}`, cuenta);
-          envioEstado = sh && sh.status ? String(sh.status) : null;
-        }
-      } catch (e) {}
-      // facturacion: documento cargado en la venta de ML
-      let factTipo = null, factNro = null;
-      if (enriquecer) try {
-        if (orden && orden.id) {
-          const bi = await mlGet(`/orders/${orden.id}/billing_info`, cuenta);
-          const b = (bi && (bi.billing_info || bi)) || {};
-          factTipo = b.doc_type || null; factNro = b.doc_number || null;
-        }
-      } catch (e) {}
-      // CUIT que el comprador paso POR MENSAJE (para factura A)
-      let cuitMsg = null;
-      for (const m of msgs) {
-        if (m.de !== 'comprador') continue;
-        const mm = String(m.texto || '').match(/\b(20|23|24|25|26|27|30|33|34)[-.\s]?(\d{8})[-.\s]?(\d)\b/);
-        if (mm) cuitMsg = (mm[1] + mm[2] + mm[3]);
-      }
-      // ¿el ultimo mensaje del comprador es SOLO un cierre/agradecimiento?
-      const esCierre = (m) => {
-        if (!m || m.de !== 'comprador') return false;
-        const t = String(m.texto || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-        if (t.length > 60 || /\?/.test(t)) return false;
-        if (m.adjuntos && m.adjuntos.length) return false;
-        const toks = t.replace(/[^a-zn ]/g, ' ').split(/\s+/).filter(Boolean);
-        if (!toks.length) return false;
-        const okSet = ['gracias','muchas','mil','ok','okey','oka','dale','perfecto','genial','buenisimo','excelente','listo','barbaro','joya','igualmente','saludos','buenas','vale','si','sii','buen','dia','tardes','noches','crack','capo','gral'];
-        const fuertes = ['gracias','perfecto','listo','genial','excelente','buenisimo','ok','okey','dale','joya','barbaro'];
-        return toks.every(x => okSet.includes(x)) && toks.some(x => fuertes.includes(x));
-      };
-      const compradorMsg = msgs.find(m => m.de === 'comprador');
-
-      // upsert de la conversacion (conv ya se leyo arriba, antes de "enriquecer")
-      const base = {
-        cuenta_id: cuenta.id, pack_id: String(pack),
-        orden_id: orden ? String(orden.id) : String(pack),
-        comprador_id: orden?.buyer?.id ? String(orden.buyer.id) : (conv?.comprador_id || null),
-        comprador_nick: orden?.buyer?.nickname || conv?.comprador_nick || null,
-        item_id: oi?.item?.id || conv?.item_id || null,
-        sku: oi?.item?.seller_sku || oi?.item?.seller_custom_field || conv?.sku || null,
-        titulo: oi?.item?.title || conv?.titulo || null,
-        reclamo: enriquecer ? reclamo : ((conv && conv.reclamo) || null),
-        fecha_venta: (orden && orden.date_created) || conv?.fecha_venta || null,
-        envio_estado: envioEstado || conv?.envio_estado || null,
-        fact_doc_tipo: factTipo || conv?.fact_doc_tipo || null,
-        fact_doc_nro: factNro || conv?.fact_doc_nro || null,
-        fact_cuit_msg: cuitMsg || conv?.fact_cuit_msg || null,
-        actualizado_at: new Date().toISOString()
-      };
-      if (!conv) {
-        const ins = await db.from('pq_conversaciones').insert({ ...base, estado: 'nuevo' }).select('*').single();
-        conv = ins.data;
-      } else {
-        await db.from('pq_conversaciones').update(base).eq('id', conv.id);
-        Object.assign(conv, base);
-      }
-      if (!conv) continue;
-
-      // mensajes nuevos, reconciliando nuestra copia local con la real de ML
-      // (evita el mensaje duplicado tras responder desde el panel)
-      const _res = await _guardarMensajesSinDuplicar(conv.id, msgs);
-      const nuevos = _res.insertados;   // solo lo realmente nuevo (para no regenerar de mas)
-      // mensajes viejos guardados sin el ID del adjunto: se lo completamos
-      try {
-        const { data: viejos } = await db.from('pq_mensajes').select('id, ml_msg_id, adjuntos').eq('conversacion_id', conv.id);
-        for (const v of (viejos || [])) {
-          const m = msgs.find(x => x.ml_msg_id === v.ml_msg_id);
-          if (!m || !m.adjuntos || !m.adjuntos.length) continue;
-          const sinId = !(v.adjuntos || []).length || (v.adjuntos || []).some(a => !a.id);
-          if (sinId && m.adjuntos.some(a => a.id)) {
-            await db.from('pq_mensajes').update({ adjuntos: m.adjuntos }).eq('id', v.id);
-          }
-        }
-      } catch (e) {}
-
-      // estado del embudo + borrador de la IA si el ultimo hablo el comprador
-      const ultimo = msgs[msgs.length - 1];
-      const upd = {
-        ult_de: ultimo.de, ult_mensaje_at: ultimo.fecha || new Date().toISOString(),
-        ult_texto: (ultimo.texto || ((ultimo.adjuntos && ultimo.adjuntos.length) ? '📎 mando un archivo adjunto' : '')).slice(0, 300),
-        no_leidos: msgs.filter(m => m.de === 'comprador').length,
-        actualizado_at: new Date().toISOString()
-      };
-      if (ultimo.de === 'comprador' && esCierre(ultimo)) {
-        // "Gracias" / "perfecto" y nada mas: no hay nada que responder -> resuelta sola
-        upd.estado = 'resuelto';
-        if (!conv.resuelta_at) upd.resuelta_at = ultimo.fecha || new Date().toISOString();
-        upd.ia_borrador = null; upd.ia_adjunto_id = null; upd.no_leidos = 0;
-      } else if (ultimo.de === 'comprador') {
-        if (conv.estado === 'resuelto' || conv.estado === 'esperando') upd.estado = 'nuevo'; // se reabre
-        if ((nuevos.some(m => m.de === 'comprador') || !conv.ia_borrador) && configDe(cuenta).pv_activa !== false
-            && borradoresHechos < TOPE_BORRADORES) {
-          try {
-            borradoresHechos++;
-            const b = await generarBorradorPV(cuenta, { ...conv, ...base }, msgs);
-            upd.motivo = b.motivo; upd.ia_borrador = b.borrador;
-            upd.ia_adjunto_id = b.adjunto_id; upd.ia_confianza = b.confianza;
-            if (b.cuit && !(cuitMsg || conv.fact_cuit_msg)) upd.fact_cuit_msg = b.cuit;   // leido de la FOTO
-          } catch (e) {}
-        }
-      } else {
-        // el ultimo mensaje es NUESTRO (quizas respondido desde ML web):
-        // la sacamos de la bandeja de Nuevos y queda esperando al cliente.
-        if (conv.estado === 'nuevo' || conv.estado === 'encurso') upd.estado = 'esperando';
-        upd.no_leidos = 0;
-        if (!conv.primera_resp_at) upd.primera_resp_at = ultimo.fecha || new Date().toISOString();
-      }
-      await db.from('pq_conversaciones').update(upd).eq('id', conv.id);
-      // AUTO CONTABILIUM: si esta tildado en Ajustes, carga el CUIT + padron
-      // apenas se detecta un CUIT distinto. Una sola vez por venta; si falla,
-      // NO reintenta en loop (queda el error visible y el boton manual).
-      try {
-        if (configDe(cuenta).pv_auto_cuit === true && !conv.cb_cuit_at && !conv.cb_cuit_err) {
-          const cuitFinal = upd.fact_cuit_msg || cuitMsg || conv.fact_cuit_msg;
-          const docVenta = factNro || conv.fact_doc_nro;
-          const distinto = cuitFinal && docVenta && String(cuitFinal).replace(/\D/g, '') !== String(docVenta).replace(/\D/g, '');
-          if (distinto) {
+        let dp; try { dp = await rp.json(); } catch (e2) { dp = []; }
+        const todasP = Array.isArray(dp) ? dp : (dp.results || []);
+        const activas = todasP.filter(x => ['started', 'active', 'pending', 'programmed', 'scheduled'].indexOf(x.status) > -1);
+        if (!activas.length) {
+          lineas.push('OK - ' + t + ' (no tenia ofertas activas)');
+        } else {
+          const partes = [];
+          for (const pr of activas) {
+            let urlDel = `https://api.mercadolibre.com/seller-promotions/items/${id}?app_version=v2&promotion_type=${encodeURIComponent(pr.type)}`;
+            if (pr.id) urlDel += `&promotion_id=${encodeURIComponent(pr.id)}`;
             try {
-              const rCb = await cbCargarCuitVenta(cuenta, { ...conv, ...upd, fact_cuit_msg: cuitFinal, fact_doc_nro: docVenta, orden_id: conv.orden_id }, null);
-              await db.from('pq_conversaciones').update({ cb_cuit_at: new Date().toISOString(), cb_cuit_err: null }).eq('id', conv.id);
-              // si ARCA no contesto o el nombre no quedo escrito, queda pendiente
-              // y el reintento lo agarra despues
-              if (rCb && rCb.padron && rCb.razon_ok !== false) await _marcarPadronHecho(conv.id);
-            } catch (eCb) {
-              await db.from('pq_conversaciones').update({ cb_cuit_err: String(eCb.message).slice(0, 200) }).eq('id', conv.id);
-            }
+              const rd = await fetch(urlDel, { method: 'DELETE', headers: { Authorization: 'Bearer ' + token } });
+              let dd; try { dd = await rd.json(); } catch (e3) { dd = {}; }
+              if (rd.ok) partes.push('quite ' + pr.type);
+              else partes.push(pr.type + ' NO: ' + ((dd && (dd.message || dd.error)) || ('HTTP ' + rd.status)));
+            } catch (e4) { partes.push(pr.type + ' NO: ' + e4.message); }
+            await new Promise(rs => setTimeout(rs, 150));
           }
+          const fallo = partes.some(x => x.indexOf(' NO: ') > -1);
+          lineas.push((fallo ? 'PARCIAL - ' : 'OK - ') + t + ' (' + partes.join('; ') + ')');
         }
-      } catch (e) {}
-      procesados++;
-    } catch (e) {
-      // un pack puntual fallo: seguimos con el resto, pero lo DEJAMOS ANOTADO.
-      // Antes esto se tragaba los errores en silencio y el panel mostraba
-      // "0 conversaciones" sin explicar por que.
-      fallidos++;
-      ultFallo = 'pack ' + pack + ': ' + String(e && e.message || e).slice(0, 140);
-    }
+      } else if (acc.accion === 'aplicar_descuento') {
+        const precioFinal = (acc.precios && acc.precios[id] != null) ? Number(acc.precios[id]) : Number(p.precio);
+        const diasE = Math.min(Math.max(parseInt(p.dias) || 30, 1), 365);
+        const body = { deal_price: precioFinal, promotion_type: 'PRICE_DISCOUNT',
+          start_date: fechaLocalAR(0), finish_date: fechaLocalAR(diasE - 1) };
+        const url = `https://api.mercadolibre.com/seller-promotions/items/${id}?app_version=v2`;
+        const hdr = { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' };
+        let r = await fetch(url, { method: 'POST', headers: hdr, body: JSON.stringify(body) });
+        let d1; try { d1 = await r.json(); } catch (e5) { d1 = {}; }
+        if (!r.ok) {
+          r = await fetch(url, { method: 'PUT', headers: hdr, body: JSON.stringify(body) });
+          try { d1 = await r.json(); } catch (e6) { d1 = {}; }
+        }
+        // Fallback: si ML rechazo una duracion larga, reintentar con 14 dias y avisar
+        let notaDias = '';
+        if (!r.ok && diasE > 14) {
+          const body14 = { deal_price: precioFinal, promotion_type: 'PRICE_DISCOUNT',
+            start_date: fechaLocalAR(0), finish_date: fechaLocalAR(13) };
+          r = await fetch(url, { method: 'POST', headers: hdr, body: JSON.stringify(body14) });
+          try { d1 = await r.json(); } catch (e7) { d1 = {}; }
+          if (!r.ok) {
+            r = await fetch(url, { method: 'PUT', headers: hdr, body: JSON.stringify(body14) });
+            try { d1 = await r.json(); } catch (e8) { d1 = {}; }
+          }
+          if (r.ok) notaDias = ' (ML no acepto ' + diasE + ' dias; quedo por 14)';
+        }
+        lineas.push((r.ok ? 'OK - ' : 'ERROR - ') + t + (r.ok
+          ? ' -> $' + Math.round(precioFinal).toLocaleString() + notaDias
+          : ' (' + mlErrDetalle(d1) + ')'));
+      } else if (acc.accion === 'medidas') {
+        const md = acc.medidas || {};
+        const bodyM = { attributes: [
+          { id: 'SELLER_PACKAGE_LENGTH', value_name: md.L + ' cm' },
+          { id: 'SELLER_PACKAGE_WIDTH',  value_name: md.A + ' cm' },
+          { id: 'SELLER_PACKAGE_HEIGHT', value_name: md.H + ' cm' },
+          { id: 'SELLER_PACKAGE_WEIGHT', value_name: md.G + ' g' }
+        ] };
+        const rM = await fetch('https://api.mercadolibre.com/items/' + id, {
+          method: 'PUT', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify(bodyM)
+        });
+        let dM; try { dM = await rM.json(); } catch (e7) { dM = {}; }
+        let extraM = '';
+        if (!rM.ok && /too small/i.test(mlErrDetalle(dM))) {
+          // ML dice que el paquete es mas chico que el PRODUCTO: mostrar que declara la ficha
+          try {
+            const rA = await fetch('https://api.mercadolibre.com/items/' + id + '?attributes=attributes', {
+              headers: { Authorization: 'Bearer ' + token }
+            });
+            const dA = await rA.json();
+            const attrsA = dA.attributes || [];
+            const paq = attrsA.filter(a => a && /^SELLER_PACKAGE_/i.test(a.id || ''))
+              .map(a => String(a.id).replace('SELLER_PACKAGE_', '') + '=' + (a.value_name || '?'));
+            const prod = attrsA.filter(a => a && /LENGTH|WIDTH|HEIGHT|WEIGHT|DEPTH|DIAMETER/i.test(a.id || '') && !/^SELLER_PACKAGE/i.test(a.id || ''))
+              .slice(0, 5).map(a => a.id + '=' + (a.value_name || '?'));
+            const partes = [];
+            if (paq.length) partes.push('ML ya registra el paquete: ' + paq.join(', ') + ' (si en la web figura "verificado", ML lo midio y esta BLOQUEADO: no se puede cambiar)');
+            if (prod.length) partes.push('Ficha del producto: ' + prod.join(', '));
+            if (partes.length) extraM = '\n   ' + partes.join('\n   ');
+          } catch (eX) {}
+        }
+        lineas.push((rM.ok ? 'OK - ' : 'ERROR - ') + t + (rM.ok ? ' (medidas declaradas)' : ' (' + mlErrDetalle(dM) + ')') + extraM);
+      } else if (acc.accion === 'clonar_fotos') {
+        const rF = await fetch('https://api.mercadolibre.com/items/' + id, {
+          method: 'PUT', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify({ pictures: acc.fotos || [] })
+        });
+        let dF; try { dF = await rF.json(); } catch (e8) { dF = {}; }
+        lineas.push((rF.ok ? 'OK - ' : 'ERROR - ') + t + (rF.ok ? ' (' + (acc.fotos || []).length + ' fotos)' : ' (' + mlErrDetalle(dF) + ')'));
+      } else {
+        lineas.push('Accion desconocida: ' + acc.accion);
+      }
+    } catch (e) { lineas.push('ERROR - ' + t + ': ' + e.message); }
+    await new Promise(rs => setTimeout(rs, 200));
   }
-  _pvSalud.fin = new Date().toISOString();
-  _pvSalud.packs = procesados;
-  _pvSalud.mirados = [...new Set([...noLeidos, ...abiertas])].slice(0, 50).length;
-  _pvSalud.fallidos = fallidos;
-  _pvSalud.ult_fallo = ultFallo;
-  _pvSalud.borradores = borradoresHechos;
-  return { packs: procesados, fallidos, ult_fallo: ultFallo };
+  return { texto: lineas.join('\n') };
 }
 
-async function autoSyncPV() {
-  if (_pvSyncOcupado) return;
-  _pvSyncOcupado = true;
+async function asistenteVerPromos(p, userId, token) {
+  const ids = await asistenteResolverItems(p, userId, token);
+  if (!ids.length) return 'No encontre publicaciones para ese SKU/item.';
+  const mini = await itemsMini(ids, token);
+  const lineas = [];
+  for (const id of ids.slice(0, 10)) {
+    const t = (mini[id] && mini[id].title) ? mini[id].title.slice(0, 42) : id;
+    try {
+      const r = await fetch(`https://api.mercadolibre.com/seller-promotions/items/${id}?app_version=v2`, {
+        headers: { Authorization: 'Bearer ' + token }
+      });
+      const d = await r.json();
+      const arr = Array.isArray(d) ? d : (d.results || []);
+      const activas = arr.filter(x => x.status === 'started' || x.status === 'active');
+      const cand = arr.length - activas.length;
+      if (!arr.length) lineas.push(t + ': sin promociones');
+      else lineas.push(t + ': ' + (activas.length ? 'ACTIVA: ' + activas.map(x => x.type).join(', ') : 'sin promos activas') + (cand ? ' (+' + cand + ' campana/s disponibles sin aplicar)' : ''));
+    } catch (e) { lineas.push(t + ': error al consultar'); }
+  }
+  return lineas.join('\n');
+}
+
+// Permisos por defecto dentro del Asistente segun rol (igual que el hub).
+// Si el usuario tiene 'acciones' personalizadas en mml_roles, mandan esas.
+function asisPermisosDe(req) {
+  if (Array.isArray(req.acciones) && req.acciones.length) return req.acciones;
+  if (req.rol === 'admin') return ['consultar','ventas','desc_poner','desc_sacar','desc_todos','smart','fotos','medidas'];
+  if (req.rol === 'encargado') return ['consultar','ventas'];
+  return ['consultar'];
+}
+// Mapea la accion que pide el LLM al permiso que la habilita
+function asisPermisoRequerido(accion) {
+  const mapa = {
+    ventas: 'ventas',
+    aplicar_descuento: 'desc_poner',
+    quitar_descuento: 'desc_sacar',
+    quitar_todo: 'desc_todos',
+    smart: 'smart', smart_aplicar: 'smart',
+    clonar_fotos: 'fotos',
+    medidas: 'medidas',
+  };
+  return mapa[accion] || 'consultar';
+}
+
+app.post('/api/asistente', requireAuth, soloRoles('admin', 'encargado', 'operador'), async (req, res) => {
   try {
-    const { data: cuentas } = await db.from('pq_cuentas').select('*').eq('activa', true);
-    for (const c of (cuentas || [])) {
-      if (configDe(c).pv_activa === false) continue;   // posventa apagada para esta cuenta
-      try { _pvSalud.error = null; _pvSalud.unread_err = null; await sincronizarMensajesPV(c); }
-      catch (e) { _pvSalud.error = String(e.message).slice(0, 200); }
+    const userId = (req.body && req.body.user_id) || '67619515';
+    const token = await getValidToken(userId);
+    if (!token) return res.status(400).json({ error: 'Sin token ML' });
+    const esAdmin = req.rol === 'admin';
+    const permisos = asisPermisosDe(req);
+    const puede = (p) => permisos.indexOf(p) > -1;
+
+    // Boton Confirmar: ejecuta la accion pendiente tal cual se mostro.
+    // Admin confirma todo; otros roles solo si tienen ese permiso marcado
+    // explicitamente en su usuario (los permisos por defecto nunca dan escritura).
+    const conf = req.body && req.body.confirmar;
+    if (conf && conf.accion) {
+      const permConf = asisPermisoRequerido(conf.accion === 'multi' ? 'aplicar_descuento' : conf.accion);
+      const confAutorizado = esAdmin || (Array.isArray(req.acciones) && req.acciones.indexOf(permConf) > -1);
+      if (!confAutorizado) return res.json({ respuesta: 'Tu usuario no tiene permiso para confirmar este cambio. Pedile a un admin que te habilite "' + permConf + '" en Usuarios.' });
+      if (conf.accion === 'smart_aplicar' && Array.isArray(conf.objetivos)) {
+        let okS = 0, errS = 0;
+        const erroresS = [];
+        for (const o of conf.objetivos) {
+          try {
+            const bodyS = { promotion_id: String(o.promo_id), promotion_type: String(o.type) };
+            if (o.sug > 0) bodyS.deal_price = Number(o.sug);
+            const rA = await fetch(`https://api.mercadolibre.com/seller-promotions/items/${encodeURIComponent(o.item)}?app_version=v2`, {
+              method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify(bodyS)
+            });
+            if (rA.ok) okS++;
+            else {
+              errS++;
+              if (erroresS.length < 5) {
+                let dA; try { dA = await rA.json(); } catch (e9) { dA = {}; }
+                erroresS.push(o.item + ': ' + ((dA && (dA.message || dA.error)) || ('HTTP ' + rA.status)));
+              }
+            }
+          } catch (eA) { errS++; if (erroresS.length < 5) erroresS.push(o.item + ': ' + eA.message); }
+          await new Promise(rs => setTimeout(rs, 200));
+        }
+        return res.json({ respuesta: 'Listo: ' + okS + ' producto(s) sumado(s) a sus campanas' + (errS ? ', ' + errS + ' con error' : '') + '.'
+          + (erroresS.length ? '\nPrimeros errores:\n- ' + erroresS.join('\n- ') : '') });
+      }
+      if (conf.accion === 'quitar_todo' && Array.isArray(conf.objetivos)) {
+        let ok = 0, err = 0;
+        const errores = [];
+        for (const o of conf.objetivos) {
+          try {
+            let urlD = `https://api.mercadolibre.com/seller-promotions/items/${encodeURIComponent(o.item)}?app_version=v2&promotion_type=${encodeURIComponent(o.type)}`;
+            if (o.promo_id) urlD += `&promotion_id=${encodeURIComponent(o.promo_id)}`;
+            const rD = await fetch(urlD, { method: 'DELETE', headers: { Authorization: 'Bearer ' + token } });
+            if (rD.ok) ok++;
+            else {
+              err++;
+              if (errores.length < 5) {
+                let dD; try { dD = await rD.json(); } catch (e5) { dD = {}; }
+                errores.push(o.item + ' (' + o.type + '): ' + ((dD && (dD.message || dD.error)) || ('HTTP ' + rD.status)));
+              }
+            }
+          } catch (e6) { err++; if (errores.length < 5) errores.push(o.item + ': ' + e6.message); }
+          await new Promise(rs => setTimeout(rs, 150));
+        }
+        return res.json({ respuesta: 'Listo: ' + ok + ' promocion(es) quitada(s)' + (err ? ', ' + err + ' con error' : '') + '.'
+          + (errores.length ? '\nPrimeros errores:\n- ' + errores.join('\n- ') : '')
+          + '\nSi habia mas tandas, repeti la orden para seguir.' });
+      }
+      if (conf.accion === 'multi' && Array.isArray(conf.acciones)) {
+        const partes = [];
+        for (const sub of conf.acciones) {
+          const out = await asistenteEjecutar(sub, userId, token);
+          partes.push(out.texto);
+        }
+        return res.json({ respuesta: partes.join('\n') });
+      }
+      const out = await asistenteEjecutar(conf, userId, token);
+      return res.json({ respuesta: out.texto });
     }
-  } catch (e) { _pvSalud.error = String(e.message).slice(0, 200); } finally { _pvSyncOcupado = false; }
-}
-setTimeout(autoSyncPV, 90 * 1000);
-setInterval(autoSyncPV, 3 * 60 * 1000);   // cada 3 minutos
 
-// ---- endpoints del embudo ----
-// DIAGNOSTICO PUNTA A PUNTA de UNA conversacion: compara ML vs nuestra base
-app.get('/api/pv/debug', soloPanel, requiereRol('master', 'dueno'), async (req, res) => {
+    const mensajes = (req.body && req.body.mensajes) || [];
+    if (!mensajes.length) return res.status(400).json({ error: 'Faltan mensajes' });
+
+    const llm = await asistenteLLM(mensajes.slice(-12));
+    if (llm.error) return res.status(500).json({ error: llm.error });
+    const j = llm.json || {};
+    const p = j.parametros || {};
+
+    const ESCRITURA = ['quitar_descuento','aplicar_descuento','multi','quitar_todo','clonar_fotos','medidas'];
+    if (ESCRITURA.indexOf(j.accion) > -1) {
+      const permNec = asisPermisoRequerido(j.accion === 'multi' ? 'aplicar_descuento' : j.accion);
+      const autorizado = esAdmin || (Array.isArray(req.acciones) && req.acciones.indexOf(permNec) > -1);
+      if (!autorizado) {
+        return res.json({ respuesta: 'Tu usuario puede consultar pero no hacer este cambio. Un admin puede habilitartelo desde Usuarios (permiso "' + permNec + '").' });
+      }
+    }
+    if (j.accion === 'ventas' && !puede('ventas')) {
+      return res.json({ respuesta: 'Tu usuario no tiene habilitado ver ventas y ganancias. Un admin puede habilitartelo desde Usuarios.' });
+    }
+
+    if (j.accion === 'ventas') {
+      return res.json({ respuesta: await asistenteVentas(p, userId) });
+    }
+
+    if (j.accion === 'medidas') {
+      const skuM = String(p.sku || '').toUpperCase().trim();
+      if (!skuM) return res.json({ respuesta: 'De que SKU cargo las medidas?' });
+      const m = await medidasDeSku(skuM);
+      if (!m) return res.json({ respuesta: 'No encontre a ' + skuM + ' en la planilla de medidas.' });
+      const L = Math.ceil(m.largo), A = Math.ceil(m.ancho), H = Math.ceil(m.alto);
+      const pesoCrudo = (m.peso || m.kgEnvio) || 0;
+      // La planilla mezcla unidades: <=100 se toma como KG, >100 como gramos ya expresados
+      const G = Math.ceil(pesoCrudo > 100 ? pesoCrudo : pesoCrudo * 1000);
+      if (!(L > 0 && A > 0 && H > 0 && G > 0)) return res.json({ respuesta: 'Las medidas de ' + skuM + ' estan incompletas en la planilla (largo/ancho/alto/peso).' });
+      const idsM = await asistenteResolverItems({ sku: skuM }, userId, token);
+      if (!idsM.length) return res.json({ respuesta: 'No encontre publicaciones activas de ' + skuM + '.' });
+      const miniM = await itemsMini(idsM, token);
+      const listaM = idsM.map(id => '- ' + ((miniM[id] && miniM[id].title) ? miniM[id].title.slice(0, 48) : id)).join('\n');
+      return res.json({
+        respuesta: 'Voy a declarar en ' + idsM.length + ' publicacion(es) de ' + skuM + ': ' + L + 'x' + A + 'x' + H + ' cm, ' + G + ' g:\n' + listaM,
+        pendiente: { accion: 'medidas', parametros: { sku: skuM }, items: idsM, medidas: { L, A, H, G } }
+      });
+    }
+
+    if (j.accion === 'clonar_fotos') {
+      const origen = String(p.origen || '').toUpperCase().trim();
+      if (!/^MLA\d+$/.test(origen)) return res.json({ respuesta: j.respuesta || 'Decime de que publicacion copio las fotos (el codigo MLA...).' });
+      const rO = await fetch('https://api.mercadolibre.com/items/' + origen + '?attributes=id,title,pictures', { headers: { Authorization: 'Bearer ' + token } });
+      const dO = await rO.json();
+      const fotos = (dO.pictures || []).map(x => ({ id: x.id })).filter(x => x.id);
+      if (!fotos.length) return res.json({ respuesta: 'La publicacion ' + origen + ' no tiene fotos para copiar.' });
+      let destinos = p.item_id ? [String(p.item_id).toUpperCase().trim()] : await asistenteResolverItems({ sku: p.sku }, userId, token);
+      destinos = destinos.filter(x => x !== origen);
+      if (!destinos.length) return res.json({ respuesta: 'No encontre otras publicaciones destino (el origen no cuenta).' });
+      const conVar = {}, sinVar = [];
+      for (let i = 0; i < destinos.length; i += 20) {
+        const chunk = destinos.slice(i, i + 20);
+        try {
+          const rV = await fetch('https://api.mercadolibre.com/items?ids=' + chunk.join(',') + '&attributes=id,variations', { headers: { Authorization: 'Bearer ' + token } });
+          const aV = await rV.json();
+          (Array.isArray(aV) ? aV : []).forEach(row => {
+            const b = row && row.body;
+            if (b && b.id) { if (Array.isArray(b.variations) && b.variations.length) conVar[b.id] = 1; else sinVar.push(b.id); }
+          });
+        } catch (eV) {}
+      }
+      if (!sinVar.length) return res.json({ respuesta: 'Las publicaciones destino tienen variantes; el clonado a publicaciones con variantes viene en la proxima version.' });
+      const miniF = await itemsMini(sinVar, token);
+      const listaF = sinVar.map(id => '- ' + ((miniF[id] && miniF[id].title) ? miniF[id].title.slice(0, 48) : id)).join('\n');
+      const nVar = Object.keys(conVar).length;
+      return res.json({
+        respuesta: 'Voy a copiar ' + fotos.length + ' foto(s) de "' + String(dO.title || origen).slice(0, 40) + '" a ' + sinVar.length + ' publicacion(es):\n' + listaF + (nVar ? '\n(' + nVar + ' con variantes: las salteo por ahora)' : ''),
+        pendiente: { accion: 'clonar_fotos', parametros: p, items: sinVar, fotos }
+      });
+    }
+
+    if (j.accion === 'smart') {
+      const maxMi = Number(p.max_mi_parte);
+      if (!(maxMi > 0 && maxMi <= 100)) return res.json({ respuesta: 'Hasta que porcentaje pones vos? Ej: "hasta 13% de mi parte".' });
+      const rcS = await fetch(`https://api.mercadolibre.com/seller-promotions/users/${userId}?app_version=v2`, {
+        headers: { Authorization: 'Bearer ' + token }
+      });
+      const dcS = await rcS.json();
+      const promosS = (dcS.results || []).filter(x => x && x.id && x.type);
+      const props = [];
+      let masHayS = false;
+      for (const pr of promosS) {
+        for (let pag = 0; pag < 8; pag++) {
+          if (props.length >= 60) { masHayS = true; break; }
+          let itemsS = [];
+          try {
+            const rS = await fetch(`https://api.mercadolibre.com/seller-promotions/promotions/${encodeURIComponent(pr.id)}/items`
+              + `?promotion_type=${encodeURIComponent(pr.type)}&app_version=v2&limit=50&offset=${pag * 50}`, {
+              headers: { Authorization: 'Bearer ' + token }
+            });
+            const dS = await rS.json();
+            itemsS = dS.results || dS.items || [];
+          } catch (eS) { break; }
+          for (const it of itemsS) {
+            if (it.status !== 'candidate') continue;
+            const ben = it.benefits || {};
+            const mi = (ben.seller_percent != null) ? Number(ben.seller_percent)
+              : (it.seller_percentage != null ? Number(it.seller_percentage) : null);
+            const ml = (ben.meli_percent != null) ? Number(ben.meli_percent)
+              : (it.meli_percentage != null ? Number(it.meli_percentage) : null);
+            if (mi == null || !(ml > 0)) continue;
+            if (mi > maxMi) continue;
+            props.push({ item: it.id, promo_id: pr.id, type: pr.type, campana: String(pr.name || pr.id).slice(0, 25),
+              price: it.original_price || it.price || 0, sug: it.suggested_discounted_price || null, mi, ml });
+            if (props.length >= 60) { masHayS = true; break; }
+          }
+          if (itemsS.length < 50) break;
+          await new Promise(rs => setTimeout(rs, 150));
+        }
+        if (props.length >= 60) break;
+      }
+      if (!props.length) return res.json({ respuesta: 'No encontre propuestas co-participadas donde tu parte sea hasta ' + maxMi + '% con aporte de ML.' });
+      const miniS = await itemsMini(props.map(x => x.item), token);
+      const lineasS = props.map(x => {
+        const t = (miniS[x.item] && (miniS[x.item].sku ? miniS[x.item].sku + ' - ' : '') + (miniS[x.item].title || '').slice(0, 34)) || x.item;
+        return '- ' + t + ': vos ' + x.mi + '% + ML ' + x.ml + '%' + (x.sug ? ' -> $' + Math.round(x.sug).toLocaleString() : '') + (x.price ? ' (de $' + Math.round(x.price).toLocaleString() + ')' : '') + ' [' + x.campana + ']';
+      }).join('\n');
+      const resp = 'Encontre ' + props.length + ' propuesta(s) donde pones hasta ' + maxMi + '% y ML aporta el resto:\n' + lineasS
+        + (masHayS ? '\n(Hay mas: proceso estas primero.)' : '')
+        + (esAdmin ? '\nConfirmas para sumarlas TODAS a sus campanas?' : '\n(Solo lectura: aplicar es de admin.)');
+      const out = { respuesta: resp };
+      if (esAdmin) out.pendiente = { accion: 'smart_aplicar', objetivos: props.map(x => ({ item: x.item, promo_id: x.promo_id, type: x.type, sug: x.sug })) };
+      return res.json(out);
+    }
+
+    if (j.accion === 'quitar_todo') {
+      const rc2 = await fetch(`https://api.mercadolibre.com/seller-promotions/users/${userId}?app_version=v2`, {
+        headers: { Authorization: 'Bearer ' + token }
+      });
+      const dc2 = await rc2.json();
+      const promos = (dc2.results || []).filter(x => x && x.id && x.type);
+      const objetivos = [];
+      const porCampana = {};
+      const vistos = {};
+      let masHay = false;
+      for (const pr of promos) {
+        for (let pag = 0; pag < 10; pag++) {
+          if (objetivos.length >= 400) { masHay = true; break; }
+          let url2 = `https://api.mercadolibre.com/seller-promotions/promotions/${encodeURIComponent(pr.id)}/items`
+            + `?promotion_type=${encodeURIComponent(pr.type)}&app_version=v2&limit=50&offset=${pag * 50}&status_item=started`;
+          let items2 = [];
+          try {
+            const r2 = await fetch(url2, { headers: { Authorization: 'Bearer ' + token } });
+            const d2 = await r2.json();
+            items2 = d2.results || d2.items || [];
+          } catch (e2) { break; }
+          for (const it2 of items2) {
+            if (!(it2.status === 'started' || it2.status === 'active')) continue;
+            const k = it2.id + '|' + pr.type + '|' + pr.id;
+            if (vistos[k]) continue;
+            vistos[k] = 1;
+            objetivos.push({ item: it2.id, type: pr.type, promo_id: pr.id });
+            const nom = String(pr.name || pr.id);
+            porCampana[nom] = (porCampana[nom] || 0) + 1;
+            if (objetivos.length >= 400) { masHay = true; break; }
+          }
+          if (items2.length < 50) break;
+          await new Promise(rs => setTimeout(rs, 150));
+        }
+        if (objetivos.length >= 400) break;
+      }
+      if (!objetivos.length) return res.json({ respuesta: 'No encontre promociones activas en el catalogo. Nada para sacar.' });
+      const desglose = Object.keys(porCampana).map(n => '- ' + n.slice(0, 35) + ': ' + porCampana[n] + ' publicacion(es)').join('\n');
+      return res.json({
+        respuesta: 'ATENCION: esto va a QUITAR las promociones activas de ' + objetivos.length + ' participacion(es) en todo el catalogo:\n'
+          + desglose
+          + (masHay ? '\n(Hay mas: proceso estas primero; cuando termine, repeti la orden para la siguiente tanda.)' : '')
+          + '\nEs una operacion grande y con impacto en las ventas. Segura/o?',
+        pendiente: { accion: 'quitar_todo', objetivos }
+      });
+    }
+    if (j.accion === 'multi') {
+      let subs = ((p.acciones || j.acciones || [])).filter(s => s && (s.accion === 'quitar_descuento' || s.accion === 'aplicar_descuento'));
+      let recorte = '';
+      if (subs.length > 60) { recorte = '\n(Ojo: eran ' + subs.length + ' ordenes, proceso las primeras 60; mandame el resto en otro mensaje.)'; subs = subs.slice(0, 60); }
+      if (!subs.length) return res.json({ respuesta: j.respuesta || 'No entendi la lista de ordenes, proba de a una.' });
+      const lineas = []; const listos = [];
+      for (const s of subs) {
+        const sp = s.parametros || {};
+        const spct = Number(sp.porcentaje);
+        const sTienePct = spct > 0 && spct < 95;
+        const sDias = Math.min(Math.max(parseInt(sp.dias) || 30, 1), 365);
+        if (s.accion === 'aplicar_descuento' && !(Number(sp.precio) > 0) && !sTienePct) {
+          return res.json({ respuesta: 'Me falta el precio o el porcentaje para "' + (sp.sku || sp.item_id || '?') + '". Pasamelo y armo el plan completo.' });
+        }
+        const ids = await asistenteResolverItems(sp, userId, token);
+        if (!ids.length) { lineas.push('- ' + (sp.sku || sp.item_id || '?') + ': no encontre publicaciones (la salteo)'); continue; }
+        const mini = await itemsMini(ids, token);
+        let sPrecios = null;
+        let idsUsar = ids;
+        if (s.accion === 'aplicar_descuento' && sTienePct) {
+          sPrecios = {}; idsUsar = [];
+          for (const id of ids) {
+            const base = (mini[id] && mini[id].price) || 0;
+            if (base > 0) { sPrecios[id] = Math.round(base * (1 - spct / 100)); idsUsar.push(id); }
+          }
+          if (!idsUsar.length) { lineas.push('- ' + (sp.sku || '?') + ': sin precios visibles (la salteo)'); continue; }
+        }
+        const tt = idsUsar.map(id => (mini[id] && mini[id].title) ? mini[id].title.slice(0, 38) : id).join(' | ');
+        lineas.push('- ' + (s.accion === 'quitar_descuento' ? 'QUITAR descuentos'
+          : (sTienePct ? 'Descuento ' + spct + '% (' + sDias + 'd)' : 'Descuento a $' + Math.round(Number(sp.precio)).toLocaleString() + ' (' + sDias + 'd)'))
+          + ' en ' + idsUsar.length + ' pub: ' + tt);
+        listos.push({ accion: s.accion, parametros: sp, items: idsUsar, precios: sPrecios });
+      }
+      if (!listos.length) return res.json({ respuesta: 'No encontre publicaciones para ninguna de las ordenes:\n' + lineas.join('\n') });
+      return res.json({
+        respuesta: 'Plan (' + listos.length + ' orden/es):\n' + lineas.join('\n') + recorte,
+        pendiente: { accion: 'multi', acciones: listos }
+      });
+    }
+    if (j.accion === 'quitar_descuento' || j.accion === 'aplicar_descuento') {
+      const pct = Number(p.porcentaje);
+      const tienePct = pct > 0 && pct < 95;
+      const diasP = Math.min(Math.max(parseInt(p.dias) || 30, 1), 365);
+      if (j.accion === 'aplicar_descuento' && !(Number(p.precio) > 0) && !tienePct) {
+        return res.json({ respuesta: j.respuesta || 'Decime el precio final o el porcentaje de descuento.' });
+      }
+      const ids = await asistenteResolverItems(p, userId, token);
+      if (!ids.length) return res.json({ respuesta: 'No encontre publicaciones activas para "' + (p.sku || p.item_id || '?') + '". Revisa el SKU.' });
+      const mini = await itemsMini(ids, token);
+
+      if (j.accion === 'aplicar_descuento' && tienePct) {
+        const precios = {};
+        const okIds = [];
+        const lineasP = [];
+        for (const id of ids) {
+          const base = (mini[id] && mini[id].price) || 0;
+          const tt = (mini[id] && mini[id].title) ? mini[id].title.slice(0, 42) : id;
+          if (!(base > 0)) { lineasP.push('- ' + tt + ': sin precio visible, la salteo'); continue; }
+          const fin = Math.round(base * (1 - pct / 100));
+          precios[id] = fin;
+          okIds.push(id);
+          lineasP.push('- ' + tt + ': $' + Math.round(base).toLocaleString() + ' -> $' + fin.toLocaleString());
+        }
+        if (!okIds.length) return res.json({ respuesta: 'No pude leer los precios actuales para calcular el ' + pct + '%.' });
+        return res.json({
+          respuesta: 'Voy a aplicar ' + pct + '% de descuento (vigente ' + diasP + ' dias) en ' + okIds.length + ' publicacion(es):\n' + lineasP.join('\n'),
+          pendiente: { accion: j.accion, parametros: p, items: okIds, precios }
+        });
+      }
+
+      const lista = ids.map(id => '- ' + ((mini[id] && mini[id].title) ? mini[id].title.slice(0, 48) : id)).join('\n');
+      const desc = j.accion === 'quitar_descuento'
+        ? 'Voy a QUITAR los descuentos de ' + ids.length + ' publicacion(es):'
+        : 'Voy a aplicar descuento (vigente ' + diasP + ' dias) dejando el precio en $' + Math.round(Number(p.precio)).toLocaleString() + ' en ' + ids.length + ' publicacion(es):';
+      return res.json({
+        respuesta: desc + '\n' + lista,
+        pendiente: { accion: j.accion, parametros: p, items: ids }
+      });
+    }
+    if (j.accion === 'ver_promos') {
+      return res.json({ respuesta: await asistenteVerPromos(p, userId, token) });
+    }
+    if (j.accion === 'buscar') {
+      const ids = await asistenteResolverItems(p, userId, token);
+      if (!ids.length) return res.json({ respuesta: 'No encontre publicaciones para ese SKU.' });
+      const mini = await itemsMini(ids, token);
+      return res.json({ respuesta: ids.map(id => '- ' + id + ': ' + (((mini[id] && mini[id].title) || '').slice(0, 50)) + ((mini[id] && mini[id].price) ? ' ($' + Math.round(mini[id].price).toLocaleString() + ')' : '')).join('\n') });
+    }
+    return res.json({ respuesta: j.respuesta || 'Decime que necesitas hacer.' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Numeros reales por SKU: comision % y envio neto promedio de ventas recientes
+// (para calcular el "limpio" en la app Promociones con datos propios)
+app.get('/api/promos/reales', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
   try {
-    const cuenta = await resolverCuenta(req);
-    if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-    const { data: conv } = await db.from('pq_conversaciones').select('*').eq('id', req.query.conv).eq('cuenta_id', cuenta.id).single();
-    if (!conv) return res.status(404).json({ error: 'conversacion no encontrada' });
-    const uid = cuenta.ml_user_id, pack = conv.pack_id;
-    const out = { conversacion: { pack, estado: conv.estado, ult_de: conv.ult_de, ult_mensaje_at: conv.ult_mensaje_at, ultima_pasada_sync: conv.actualizado_at } };
-    // 1) ¿figura entre los "sin leer" de ML?
-    try {
-      const u = await mlGet(`/messages/unread?role=seller&tag=post_sale&limit=50`, cuenta);
-      out.figura_en_sin_leer = (u.results || []).some(x => String(x.resource || '').includes(String(pack)));
-    } catch (e) { out.figura_en_sin_leer = 'ERROR ' + e.message.slice(0, 120); }
-    // 2) el hilo REAL en ML (con la paginacion nueva)
-    let mlIds = null;
-    try {
-      let h = await mlGet(`/messages/packs/${pack}/sellers/${uid}?tag=post_sale&mark_as_read=false&limit=40`, cuenta);
-      const total = (h.paging && Number(h.paging.total)) || (h.messages || []).length;
-      if (total > 40) h = await mlGet(`/messages/packs/${pack}/sellers/${uid}?tag=post_sale&mark_as_read=false&limit=40&offset=${total - 40}`, cuenta);
-      const msgs = h.messages || [];
-      const ult = msgs[msgs.length - 1] || null;
-      out.ml = {
-        total_mensajes: total, traidos: msgs.length,
-        ultimo: ult ? {
-          de: String(ult.from && ult.from.user_id) === String(uid) ? 'vendedor' : 'comprador',
-          fecha: (ult.message_date && (ult.message_date.received || ult.message_date.created)) || ult.date_created || null,
-          texto: String((ult.text && ult.text.plain) || ult.text || '').slice(0, 90)
-        } : null
-      };
-      mlIds = msgs.map(m => String(m.id || m.message_id || '')).filter(Boolean);
-    } catch (e) { out.ml = 'ERROR ' + e.message.slice(0, 200); }
-    // 3) lo que tenemos guardado
-    const { data: rows } = await db.from('pq_mensajes').select('ml_msg_id, de, fecha, texto').eq('conversacion_id', conv.id).order('fecha', { ascending: true });
-    const ultDb = (rows || [])[rows ? rows.length - 1 : 0] || null;
-    out.nuestra_base = {
-      total_mensajes: (rows || []).length,
-      ultimo: ultDb ? { de: ultDb.de, fecha: ultDb.fecha, texto: String(ultDb.texto || '').slice(0, 90) } : null
-    };
-    // 4) el veredicto: ¿cuantos mensajes de ML nos faltan?
-    if (Array.isArray(mlIds)) {
-      const setDb = new Set((rows || []).map(r => String(r.ml_msg_id)));
-      out.VEREDICTO_mensajes_de_ML_que_faltan_en_base = mlIds.filter(x => !setDb.has(x)).length;
+    const userId = req.query.user_id || '67619515';
+    const skus = String(req.query.skus || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean).slice(0, 120);
+    if (!skus.length) return res.json({});
+    const desde = new Date(Date.now() - 60 * 864e5).toISOString();
+    let rows = [], off = 0;
+    while (off < 6000) {
+      const { data: d, error } = await supabase.from('ventas')
+        .select('sku,precio,comision,costo_envio,precio_comprador_envio,estado')
+        .eq('user_id', String(userId)).gte('fecha', desde).in('sku', skus).range(off, off + 999);
+      if (error) return res.status(500).json({ error: error.message });
+      rows = rows.concat(d || []);
+      if (!d || d.length < 1000) break;
+      off += 1000;
+    }
+    const agg = {};
+    for (const v2 of rows) {
+      if (v2.estado === 'cancelled') continue;
+      const s = String(v2.sku || '').toUpperCase();
+      const a = agg[s] || (agg[s] = { fact: 0, com: 0, env: 0, n: 0 });
+      a.fact += Number(v2.precio) || 0;
+      a.com += Number(v2.comision) || 0;
+      a.env += (Number(v2.costo_envio) || 0) - (Number(v2.precio_comprador_envio) || 0);
+      a.n++;
+    }
+    const out = {};
+    for (const s in agg) {
+      const a = agg[s];
+      if (a.n < 1 || a.fact <= 0) continue;
+      out[s] = { com_pct: a.com / a.fact, envio: a.env / a.n, ventas: a.n };
     }
     res.json(out);
-  } catch (e) { res.status(500).json({ error: e.message.slice(0, 300) }); }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// RESCATE: el bot respondia al instante y ML marcaba la conversacion como
-// leida -> nunca entraba por "sin leer" -> las conversaciones nuevas quedaban
-// invisibles. Este job recorre las ventas recientes, detecta packs CON
-// mensajes que no tenemos, y les crea la ficha: la rotacion normal del sync
-// las adopta y las completa en los ciclos siguientes.
-let _rescateOcupado = false;
-async function _pvRescate(cuenta, dias) {
-  if (_rescateOcupado) return;
-  _rescateOcupado = true;
-  const R = _pvSalud.rescate = {
-    estado: 'corriendo', dias, ordenes: 0, con_mensajes: 0, creadas: 0,
-    err: null, inicio: new Date().toISOString(), fin: null
-  };
+const ML_CLIENT_ID     = process.env.ML_CLIENT_ID;
+const ML_CLIENT_SECRET = process.env.ML_CLIENT_SECRET;
+const ML_REDIRECT_URI  = process.env.ML_REDIRECT_URI || 'https://margenml-frontend.vercel.app/';
+
+// ── OAUTH ─────────────────────────────────────────────────────────
+app.post('/api/auth/token', async (req, res) => {
   try {
-    const desde = new Date(Date.now() - dias * 864e5).toISOString();
-    R.desde = desde;
-    const uid = cuenta.ml_user_id;
-    const { data: existentes } = await db.from('pq_conversaciones').select('pack_id').eq('cuenta_id', cuenta.id);
-    const ya = new Set((existentes || []).map(x => String(x.pack_id)));
-    for (let off = 0; off < 3000; off += 50) {
-      let d;
-      try {
-        d = await mlGet(`/orders/search?seller=${uid}&order.date_created.from=${encodeURIComponent(desde)}&sort=date_desc&limit=50&offset=${off}`, cuenta);
-      } catch (e) { R.err = 'orders: ' + e.message.slice(0, 120); break; }
-      const rs = d.results || [];
-      if (!rs.length) break;
-      for (const o of rs) {
-        R.ordenes++;
-        const pack = String(o.pack_id || o.id);
-        if (!pack || ya.has(pack)) continue;
-        ya.add(pack);
-        try {
-          const h = await mlGet(`/messages/packs/${pack}/sellers/${uid}?tag=post_sale&mark_as_read=false&limit=1`, cuenta);
-          const tot = (h.paging && Number(h.paging.total)) || ((h.messages || []).length);
-          if (tot > 0) {
-            R.con_mensajes++;
-            await db.from('pq_conversaciones').upsert({
-              cuenta_id: cuenta.id, pack_id: pack, estado: 'nuevo',
-              ult_mensaje_at: o.date_created || new Date().toISOString(),
-              actualizado_at: new Date(0).toISOString()   // primera en la rotacion
-            }, { onConflict: 'cuenta_id,pack_id', ignoreDuplicates: true });
-            R.creadas++;
-          }
-        } catch (e) {}
-        await new Promise(r => setTimeout(r, 450));   // respeto del rate limit de ML
-      }
-      if (rs.length < 50) break;
-    }
-    R.estado = 'terminado';
-  } catch (e) { R.err = String(e.message).slice(0, 200); R.estado = 'error'; }
-  R.fin = new Date().toISOString();
-  _rescateOcupado = false;
-}
-app.post('/api/pv/rescatar', soloPanel, requiereRol('master', 'dueno'), async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-  if (_rescateOcupado) return res.json({ ok: true, msg: 'ya hay un refresco corriendo', rescate: _pvSalud.rescate || null });
-  // ventana en dias: 1 a 30. Cuanto mas larga, mas tarda (mira ~2 ventas por segundo).
-  const dias = Math.max(1, Math.min(Number(req.body && req.body.dias) || 3, 30));
-  _pvRescate(cuenta, dias);   // corre de fondo
-  res.json({ ok: true, dias, msg: 'refresco arrancado (ultimos ' + dias + ' dias)' });
-});
-
-app.get('/api/pv/salud', soloPanel, async (req, res) => {
-  res.json({ ..._pvSalud, padron_job: _padronJob, ahora: new Date().toISOString(), version: 'v13.36' });
-});
-app.get('/api/pv/lista', soloPanel, async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-  const { data } = await db.from('pq_conversaciones').select('*')
-    .eq('cuenta_id', cuenta.id).order('ult_mensaje_at', { ascending: false }).limit(300);
-  const lista = data || [];
-  // PREVIEW EN LA TARJETA: los ultimos 3 mensajes (con adjuntos) de las
-  // conversaciones accionables, para leer las fotos y responder sin abrir el
-  // hilo. Solo Nuevos y En curso, que es donde se labura; una sola consulta.
-  try {
-    const ids = lista.filter(c => c.estado === 'nuevo' || c.estado === 'encurso').slice(0, 80).map(c => c.id);
-    if (ids.length) {
-      const { data: msjs } = await db.from('pq_mensajes')
-        .select('conversacion_id, de, texto, adjuntos, fecha')
-        .in('conversacion_id', ids).order('fecha', { ascending: false }).limit(800);
-      const porConv = {};
-      for (const m of (msjs || [])) (porConv[m.conversacion_id] = porConv[m.conversacion_id] || []).push(m);
-      for (const c of lista) if (porConv[c.id]) {
-        c.ultimos = porConv[c.id].slice(0, 3).reverse().map(m => ({
-          de: m.de, texto: String(m.texto || '').slice(0, 600),
-          adjuntos: m.adjuntos || [], fecha: m.fecha
-        }));
-      }
-    }
-  } catch (e) { /* si el preview falla, la lista sale igual que siempre */ }
-  res.json(lista);
-});
-
-// Refresco EN VIVO de UNA conversacion contra ML. Es la version liviana del
-// sync: trae los mensajes nuevos del pack (incluidos los que respondiste desde
-// la web de ML) y acomoda el estado. Sin IA ni facturacion: eso lo completa el
-// sync grande. Se usa al ABRIR un caso, para que nunca veas el hilo viejo.
-// Inserta los mensajes que vienen de ML en la base SIN duplicar. El caso feo:
-// cuando respondemos desde el panel guardamos una copia local (ml_msg_id
-// "local-...") para que la veas al instante; despues el sync trae ESE MISMO
-// mensaje con su id real de ML. Como los id no coinciden, antes se guardaba dos
-// veces. Aca reconciliamos por texto: si ya existe una copia local nuestra con
-// el mismo texto, le ponemos el id real en vez de insertar otra fila. Y si
-// quedaron duplicados de antes, los limpiamos.
-async function _guardarMensajesSinDuplicar(convId, msgsML) {
-  const norm = s => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
-  const { data: exist } = await db.from('pq_mensajes')
-    .select('id, ml_msg_id, de, texto').eq('conversacion_id', convId);
-  const filas = exist || [];
-  const idsReales = new Set(filas.filter(f => !String(f.ml_msg_id || '').startsWith('local-')).map(f => f.ml_msg_id));
-  // copias locales nuestras (aun sin id real de ML), por texto
-  const localesPorTexto = new Map();
-  for (const f of filas) {
-    if (String(f.ml_msg_id || '').startsWith('local-') && f.de === 'vendedor') {
-      localesPorTexto.set(norm(f.texto), f);
-    }
-  }
-  const aInsertar = [];
-  let nuevos = 0;
-  for (const m of msgsML) {
-    if (!m.ml_msg_id) continue;
-    if (idsReales.has(m.ml_msg_id)) continue;         // ya lo tenemos con su id real
-    if (m.de === 'vendedor') {
-      const local = localesPorTexto.get(norm(m.texto));
-      if (local) {
-        // era nuestra copia local: le ponemos el id real y no insertamos otra
-        await db.from('pq_mensajes').update({ ml_msg_id: m.ml_msg_id, fecha: m.fecha || undefined, adjuntos: (m.adjuntos && m.adjuntos.length) ? m.adjuntos : undefined }).eq('id', local.id);
-        idsReales.add(m.ml_msg_id);
-        localesPorTexto.delete(norm(m.texto));
-        continue;
-      }
-    }
-    aInsertar.push({ ...m, conversacion_id: convId });
-    idsReales.add(m.ml_msg_id);
-    nuevos++;
-  }
-  if (aInsertar.length) await db.from('pq_mensajes').insert(aInsertar);
-  // limpieza de duplicados viejos: copias locales cuyo texto YA existe como real
-  const textosReales = new Set(filas.filter(f => !String(f.ml_msg_id || '').startsWith('local-')).map(f => norm(f.texto)));
-  for (const [txt, f] of localesPorTexto) {
-    if (textosReales.has(txt)) { try { await db.from('pq_mensajes').delete().eq('id', f.id); } catch (e) {} }
-  }
-  // devolvemos SOLO los mensajes realmente nuevos (no las copias reconciliadas):
-  // asi el que llama sabe si entro algo del comprador sin regenerar de mas.
-  return { n: nuevos, insertados: aInsertar };
-}
-
-async function refrescarConv(cuenta, conv) {
-  const uid = cuenta.ml_user_id;
-  let hilo = await mlGet(`/messages/packs/${conv.pack_id}/sellers/${uid}?tag=post_sale&mark_as_read=false&limit=40`, cuenta);
-  const total = (hilo && hilo.paging && Number(hilo.paging.total)) || 0;
-  if (total > 40) {
-    try { hilo = await mlGet(`/messages/packs/${conv.pack_id}/sellers/${uid}?tag=post_sale&mark_as_read=false&limit=40&offset=${total - 40}`, cuenta); } catch (e) {}
-  }
-  const msgs = (hilo.messages || []).map(m => ({
-    ml_msg_id: String(m.id || m.message_id || ''),
-    de: String(m.from?.user_id) === String(uid) ? 'vendedor' : 'comprador',
-    texto: m.text || '',
-    adjuntos: (m.message_attachments || []).map(a => ({ nombre: a.original_filename || a.filename || 'archivo', id: a.filename || null })),
-    fecha: (m.message_date && (m.message_date.received || m.message_date.created)) || null
-  })).filter(m => m.texto || (m.adjuntos && m.adjuntos.length));
-  if (!msgs.length) return false;
-  const nuevosN = (await _guardarMensajesSinDuplicar(conv.id, msgs)).n;
-  const ultimo = msgs[msgs.length - 1];
-  const upd = {
-    ult_de: ultimo.de,
-    ult_texto: (ultimo.texto || ((ultimo.adjuntos && ultimo.adjuntos.length) ? '📎 mando un archivo adjunto' : '')).slice(0, 300),
-    ult_mensaje_at: ultimo.fecha || conv.ult_mensaje_at,
-    actualizado_at: new Date().toISOString()
-  };
-  if (ultimo.de === 'vendedor') {
-    // ya lo respondimos (desde donde sea): sale de Nuevos
-    if (conv.estado === 'nuevo' || conv.estado === 'encurso') upd.estado = 'esperando';
-    upd.no_leidos = 0;
-    if (!conv.primera_resp_at) upd.primera_resp_at = ultimo.fecha || new Date().toISOString();
-  } else if (conv.estado === 'resuelto' || conv.estado === 'esperando') {
-    upd.estado = 'nuevo';   // el comprador volvio a escribir: se reabre
-  }
-  await db.from('pq_conversaciones').update(upd).eq('id', conv.id);
-  Object.assign(conv, upd);
-  return nuevosN > 0;
-}
-
-app.get('/api/pv/conv', soloPanel, async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-  const { data: conv } = await db.from('pq_conversaciones').select('*')
-    .eq('id', req.query.id).eq('cuenta_id', cuenta.id).single();
-  if (!conv) return res.status(404).json({ error: 'no encontrada' });
-  // vivo=1: antes de mostrar, traer de ML lo que falte (respuestas hechas desde
-  // la web de ML incluidas). Si ML no contesta, se muestra lo que hay en la base.
-  if (String(req.query.vivo || '') === '1' && conv.pack_id) {
-    try { await refrescarConv(cuenta, conv); } catch (e) {}
-  }
-  const { data: msjs } = await db.from('pq_mensajes').select('*')
-    .eq('conversacion_id', conv.id).order('fecha', { ascending: true }).limit(100);
-  const { data: archTodos } = await db.from('pq_archivos')
-    .select('id, nombre, sku_madre, ambito, patron, disparador')
-    .eq('cuenta_id', cuenta.id).limit(200);
-  const archivos = (archTodos || []).filter(a => pvArchivoAplica(a, conv.sku)).slice(0, 20);
-  res.json({ conv, mensajes: msjs || [], archivos: archivos || [] });
-});
-
-app.post('/api/pv/estado', soloPanel, async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-  const { id, estado } = req.body;
-  if (!PV_ESTADOS.includes(estado)) return res.status(400).json({ error: 'estado invalido' });
-  await db.from('pq_conversaciones').update({
-    estado, actualizado_at: new Date().toISOString(),
-    resuelta_at: estado === 'resuelto' ? new Date().toISOString() : null
-  }).eq('id', id).eq('cuenta_id', cuenta.id);
-  res.json({ ok: true });
-});
-
-app.post('/api/pv/sync', soloPanel, async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-  try { res.json({ ok: true, ...(await sincronizarMensajesPV(cuenta)) }); }
-  catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// responder por la mensajeria de ML (con adjunto opcional de la biblioteca)
-app.post('/api/pv/responder', soloPanel, async (req, res) => {
-  try {
-    const cuenta = await resolverCuenta(req);
-    if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-    const { id, texto, archivo_id } = req.body;
-    if (!texto || !String(texto).trim()) return res.status(400).json({ error: 'falta el texto' });
-    const largo = String(texto).trim().length;
-    if (largo > 350) return res.status(400).json({ error: 'Mercado Libre permite hasta 350 caracteres por mensaje y este tiene ' + largo + '. Acortalo o mandalo en dos mensajes.' });
-    const { data: conv } = await db.from('pq_conversaciones').select('*')
-      .eq('id', id).eq('cuenta_id', cuenta.id).single();
-    if (!conv) return res.status(404).json({ error: 'conversacion no encontrada' });
-    if (!conv.comprador_id) return res.status(400).json({ error: 'no tengo el comprador de esta venta (reintenta el sync)' });
-
-    let attachments;
-    if (archivo_id) {
-      const { data: arch } = await db.from('pq_archivos').select('*')
-        .eq('id', archivo_id).eq('cuenta_id', cuenta.id).single();
-      if (!arch) return res.status(404).json({ error: 'archivo no encontrado en la biblioteca' });
-      const buf = await bajarArchivo(arch.ruta);
-      const adjId = await mlSubirAdjunto(cuenta, buf, arch.nombre, arch.mime);
-      attachments = [adjId];
-    }
-    const body = {
-      from: { user_id: String(cuenta.ml_user_id) },
-      to: { user_id: String(conv.comprador_id) },
-      text: String(texto).trim()
-    };
-    if (attachments) body.attachments = attachments;
-    await mlPost(`/messages/packs/${conv.pack_id}/sellers/${cuenta.ml_user_id}?tag=post_sale`, body, cuenta);
-
-    await db.from('pq_mensajes').insert({
-      conversacion_id: conv.id, ml_msg_id: 'local-' + Date.now(), de: 'vendedor',
-      texto: String(texto).trim(),
-      adjuntos: attachments ? [{ nombre: 'adjunto enviado' }] : null,
-      fecha: new Date().toISOString()
+    const { code } = req.body;
+    const resp = await fetch('https://api.mercadolibre.com/oauth/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type:    'authorization_code',
+        client_id:     ML_CLIENT_ID,
+        client_secret: ML_CLIENT_SECRET,
+        code,
+        redirect_uri:  ML_REDIRECT_URI
+      })
     });
-    const _norm = s => String(s || '').replace(/\s+/g, ' ').trim();
-    const editado = _norm(texto) !== _norm(conv.ia_borrador);
-    await db.from('pq_conversaciones').update({
-      estado: 'esperando', ult_de: 'vendedor', no_leidos: 0,
-      envios: (Number(conv.envios) || 0) + 1,
-      ...(conv.primera_resp_at ? {} : { primera_resp_at: new Date().toISOString() }),
-      envios_sin_editar: (Number(conv.envios_sin_editar) || 0) + (editado ? 0 : 1),
-      ult_envio_editado: editado,
-      ult_mensaje_at: new Date().toISOString(), actualizado_at: new Date().toISOString()
-    }).eq('id', conv.id);
-    // CALIFICACION AUTOMATICA: mandar el borrador tal cual = 👍 (la IA acerto);
-    // editarlo antes de mandar = 👎 con tu correccion. Es el mismo aprendizaje
-    // que en preguntas. Best-effort: si faltan las columnas, no rompe el envio.
-    if (conv.ia_borrador) {
+    const data = await resp.json();
+    if (data.error) return res.status(400).json(data);
+
+    const { error } = await supabase.from('ml_tokens').upsert({
+      user_id:       String(data.user_id),
+      access_token:  data.access_token,
+      refresh_token: data.refresh_token,
+      expires_at:    new Date(Date.now() + data.expires_in * 1000).toISOString(),
+      updated_at:    new Date().toISOString()
+    }, { onConflict: 'user_id' });
+
+    if (error) console.error('Supabase upsert error:', error);
+
+    res.json({ access_token: data.access_token, user_id: data.user_id, expires_in: data.expires_in });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── REFRESH TOKEN ─────────────────────────────────────────────────
+app.post('/api/auth/refresh', async (req, res) => {
+  try {
+    const { user_id } = req.body;
+    const { data: tokenRow } = await supabase
+      .from('ml_tokens').select('*').eq('user_id', user_id).single();
+    if (!tokenRow) return res.status(404).json({ error: 'Token no encontrado' });
+
+    const resp = await fetch('https://api.mercadolibre.com/oauth/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type:    'refresh_token',
+        client_id:     ML_CLIENT_ID,
+        client_secret: ML_CLIENT_SECRET,
+        refresh_token: tokenRow.refresh_token
+      })
+    });
+    const data = await resp.json();
+    if (data.error) return res.status(400).json(data);
+
+    await supabase.from('ml_tokens').upsert({
+      user_id:       String(data.user_id),
+      access_token:  data.access_token,
+      refresh_token: data.refresh_token,
+      expires_at:    new Date(Date.now() + data.expires_in * 1000).toISOString(),
+      updated_at:    new Date().toISOString()
+    }, { onConflict: 'user_id' });
+
+    res.json({ access_token: data.access_token, expires_in: data.expires_in });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Helper: token válido ──────────────────────────────────────────
+async function getValidToken(userId) {
+  const { data: tokenRow } = await supabase
+    .from('ml_tokens').select('*').eq('user_id', String(userId)).single();
+  if (!tokenRow) return null;
+
+  if (new Date(tokenRow.expires_at).getTime() - 60000 > Date.now()) {
+    return tokenRow.access_token;
+  }
+
+  const resp = await fetch('https://api.mercadolibre.com/oauth/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type:    'refresh_token',
+      client_id:     ML_CLIENT_ID,
+      client_secret: ML_CLIENT_SECRET,
+      refresh_token: tokenRow.refresh_token
+    })
+  });
+  const data = await resp.json();
+  if (data.error) {
+    console.error('Refresh falló:', data);
+    return tokenRow.access_token;
+  }
+
+  await supabase.from('ml_tokens').upsert({
+    user_id:       String(userId),
+    access_token:  data.access_token,
+    refresh_token: data.refresh_token,
+    expires_at:    new Date(Date.now() + data.expires_in * 1000).toISOString(),
+    updated_at:    new Date().toISOString()
+  }, { onConflict: 'user_id' });
+
+  return data.access_token;
+}
+
+// ── Helper: datos de envío completos ─────────────────────────────
+async function getShipData(shipmentId, token) {
+  if (!shipmentId) return {};
+  try {
+    const r = await fetch(`https://api.mercadolibre.com/shipments/${shipmentId}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    const ship = await r.json();
+    if (ship.error) return {};
+
+    // Costo "bruto" del envío = tarifa total de ML (con IVA)
+    let costoEnvio   = (ship.shipping_option && ship.shipping_option.list_cost) || ship.base_cost || 0;
+    // Aporte del comprador (fallback: campo del shipment; suele venir 0 en envíos subsidiados)
+    let pagoComprador = (ship.shipping_option && ship.shipping_option.cost) || 0;
+
+    // Desglose real de costos: acá está lo que paga el comprador y lo que banca el vendedor.
+    try {
+      const rc = await fetch(`https://api.mercadolibre.com/shipments/${shipmentId}/costs`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      const costs = await rc.json();
+      if (costs && !costs.error) {
+        const gross    = Number(costs.gross_amount) || 0;
+        const recvCost = (costs.receiver && Number(costs.receiver.cost)) || 0;
+        const sender   = (Array.isArray(costs.senders) && costs.senders[0]) || {};
+        const sendCost = Number(sender.cost) || 0;
+
+        const esFlexShip = ship.logistic_type === 'self_service';
+        const haySenders = Array.isArray(costs.senders) && costs.senders.length > 0;
+        if (!esFlexShip && haySenders) {
+          // FIX envio: el costo REAL del vendedor es senders.cost (ya neto del aporte del
+          // comprador y del descuento de ML). Es 0 cuando el envio lo paga el comprador
+          // (productos baratos). Evita cargar el bruto cuando no hay list_cost.
+          costoEnvio    = sendCost;
+          pagoComprador = 0;
+        } else {
+          // Flex u otros sin desglose de senders: logica anterior
+          if (recvCost > 0) pagoComprador = recvCost;
+          if (!costoEnvio && gross > 0) costoEnvio = gross;
+          if (!costoEnvio && sendCost > 0) costoEnvio = sendCost + pagoComprador;
+        }
+
+        // Log de verificación: bruto - aporteComprador debería dar el neto del vendedor (senders.cost)
+        console.log(`[ENVIO] ship=${shipmentId} bruto=${costoEnvio} pagoComprador=${pagoComprador} netoCalc=${costoEnvio - pagoComprador} netoVendedor(senders.cost)=${sendCost} | keys=${Object.keys(costs).join(',')}`);
+      }
+    } catch(e) { /* si /costs falla, quedan los valores del shipment */ }
+
+    // ML devuelve la dirección del comprador bajo receiver_address (no receiver)
+    const rcv = ship.receiver_address || ship.receiver || {};
+    // Depósito de ORIGEN del envío (sender_address.node.logistic_center_id):
+    // identifica de forma exacta si salió de Flex Baires (Villa Crespo, ARP676195153)
+    // o de Flex Rosario (Ruedo/Gustavo), sin depender de las tablas de App Depósito.
+    const snd = ship.sender_address || {};
+    const logisticCenterId = (snd.node && snd.node.logistic_center_id) || '';
+    console.log(`[PROV] ship=${shipmentId} provincia=${(rcv.state && rcv.state.name) || '(vacío)'} ciudad=${(rcv.city && rcv.city.name) || '(vacío)'} centro_origen=${logisticCenterId || '(vacío)'} | shipKeys=${Object.keys(ship).join(',')}`);
+    return {
+      costo_envio:            costoEnvio,
+      precio_comprador_envio: pagoComprador,
+      logistic_type:          ship.logistic_type || '',
+      provincia:             (rcv.state && rcv.state.name) || '',
+      ciudad:                (rcv.city  && rcv.city.name)  || '',
+      logistic_center_id:     logisticCenterId,
+      // Si ML partio la orden en varios paquetes (splitted_order), el shipment
+      // apunta a su hermano: lo usamos para agrupar el envio total del pack.
+      sibling_ship_id: (ship.sibling && ship.sibling.source === 'split' && ship.sibling.sibling_id)
+        ? String(ship.sibling.sibling_id) : '',
+    };
+  } catch(e) {
+    return {};
+  }
+}
+
+// ── Helper: datos de ítem (tipo de publicación) ───────────────────
+async function getItemData(itemId, token) {
+  if (!itemId) return {};
+  try {
+    const r = await fetch(`https://api.mercadolibre.com/items/${itemId}?attributes=listing_type_id,seller_sku`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    const item = await r.json();
+    if (item.error) return {};
+    return {
+      tipo_publicacion: item.listing_type_id || '',
+    };
+  } catch(e) {
+    return {};
+  }
+}
+
+// ── FLEX BAIRES: depósito fulfillment tercerizado (Villa Crespo, CABA) ──
+// Identificado por sender_address.node.logistic_center_id del shipment.
+// Confirmado con dos ventas de prueba: Baires=ARP676195153, Rosario=ARP676195151.
+const FLEX_BAIRES_NODE = 'ARP676195153';
+
+// Cache en memoria (5 min) de las 4 tablas de configuración historizadas.
+let _fbCache = { cbm: [], unificado: [], zonas: [], umbral: [], ts: 0 };
+async function _fbCargarConfig() {
+  const ahora = Date.now();
+  if (_fbCache.ts && (ahora - _fbCache.ts) < 5 * 60 * 1000) return _fbCache;
+  const [cbm, uni, zonas, umbral] = await Promise.all([
+    supabase.from('fb_config_cbm').select('*').order('vigente_desde', { ascending: true }),
+    supabase.from('fb_config_unificado').select('*').order('vigente_desde', { ascending: true }),
+    supabase.from('fb_config_zonas').select('*').order('vigente_desde', { ascending: true }),
+    supabase.from('fb_config_umbral').select('*').order('vigente_desde', { ascending: true }),
+  ]);
+  _fbCache = {
+    cbm: cbm.data || [], unificado: uni.data || [], zonas: zonas.data || [], umbral: umbral.data || [],
+    ts: ahora
+  };
+  return _fbCache;
+}
+// Devuelve la fila vigente a una fecha dada, de una lista ordenada asc por vigente_desde.
+function _vigenteA(filas, fecha, filtro) {
+  let elegido = null;
+  for (const f of filas) {
+    if (filtro && !filtro(f)) continue;
+    if (new Date(f.vigente_desde) <= new Date(fecha)) elegido = f;
+    else break;
+  }
+  return elegido;
+}
+
+// Medidas por SKU (largo/ancho/alto en cm, planilla de Google Sheets).
+// Reutiliza el mismo cache que usa /api/medidas.
+async function getMedidas() {
+  const ahora = Date.now();
+  if (_medidasCache && (ahora - _medidasTs) < 5 * 60 * 1000) return _medidasCache;
+  try {
+    const r = await fetch(MEDIDAS_CSV_URL);
+    const text = await r.text();
+    const map = buildMedidas(text);
+    if (Object.keys(map).length > 0) { _medidasCache = map; _medidasTs = ahora; }
+    return map;
+  } catch (e) {
+    console.error('[FB-MEDIDAS] error:', e.message);
+    return _medidasCache || {};
+  }
+}
+
+// Calcula (y deja listos para congelar) los 4 costos de Flex Baires de una venta.
+async function calcularCostosFlexBaires({ sku, unidades, ciudad, fecha, precio }) {
+  const cfg = await _fbCargarConfig();
+  const out = { fb_cbm_m3: 0, fb_costo_cbm: 0, fb_costo_unificado: 0, fb_costo_zona: 0, fb_ahorro_ml: 0 };
+
+  // 1) Costo por CBM: largo x ancho x alto (cm, planilla de medidas) -> m3 -> $/CBM vigente
+  try {
+    const medidas = await getMedidas();
+    const m = medidas[String(sku || '').toUpperCase()];
+    if (m && m.largo > 0 && m.ancho > 0 && m.alto > 0) {
+      const cbmUnidad = (m.largo * m.ancho * m.alto) / 1000000; // cm3 -> m3
+      out.fb_cbm_m3 = Math.round(cbmUnidad * (unidades || 1) * 1e6) / 1e6;
+      const tarifaCbm = _vigenteA(cfg.cbm, fecha);
+      if (tarifaCbm) out.fb_costo_cbm = Math.round(out.fb_cbm_m3 * Number(tarifaCbm.costo_cbm) * 100) / 100;
+    } else {
+      console.log(`[FB-CBM] sin medidas para sku=${sku}, no se calculó CBM`);
+    }
+  } catch (e) { console.error('[FB-CBM] error:', e.message); }
+
+  // 2) Costo unificado Recepción + Picking + Packing (por unidad, tarifa vigente)
+  const uni = _vigenteA(cfg.unificado, fecha);
+  if (uni) out.fb_costo_unificado = Math.round(Number(uni.costo) * (unidades || 1) * 100) / 100;
+
+  // 3) Costo de envío según zona de destino (ciudad del comprador, solo Baires)
+  const zonaRow = _vigenteA(cfg.zonas, fecha, f => String(f.zona || '').trim().toLowerCase() === String(ciudad || '').trim().toLowerCase());
+  if (zonaRow) out.fb_costo_zona = Number(zonaRow.costo);
+
+  // 4) Bonificación/ahorro ML según umbral de precio del producto
+  //    PENDIENTE DE AJUSTAR: confirmar el monto real que paga ML (bonif_ml) y
+  //    cómo se compara contra el costo de Colecta desde Rosario para el ahorro real.
+  const umbralRow = _vigenteA(cfg.umbral, fecha);
+  if (umbralRow && precio != null) {
+    out.fb_ahorro_ml = (Number(precio) < Number(umbralRow.monto_umbral)) ? Number(umbralRow.bonif_ml || 0) : 0;
+  }
+
+  return out;
+}
+
+// ── REPARTO DE ENVÍO EN PACKS (carrito: varias órdenes, UN solo envío) ──
+// ML crea una orden por producto pero cobra UN envío por el paquete. Sin esto,
+// cada fila de venta se llevaba el costo COMPLETO del envío (se contaba doble).
+// Regla acordada:
+//   1. Ítems con precio UNITARIO < umbral ($33.000, tabla fb_config_umbral) NO pagan envío.
+//   2. Envío teórico del Drive (columna envioML, c/IVA) por cada ítem que paga.
+//   3. Si la suma teórica ≈ envío real de ML (tolerancia $2) → usar valores del Drive.
+//   4. Si no coincide → repartir el envío real por unidades entre los que pagan.
+//   5. Si un solo ítem paga → absorbe el envío completo.
+// El ingreso del comprador (precio_comprador_envio) se reparte en la misma proporción.
+const _packCache = new Map(); // pack_id → { t, ordenes:[{orderId,sku,unitPrice,qty}] }
+
+async function _ordenesDelPack(packId, token) {
+  const c = _packCache.get(String(packId));
+  if (c && Date.now() - c.t < 10 * 60 * 1000) return c;
+  const H = { headers: { Authorization: `Bearer ${token}` } };
+  const rp = await fetch(`https://api.mercadolibre.com/packs/${packId}`, H);
+  const pack = await rp.json();
+  if (!pack || !Array.isArray(pack.orders) || pack.orders.length < 2) return null;
+  const ordenes = [];
+  // Un pack puede tener: (a) varias ordenes compartiendo UN envio, o (b) ordenes
+  // PARTIDAS por ML en varios paquetes, cada una con SU envio (tag splitted_order).
+  // Sumamos el costo de TODOS los envios distintos del pack (deduplicando por
+  // shipment_id) para obtener el envio real total a repartir.
+  const shipsVistos = new Set();
+  let envioTotal = 0, ingresoTotal = 0;
+  for (const o of pack.orders) {
+    const ro = await fetch(`https://api.mercadolibre.com/orders/${o.id}`, H);
+    const ord = await ro.json();
+    if (!ord || ord.error) continue;
+    if (ord.status === 'cancelled') continue; // canceladas: ni unidades ni envio
+    const it = (ord.order_items && ord.order_items[0]) || {};
+    ordenes.push({
+      orderId: String(ord.id),
+      sku: String((it.item && (it.item.seller_sku || it.item.seller_custom_field)) || '').trim().toUpperCase(),
+      unitPrice: Number(it.unit_price) || 0,
+      qty: Number(it.quantity) || 1
+    });
+    const shipId = ord.shipping && ord.shipping.id;
+    if (shipId && !shipsVistos.has(String(shipId))) {
+      shipsVistos.add(String(shipId));
       try {
-        await db.from('pq_conversaciones').update({
-          pv_calificacion: editado ? 'mal' : 'bien',
-          pv_correccion: editado ? String(texto).trim().slice(0, 600) : null,
-          pv_calif_at: new Date().toISOString()
-        }).eq('id', conv.id);
+        const sd = await getShipData(shipId, token);
+        envioTotal += Number(sd.costo_envio) || 0;
+        ingresoTotal += Number(sd.precio_comprador_envio) || 0;
       } catch (e) {}
     }
-    res.json({ ok: true, con_adjunto: !!attachments, calificacion: conv.ia_borrador ? (editado ? 'mal' : 'bien') : null });
-  } catch (e) { res.status(500).json({ error: e.message.slice(0, 400) }); }
-});
-
-// CALIFICAR el borrador de la IA SIN enviar (modo sombra, para entrenar).
-// 👍 bien = "asi esta perfecto"; 👎 mal = "no, deberia decir esto" (+correccion).
-// No manda nada al comprador: es puro aprendizaje. Si faltan las columnas,
-// devuelve el SQL para crearlas una vez (igual patron que el padron).
-const _SQL_CALIF = 'alter table pq_conversaciones add column if not exists pv_calificacion text; '
-  + 'alter table pq_conversaciones add column if not exists pv_correccion text; '
-  + 'alter table pq_conversaciones add column if not exists pv_calif_at timestamptz;';
-app.post('/api/pv/calificar', soloPanel, async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-  const { id, calificacion, correccion } = req.body || {};
-  if (!['bien', 'mal'].includes(calificacion)) return res.status(400).json({ error: 'calificacion invalida (bien|mal)' });
-  const { error } = await db.from('pq_conversaciones').update({
-    pv_calificacion: calificacion,
-    pv_correccion: calificacion === 'mal' ? (String(correccion || '').trim().slice(0, 600) || null) : null,
-    pv_calif_at: new Date().toISOString()
-  }).eq('id', id).eq('cuenta_id', cuenta.id);
-  if (error) {
-    if (/column .* does not exist|pv_calificacion/i.test(error.message)) {
-      return res.status(400).json({ error: 'FALTA_COLUMNA', sql: _SQL_CALIF });
-    }
-    return res.status(500).json({ error: error.message });
   }
-  res.json({ ok: true });
-});
-
-// bajar un adjunto de la mensajeria de ML (fotos del comprador, etc.)
-app.get('/api/pv/adjunto', soloPanel, async (req, res) => {
-  try {
-    const cuenta = await resolverCuenta(req);
-    if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-    const { data: conv } = await db.from('pq_conversaciones').select('id')
-      .eq('id', req.query.conv).eq('cuenta_id', cuenta.id).single();
-    if (!conv) return res.status(404).json({ error: 'conversacion no encontrada' });
-    const attId = String(req.query.id || '').replace(/[^a-zA-Z0-9._-]/g, '');
-    if (!attId) return res.status(400).json({ error: 'falta el id del adjunto' });
-    const token = await getAccessToken(cuenta);
-    const r = await fetch(`https://api.mercadolibre.com/messages/attachments/${attId}?tag=post_sale&site_id=MLA`, {
-      headers: { Authorization: 'Bearer ' + token }
-    });
-    if (!r.ok) return res.status(502).json({ error: 'ML adjunto -> ' + r.status });
-    const buf = Buffer.from(await r.arrayBuffer());
-    const ct = r.headers.get('content-type') || 'application/octet-stream';
-    // FOTOS DE IPHONE (.heic): ningun navegador las muestra. Si esta instalada
-    // la libreria heic-convert (agregala a package.json: "heic-convert": "^2"),
-    // las convertimos a JPEG al vuelo y el panel las previsualiza como cualquier
-    // foto. Si no esta, se manda el original y el panel muestra el boton de
-    // descarga. Nada se rompe en ningun caso.
-    if (/heic|heif/i.test(ct) || /\.hei[cf]/i.test(attId)) {
-      const lib = _heicLib();
-      if (lib) {
-        try {
-          const jpg = await lib({ buffer: buf, format: 'JPEG', quality: 0.82 });
-          res.set('Content-Type', 'image/jpeg');
-          res.set('Cache-Control', 'private, max-age=3600');
-          return res.send(Buffer.from(jpg));
-        } catch (e) { /* conversion fallo: va el original */ }
-      }
-    }
-    res.set('Content-Type', ct);
-    res.set('Cache-Control', 'private, max-age=3600');
-    res.send(buf);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-let _heic = undefined;
-function _heicLib() {
-  if (_heic === undefined) { try { _heic = require('heic-convert'); } catch (e) { _heic = null; } }
-  return _heic;
+  if (ordenes.length < 2) return null;
+  const out = { t: Date.now(), ordenes, envioTotal, ingresoTotal };
+  _packCache.set(String(packId), out);
+  return out;
 }
 
-// METRICAS DE POSVENTA: motivos, productos problematicos y madurez para el AUTO
-app.get('/api/pv/stats', soloPanel, async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-  // pedimos tambien pv_calificacion; si la columna no existe todavia, reintentamos
-  // sin ella para que las metricas salgan igual.
-  let rows = [];
-  {
-    const r = await db.from('pq_conversaciones')
-      .select('estado,motivo,sku,titulo,reclamo,creado_at,resuelta_at,envios,envios_sin_editar,pv_calificacion')
-      .eq('cuenta_id', cuenta.id).order('creado_at', { ascending: false }).limit(1000);
-    if (r.error) {
-      const r2 = await db.from('pq_conversaciones')
-        .select('estado,motivo,sku,titulo,reclamo,creado_at,resuelta_at,envios,envios_sin_editar')
-        .eq('cuenta_id', cuenta.id).order('creado_at', { ascending: false }).limit(1000);
-      rows = r2.data || [];
-    } else rows = r.data || [];
-  }
-  const tot = rows.length;
-  const abiertas = rows.filter(r => r.estado !== 'resuelto').length;
-  const reclamos = rows.filter(r => r.reclamo).length;
-  const conTiempo = rows.filter(r => r.resuelta_at && r.creado_at);
-  const t_medio = conTiempo.length
-    ? Math.round(conTiempo.reduce((a, r) => a + (new Date(r.resuelta_at) - new Date(r.creado_at)), 0) / conTiempo.length / 36e5 * 10) / 10
-    : null;
-  const porMot = {};
-  for (const r of rows) {
-    const m = r.motivo || 'otro';
-    porMot[m] = porMot[m] || { motivo: m, casos: 0, abiertos: 0, envios: 0, sin_editar: 0 };
-    porMot[m].casos++;
-    if (r.estado !== 'resuelto') porMot[m].abiertos++;
-    porMot[m].envios += Number(r.envios) || 0;
-    porMot[m].sin_editar += Number(r.envios_sin_editar) || 0;
-    if (r.pv_calificacion === 'bien') { porMot[m].bien = (porMot[m].bien || 0) + 1; }
-    else if (r.pv_calificacion === 'mal') { porMot[m].mal = (porMot[m].mal || 0) + 1; }
-  }
-  const motivos = Object.values(porMot).sort((a, b) => b.casos - a.casos).map(m => {
-    const bien = m.bien || 0, mal = m.mal || 0, calif = bien + mal;
-    return {
-      ...m, bien, mal,
-      pct_sin_editar: m.envios ? Math.round(100 * m.sin_editar / m.envios) : null,
-      pct_bien: calif ? Math.round(100 * bien / calif) : null,
-      // candidato a automatico: suficientes calificaciones y casi todas 👍.
-      // Si todavia no hay calificaciones, cae al criterio viejo (sin editar).
-      candidato_auto: calif >= 10 ? (bien / calif) >= 0.9 : (m.envios >= 10 && (m.sin_editar / m.envios) >= 0.9)
-    };
-  });
-  // calidad global de la IA de posventa
-  const calif_bien = rows.filter(r => r.pv_calificacion === 'bien').length;
-  const calif_mal = rows.filter(r => r.pv_calificacion === 'mal').length;
-  const porSku = {};
-  for (const r of rows) {
-    if (!r.sku) continue;
-    porSku[r.sku] = porSku[r.sku] || { sku: r.sku, titulo: r.titulo, casos: 0, mot: {} };
-    porSku[r.sku].casos++;
-    const m = r.motivo || 'otro';
-    porSku[r.sku].mot[m] = (porSku[r.sku].mot[m] || 0) + 1;
-  }
-  const skus = Object.values(porSku).sort((a, b) => b.casos - a.casos).slice(0, 10).map(s => ({
-    sku: s.sku, titulo: s.titulo, casos: s.casos,
-    motivo_top: Object.entries(s.mot).sort((a, b) => b[1] - a[1])[0][0]
-  }));
-  res.json({ tot, abiertas, resueltas: tot - abiertas, reclamos, t_medio_horas: t_medio,
-    calif_bien, calif_mal, calif_pct: (calif_bien + calif_mal) ? Math.round(100 * calif_bien / (calif_bien + calif_mal)) : null,
-    motivos, skus });
-});
-
-// =====================================================================
-// RECLAMOS Y MEDIACIONES  (canal APARTE de la mensajeria de posventa)
-// ---------------------------------------------------------------------
-// La posventa lee la BANDEJA de mensajes (tag=post_sale). Cuando un caso
-// escala a RECLAMO o MEDIACION, la conversacion se muda al centro de
-// reclamos de ML (vendedor <-> Mercado Libre), que es OTRA API: por eso
-// esos casos NO aparecian en Posventa (buscabas el Nº de venta y "no habia
-// nada en ningun estado"). Este modulo los trae directo desde
-// /post-purchase/v1/claims con su ETAPA, MOTIVO, VENCIMIENTO y si AFECTA la
-// reputacion. Es SOLO LECTURA + link a ML para accionar: a proposito nada
-// automatico toca un caso que ya escalo (un error aca cuesta plata).
-// =====================================================================
-const _SQL_REC =
-  'create table if not exists pq_reclamos (' +
-  ' id text primary key, cuenta_id bigint, orden_id text, pack_id text,' +
-  ' tipo text, etapa text, estado text, reason_id text, motivo text,' +
-  ' titulo text, sku text, item_id text, responsable text,' +
-  ' vence_at timestamptz, afecta_reputacion text,' +
-  ' ult_mensaje text, ult_de text, ult_mensaje_at timestamptz,' +
-  ' date_created timestamptz, last_updated timestamptz,' +
-  ' actualizado_at timestamptz default now());' +
-  ' create index if not exists pq_reclamos_cuenta on pq_reclamos(cuenta_id);';
-// NOTA: cuenta_id es bigint (igual que en pq_conversaciones); una version
-// anterior lo creo como uuid por error y se corrigio en vivo con
-// "alter table pq_reclamos alter column cuenta_id type bigint".
-
-const _recSalud = { fin: null, listados: 0, enriquecidos: 0, qbase: null, error: null, falta_tabla: false };
-let _recSyncOcupado = false;
-const _RE_FALTA_TABLA = /relation .*pq_reclamos.* does not exist|could not find the table/i;
-
-// texto legible del motivo: primero lo que da ML en el detalle, si no un mapa
-function _motivoReclamo(cl, det) {
-  const t = det && (det.title || det.problem || det.description);
-  if (t) return String(t).slice(0, 90);
-  const porRazon = { PNR: 'Producto no recibido', PDD: 'Producto con defectos', CS: 'Cancelacion' };
-  const porTipo = { mediations: 'Mediacion', return: 'Devolucion', cancel_sale: 'Cancelacion',
-    cancel_purchase: 'Cancelacion', change: 'Cambio de producto', fulfillment: 'Problema de envio' };
-  return porRazon[cl.reason_id] || porTipo[cl.tipo] || porTipo[cl.type] || 'Reclamo';
-}
-
-// ML expone la busqueda de claims de distintas formas segun el vendedor/pais.
-// Probamos variantes en el primer pedido y nos quedamos con la que responde.
-async function _recBuscar(cuenta, qbase, off) {
-  return mlGet(`/post-purchase/v1/claims/search?${qbase}&sort=date_desc&limit=50&offset=${off}`, cuenta);
-}
-
-async function sincronizarReclamos(cuenta) {
-  const uid = cuenta.ml_user_id;
-  // lo que ya tenemos guardado (para decidir a quien re-enriquecer y no re-pedir de mas)
-  const previos = {};
-  {
-    const { data, error } = await db.from('pq_reclamos')
-      .select('id,last_updated,item_id,titulo,sku,pack_id,vence_at,responsable').eq('cuenta_id', cuenta.id);
-    if (error) { if (_RE_FALTA_TABLA.test(String(error.message))) { _recSalud.falta_tabla = true; return; } }
-    for (const r of (data || [])) previos[r.id] = r;
-  }
-  // 1) LISTAR los reclamos ABIERTOS del vendedor (paginado). qbase es LOCAL a
-  // esta cuenta: nunca reusamos entre cuentas una variante que lleve el uid.
-  const variantes = [`status=opened`, `player_user_id=${uid}&status=opened`, `user_id=${uid}&status=opened`];
-  let qbase = null;
-  let paginadoOk = true;
-  const claims = [];
-  for (let off = 0; off < 500; off += 50) {
-    let d = null;
-    if (!qbase) {
-      // primera pagina: probamos las variantes hasta que una responda
-      let errUlt = null;
-      for (const v of variantes) {
-        try { d = await _recBuscar(cuenta, v, off); qbase = v; break; }
-        catch (e) { errUlt = e; }
-      }
-      if (!d) { _recSalud.error = 'search: ' + String(errUlt && errUlt.message).slice(0, 160); return; }  // ninguna variante anduvo
-    } else {
-      try { d = await _recBuscar(cuenta, qbase, off); }
-      catch (e) { _recSalud.error = 'search: ' + String(e.message).slice(0, 160); paginadoOk = false; break; }
-    }
-    const rs = d.data || d.results || [];
-    claims.push(...rs);
-    const tot = (d.paging && Number(d.paging.total)) || rs.length;
-    if (rs.length < 50 || off + 50 >= tot) break;
-  }
-  _recSalud.qbase = qbase;
-  _recSalud.listados = claims.length;
-  if (paginadoOk) _recSalud.error = null;
-
-  let enr = 0;
-  for (const cl of claims) {
+// Cuando ML PARTE una orden en varios paquetes (tag splitted_order), cada mitad
+// recibe un pack_id DISTINTO (ej: ...837 y ...839), asi que /packs/{id} devuelve
+// una sola orden y no sirve para agrupar. En ese caso seguimos la cadena de
+// hermanos (shipment.sibling.sibling_id) para reconstruir el grupo real.
+async function _grupoPorSiblings(order, siblingShipId, token) {
+  const clave = 'sib:' + String(order.id);
+  const c = _packCache.get(clave);
+  if (c && Date.now() - c.t < 10 * 60 * 1000) return c;
+  const H = { headers: { Authorization: `Bearer ${token}` } };
+  const it0 = (order.order_items && order.order_items[0]) || {};
+  const ordenes = [{
+    orderId: String(order.id),
+    sku: String((it0.item && (it0.item.seller_sku || it0.item.seller_custom_field)) || '').trim().toUpperCase(),
+    unitPrice: Number(it0.unit_price) || 0,
+    qty: Number(it0.quantity) || 1
+  }];
+  const shipsVistos = new Set();
+  let envioTotal = 0, ingresoTotal = 0;
+  const miShip = order.shipping && order.shipping.id;
+  if (miShip) {
+    shipsVistos.add(String(miShip));
     try {
-      const id = String(cl.id);
-      const orden = (cl.resource === 'order' && cl.resource_id) ? String(cl.resource_id)
-        : (cl.order_id ? String(cl.order_id) : (previos[id]?.pack_id || null));
-      // vencimiento + responsable: del player que soy yo (o el 'respondent')
-      let vence = null, responsable = null;
-      const players = cl.players || [];
-      const yo = players.find(p => String(p.user_id) === String(uid)) || players.find(p => p.role === 'respondent');
-      if (yo && yo.due_date) vence = yo.due_date;
-      if (yo && Array.isArray(yo.available_actions) && yo.available_actions.length) responsable = 'seller';
-
-      const prev = previos[id];
-      const cambio = !prev || String(prev.last_updated || '') !== String(cl.last_updated || '');
-      let det = null, afecta = null;
-      let item = { id: prev?.item_id || null, titulo: prev?.titulo || null, sku: prev?.sku || null };
-      let ultMsg, ultDe, ultAt;   // undefined => no pisar lo que ya estaba
-      if (cambio) {
-        try { det = await mlGet(`/post-purchase/v1/claims/${id}/detail`, cuenta); } catch (e) {}
-        if (det) { if (!vence && det.due_date) vence = det.due_date; if (det.action_responsible) responsable = det.action_responsible; }
-        try {
-          const ar = await mlGet(`/post-purchase/v1/claims/${id}/affects-reputation`, cuenta);
-          afecta = ar && ar.affects_reputation ? String(ar.affects_reputation) : null;
-        } catch (e) {}
-        try {
-          const mm = await mlGet(`/post-purchase/v1/claims/${id}/messages`, cuenta);
-          const arr = mm.data || mm.results || mm.messages || (Array.isArray(mm) ? mm : []);
-          const last = arr[arr.length - 1];
-          if (last) { ultMsg = String(last.message || '').slice(0, 300); ultDe = last.sender_role || null; ultAt = last.date_created || null; }
-        } catch (e) {}
-        if (orden && !item.titulo) {
-          try {
-            const o = await mlGet(`/orders/${orden}`, cuenta);
-            const oi = o && o.order_items && o.order_items[0] && o.order_items[0].item;
-            if (oi) item = { id: oi.id || null, titulo: oi.title || null, sku: oi.seller_sku || oi.seller_custom_field || null };
-          } catch (e) {}
-        }
-        await new Promise(r => setTimeout(r, 350));   // respeto del rate limit de ML
-        enr++;
-      }
-      const fila = {
-        id, cuenta_id: cuenta.id, orden_id: orden,
-        pack_id: cl.pack_id ? String(cl.pack_id) : (prev?.pack_id || null),
-        tipo: cl.type || null, etapa: cl.stage || null, estado: cl.status || 'opened',
-        reason_id: cl.reason_id || null, motivo: _motivoReclamo(cl, det),
-        titulo: item.titulo, sku: item.sku, item_id: item.id,
-        responsable: responsable || prev?.responsable || undefined,
-        vence_at: vence || prev?.vence_at || undefined,
-        afecta_reputacion: afecta !== null ? afecta : undefined,
-        ult_mensaje: ultMsg, ult_de: ultDe, ult_mensaje_at: ultAt,
-        date_created: cl.date_created || null, last_updated: cl.last_updated || null,
-        actualizado_at: new Date().toISOString()
-      };
-      Object.keys(fila).forEach(k => fila[k] === undefined && delete fila[k]);
-      const up = await db.from('pq_reclamos').upsert(fila, { onConflict: 'id' });
-      if (up.error && _RE_FALTA_TABLA.test(String(up.error.message))) { _recSalud.falta_tabla = true; return; }
-    } catch (e) { /* un reclamo puntual fallo: seguimos con el resto */ }
-  }
-  // los que ya no figuran abiertos -> los marcamos cerrados (salen de la bandeja).
-  // SOLO si el listado se completo sin error: si el paginado se corto a la mitad,
-  // NO cerramos nada (cerrariamos reclamos que en realidad siguen abiertos).
-  if (paginadoOk) try {
-    const vivos = new Set(claims.map(c => String(c.id)));
-    for (const id of Object.keys(previos)) {
-      if (!vivos.has(id)) await db.from('pq_reclamos').update({ estado: 'closed', actualizado_at: new Date().toISOString() }).eq('id', id).eq('cuenta_id', cuenta.id);
-    }
-  } catch (e) {}
-  _recSalud.enriquecidos = enr;
-  _recSalud.falta_tabla = false;
-}
-
-async function autoSyncRec() {
-  if (_recSyncOcupado) return;
-  _recSyncOcupado = true;
-  try {
-    const { data: cuentas } = await db.from('pq_cuentas').select('*').eq('activa', true);
-    for (const c of (cuentas || [])) {
-      if (configDe(c).rec_activa === false) continue;   // reclamos apagados para esta cuenta
-      try { await sincronizarReclamos(c); }
-      catch (e) { _recSalud.error = String(e.message).slice(0, 200); }
-    }
-  } catch (e) { _recSalud.error = String(e.message).slice(0, 200); }
-  finally { _recSalud.fin = new Date().toISOString(); _recSyncOcupado = false; }
-}
-setTimeout(autoSyncRec, 120 * 1000);
-setInterval(autoSyncRec, 5 * 60 * 1000);   // cada 5 minutos
-
-// ---- endpoints de reclamos ----
-app.get('/api/rec/lista', soloPanel, async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-  const { data, error } = await db.from('pq_reclamos').select('*')
-    .eq('cuenta_id', cuenta.id).order('vence_at', { ascending: true, nullsFirst: false }).limit(300);
-  if (error) {
-    if (_RE_FALTA_TABLA.test(String(error.message))) return res.json({ falta_tabla: true, sql: _SQL_REC, lista: [] });
-    return res.status(500).json({ error: error.message });
-  }
-  res.json({ lista: data || [], salud: { fin: _recSalud.fin, listados: _recSalud.listados, error: _recSalud.error } });
-});
-
-// hilo de la mediacion EN VIVO desde ML (solo lectura). Para RESPONDER se abre
-// en ML: no mandamos nada por API en un caso escalado.
-app.get('/api/rec/hilo', soloPanel, async (req, res) => {
-  try {
-    const cuenta = await resolverCuenta(req);
-    if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-    const id = String(req.query.id || '').replace(/[^0-9]/g, '');
-    if (!id) return res.status(400).json({ error: 'falta el id del reclamo' });
-    const { data: r } = await db.from('pq_reclamos').select('id,orden_id').eq('id', id).eq('cuenta_id', cuenta.id).single();
-    if (!r) return res.status(404).json({ error: 'reclamo no encontrado' });
-    let det = null; try { det = await mlGet(`/post-purchase/v1/claims/${id}/detail`, cuenta); } catch (e) {}
-    let msgs = [];
-    try {
-      const mm = await mlGet(`/post-purchase/v1/claims/${id}/messages`, cuenta);
-      const arr = mm.data || mm.results || mm.messages || (Array.isArray(mm) ? mm : []);
-      msgs = (arr || []).map(m => ({
-        de: m.sender_role || null, para: m.receiver_role || null,
-        texto: String(m.message || ''), fecha: m.date_created || null,
-        adjuntos: (m.attachments || []).map(a => a.original_filename || a.filename || 'adjunto')
-      }));
+      const sd = await getShipData(miShip, token);
+      envioTotal += Number(sd.costo_envio) || 0;
+      ingresoTotal += Number(sd.precio_comprador_envio) || 0;
     } catch (e) {}
-    res.json({ id, orden_id: r.orden_id,
-      detalle: det ? { titulo: det.title || null, problema: det.problem || null, descripcion: det.description || null, vence: det.due_date || null, responsable: det.action_responsible || null } : null,
-      mensajes: msgs });
-  } catch (e) { res.status(500).json({ error: e.message.slice(0, 300) }); }
-});
-
-// salud del sync de reclamos (diagnostico)
-app.get('/api/rec/salud', soloPanel, async (req, res) => {
-  res.json({ ..._recSalud, ahora: new Date().toISOString(), version: 'v13.36' });
-});
-
-// Clasifica por NOMBRE cuales PDFs son manuales para el comprador y cuales
-// son archivos de packaging/etiquetas/imprenta (que no hay que mandarle a nadie).
-app.post('/api/clasificar-manuales', soloPanel, async (req, res) => {
-  try {
-    const nombres = (req.body.nombres || []).slice(0, 300).map(n => String(n).slice(0, 120));
-    if (!nombres.length) return res.json({ descartar: [] });
-    const cuenta = await resolverCuenta(req);
-    const cfg = cuenta ? configDe(cuenta) : {};
-    const sys = `Sos el bibliotecario de una tienda. Te paso nombres de PDFs que estan en carpetas "Manual y Packaging" de productos. Descarta SOLO los que CLARAMENTE son material de imprenta/packaging por su nombre: caja, packaging, etiqueta, label, troquel, arte, marca, EAN, codigo de barras.
-IMPORTANTISIMO: ante la MINIMA duda, NO lo descartes. Un PDF cuyo nombre es solo un codigo de producto (ej: MEIN200.pdf) casi siempre ES el manual. "Manual", "Instructivo", "Armado", "Instrucciones", "Guia" SIEMPRE son manuales: nunca los descartes.
-Responde SOLO este JSON: {"descartar":[indices de los CLARAMENTE packaging, empezando en 0]}`;
-    const lista = nombres.map((n, i) => i + ': ' + n).join('\n');
-    const r = await llamarIA(modeloDe(cfg.ia_responde), sys, lista, 400);
-    const j = parsearJson(r.texto);
-    const descartar = Array.isArray(j.descartar) ? j.descartar.map(Number).filter(x => x >= 0 && x < nombres.length) : [];
-    res.json({ descartar });
-  } catch (e) { res.json({ descartar: [], error: e.message }); }
-});
-
-// TIEMPOS DE RESPUESTA: promedio y evolucion semanal (para ver si mejoramos)
-app.get('/api/tiempos', soloPanel, async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-  const desde = new Date(Date.now() - 60 * 864e5).toISOString();
-  const { data: pq } = await db.from('pq_preguntas').select('fecha_pregunta, enviada_at')
-    .eq('cuenta_id', cuenta.id).gte('fecha_pregunta', desde).not('enviada_at', 'is', null).limit(3000);
-  const { data: pv } = await db.from('pq_conversaciones').select('creado_at, primera_resp_at, resuelta_at')
-    .eq('cuenta_id', cuenta.id).gte('creado_at', desde).limit(2000);
-  const sem = f => { const x = new Date(f); const l = new Date(x); l.setDate(x.getDate() - ((x.getDay() + 6) % 7)); return l.toISOString().slice(0, 10); };
-  const agg = {};
-  const add = (k, campo, h) => { agg[k] = agg[k] || { sem: k, pre: [], pv1: [], pvr: [] }; agg[k][campo].push(h); };
-  (pq || []).forEach(r => {
-    const h = (new Date(r.enviada_at) - new Date(r.fecha_pregunta)) / 36e5;
-    if (h >= 0 && h < 24 * 14) add(sem(r.fecha_pregunta), 'pre', h);
-  });
-  (pv || []).forEach(r => {
-    if (r.primera_resp_at && r.creado_at) { const h = (new Date(r.primera_resp_at) - new Date(r.creado_at)) / 36e5; if (h >= 0 && h < 24 * 30) add(sem(r.creado_at), 'pv1', h); }
-    if (r.resuelta_at && r.creado_at) { const h = (new Date(r.resuelta_at) - new Date(r.creado_at)) / 36e5; if (h >= 0 && h < 24 * 60) add(sem(r.creado_at), 'pvr', h); }
-  });
-  const prom = a => a.length ? Math.round(a.reduce((x, y) => x + y, 0) / a.length * 10) / 10 : null;
-  const semanas = Object.values(agg).sort((a, b) => a.sem < b.sem ? 1 : -1).slice(0, 8)
-    .map(x => ({ sem: x.sem, pre: prom(x.pre), pv_primera: prom(x.pv1), pv_resolucion: prom(x.pvr) }));
-  const junta = c => prom([].concat(...Object.values(agg).map(x => x[c])));
-  res.json({ prom_pre: junta('pre'), prom_pv_primera: junta('pv1'), prom_pv_resolucion: junta('pvr'), semanas });
-});
-
-// INFO DE UNA PUBLICACION: precio real (con descuento) + cuotas.
-// Referencia interna para el vendedor: NO se le informa al comprador.
-app.get('/api/pub-info', soloPanel, async (req, res) => {
-  try {
-    const cuenta = await resolverCuenta(req);
-    const id = String(req.query.item || '').replace(/[^A-Za-z0-9]/g, '');
-    if (!cuenta || !/^MLA\d+$/.test(id)) return res.status(400).json({ error: 'item invalido' });
-    const it = await mlGet(`/items/${id}?attributes=id,title,price`, cuenta);
-    const real = await precioRealDe(cuenta, id, it.price || null);
-    let cuotas = null;
-    try {
-      const q = encodeURIComponent(String(it.title || '').split(' ').slice(0, 4).join(' '));
-      const s = await mlGet(`/sites/MLA/search?seller_id=${cuenta.ml_user_id}&q=${q}&limit=20`, cuenta);
-      const hit = (s.results || []).find(r => r.id === id);
-      if (hit && hit.installments && hit.installments.quantity) cuotas = `${hit.installments.quantity} cuotas de $${Math.round(hit.installments.amount || 0).toLocaleString('es-AR')}`;
-    } catch (e) {}
-    res.json({ id, precio: real, lista: it.price || null, cuotas });
-  } catch (e) { res.status(500).json({ error: e.message.slice(0, 200) }); }
-});
-
-// ══ CONTABILIUM: actualizar el CLIENTE de una venta con el CUIT del mensaje ══
-// Automatiza el proceso manual: buscar la venta en Integraciones ML, editar el
-// cliente (CUIT + categoria) y guardar, para que la Factura A salga bien.
-let _cbTok = null;
-async function cbToken() {
-  if (_cbTok && _cbTok.exp > Date.now()) return _cbTok.v;
-  const id = process.env.CONTABILIUM_CLIENT_ID, sec = process.env.CONTABILIUM_CLIENT_SECRET;
-  if (!id || !sec) throw new Error('Faltan credenciales: copia CONTABILIUM_CLIENT_ID y CONTABILIUM_CLIENT_SECRET (las mismas de MargenML) a las Variables de RespondIA en Railway.');
-  const r = await fetch('https://rest.contabilium.com/token', {
-    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: `grant_type=client_credentials&client_id=${encodeURIComponent(id)}&client_secret=${encodeURIComponent(sec)}`
-  });
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok || !j.access_token) throw new Error('Contabilium token -> ' + r.status + ' ' + JSON.stringify(j).slice(0, 150));
-  _cbTok = { v: j.access_token, exp: Date.now() + 50 * 60000 };
-  return _cbTok.v;
-}
-async function cbApi(metodo, path, body) {
-  const t = await cbToken();
-  const r = await fetch('https://rest.contabilium.com' + path, {
-    method: metodo,
-    headers: { Authorization: 'Bearer ' + t, 'Content-Type': 'application/json' },
-    body: body ? JSON.stringify(body) : undefined
-  });
-  const txt = await r.text().catch(() => '');
-  let j = {};
-  try { j = txt ? JSON.parse(txt) : {}; } catch (e) { j = {}; }
-  if (!r.ok) {
-    // si es 405, la cabecera Allow dice QUE metodos acepta esa ruta: la mostramos
-    const allow = r.headers.get('allow') || r.headers.get('access-control-allow-methods');
-    // los 400 de Contabilium a veces vienen con el cuerpo vacio o en texto plano:
-    // mostramos el crudo, que dice mas que un "{}" pelado.
-    const detalle = (txt && txt.trim()) ? txt.slice(0, 400) : '(respondio con el cuerpo vacio)';
-    throw new Error('Contabilium ' + metodo + ' ' + path + ' -> ' + r.status
-      + (allow ? ' [esta ruta acepta: ' + allow + ']' : '') + ' ' + detalle);
   }
-  return j;
-}
-
-// DIAGNOSTICO SOLO LECTURA de la API de Contabilium.
-// Manda OPTIONS y GET a las rutas que le pases y devuelve el estado y la cabecera
-// Allow, que es la que dice que metodos acepta cada ruta. NUNCA manda POST, PUT
-// ni DELETE: no puede crear, modificar ni borrar nada en tu cuenta.
-// Uso: /api/cb-metodos?clave=...&path=/api/clientes,/api/comprobantes-venta
-app.get('/api/cb-metodos', soloPanel, requiereRol('master', 'dueno'), async (req, res) => {
-  try {
-    const t = await cbToken();
-    const rutas = String(req.query.path || '/api/clientes')
-      .split(',').map(s => s.trim()).filter(Boolean).slice(0, 10);
-    const out = [];
-    for (const p of rutas) {
-      const fila = { path: p };
-      for (const metodo of ['OPTIONS', 'GET']) {   // <- los dos unicos permitidos aca
-        try {
-          const r = await fetch('https://rest.contabilium.com' + p, {
-            method: metodo, headers: { Authorization: 'Bearer ' + t }
-          });
-          const txt = await r.text().catch(() => '');
-          fila[metodo] = {
-            status: r.status,
-            acepta: r.headers.get('allow') || r.headers.get('access-control-allow-methods') || null,
-            muestra: txt.slice(0, 300)
-          };
-        } catch (e) { fila[metodo] = { error: String(e.message).slice(0, 150) }; }
-      }
-      out.push(fila);
-    }
-    res.json({ ok: true, nota: 'solo OPTIONS y GET: este diagnostico no modifica nada', rutas: out });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-// Padron de ARCA/AFIP: con el CUIT devuelve razon social y si es
-// Monotributista o Responsable Inscripto (lo que hace el boton ARCA).
-// ---------------------------------------------------------------------
-// PADRON VIA CONTABILIUM
-// Es el mismo metodo que usa su boton ARCA. Acepta pedidos sin sesion y el
-// parametro se llama nroDocumento (lo dijo el propio error de la API).
-// OJO: NO es una API documentada, es un metodo interno de su aplicacion web.
-// Puede cambiar o cerrarse sin aviso, por eso queda AFIP como respaldo y el
-// boton manual de Contabilium como ultima red.
-// ---------------------------------------------------------------------
-const CB_PADRON_URL = 'https://app.contabilium.com/common.aspx/ObtenerDatosAfipPersona';
-
-// Los WebMethod de ASP.NET envuelven la respuesta en {"d": ...} y a veces "d"
-// viene como texto JSON. Aplanamos todo y buscamos los campos por nombre, para
-// no depender de la forma exacta que devuelva.
-function _cbPadronParse(j) {
-  let d = (j && j.d !== undefined) ? j.d : j;
-  if (typeof d === 'string') { try { d = JSON.parse(d); } catch (e) {} }
-  if (!d || typeof d !== 'object') return { razon: null, cat: null, cat_texto: null, crudo: d };
-  const plano = {};
-  (function aplanar(o, pre) {
-    for (const k of Object.keys(o || {})) {
-      const v = o[k];
-      if (v && typeof v === 'object' && !Array.isArray(v)) aplanar(v, pre + k + '.');
-      else plano[(pre + k).toLowerCase()] = v;
-    }
-  })(d, '');
-  const buscar = re => { for (const k of Object.keys(plano)) if (re.test(k) && plano[k]) return String(plano[k]); return null; };
-  const directo = k => (d[k] !== undefined && d[k] !== null && String(d[k]).trim() !== '') ? String(d[k]).trim() : null;
-
-  // Contabilium devuelve un ContribuyenteAfipDTO con estos nombres exactos.
-  // Los miramos primero; la busqueda difusa queda de respaldo.
-  let razon = directo('RazonSocial') || buscar(/razon|denomin/);
-  if (!razon) {
-    const ape = buscar(/apellido/), nom = buscar(/(^|\.)nombre/);
-    razon = [ape, nom].filter(Boolean).join(' ').trim() || null;
-  }
-  // El CODIGO tal cual lo usa Contabilium: MO = Monotributo, RI = Responsable
-  // Inscripto, CF = Consumidor Final, EX = Exento. Hay que guardarlo TAL CUAL en
-  // el cliente: si le mandamos un valor inventado como "MT", no lo entiende.
-  const catCodigo = directo('CategoriaImpositiva') || buscar(/categoriaimpositiv|condicioniva/) || null;
-  const c = String(catCodigo || '').trim().toUpperCase();
-  let cat = null;
-  if (/^MO|^MT|MONOTRIB/.test(c)) cat = 'MT';
-  else if (/^RI|INSCRIPT|RESPONSABLE/.test(c)) cat = 'RI';
-  return {
-    razon, cat, cat_codigo: catCodigo, cat_texto: catCodigo,
-    tipo_doc: directo('TipoDoc'),
-    domicilio: directo('Domicilio'), provincia: directo('ProvinciaNombre'),
-    ciudad: directo('CiudadNombre'), cp: directo('CodigoPostal'),
-    provincia_id: directo('ProvinciaId'), ciudad_id: directo('CiudadId'),
-    crudo: d
-  };
-}
-
-// Escribe un valor en la primera clave que el objeto YA tenga. Si la clave no
-// existe, agregarla no sirve: Contabilium ignora los campos que no conoce (por
-// eso la razon social no se aplicaba aunque la mandaramos).
-function _ponerCampo(obj, claves, valor) {
-  if (valor === null || valor === undefined || String(valor).trim() === '') return false;
-  for (const k of claves) if (k in obj) { obj[k] = valor; return true; }
-  return false;
-}
-
-// Escribe la categoria impositiva en la clave que el cliente realmente usa,
-// sin inventar campos nuevos (un campo desconocido puede hacer fallar el PUT).
-function _ponerCategoria(obj, valor) {
-  if (valor === null || valor === undefined || valor === '') return;
-  if ('CondicionIva' in obj) obj.CondicionIva = valor;
-  else if ('condicionIva' in obj) obj.condicionIva = valor;
-  else if ('CategoriaImpositiva' in obj) obj.CategoriaImpositiva = valor;
-  else if ('categoriaImpositiva' in obj) obj.categoriaImpositiva = valor;
-  else obj.CondicionIva = valor;
-}
-
-async function padronContabilium(cuit, log) {
-  const anotar = o => { if (log) log.push(Object.assign({ fuente: 'contabilium' }, o)); };
-  try {
-    const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), 25000);   // su consulta a ARCA es lenta
-    const r = await fetch(CB_PADRON_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json; charset=utf-8', 'Accept': 'application/json' },
-      body: JSON.stringify({ nroDocumento: String(cuit).replace(/\D/g, '') }),
-      signal: ctl.signal
-    }).finally(() => clearTimeout(timer));
-    const txt = await r.text().catch(() => '');
-    let j = null; try { j = JSON.parse(txt); } catch (e) {}
-    if (!r.ok || !j) { anotar({ status: r.status, muestra: txt.slice(0, 200) }); return null; }
-    const p = _cbPadronParse(j);
-    anotar({ status: r.status, razon: p.razon, cat: p.cat, cat_codigo: p.cat_codigo });
-    return (p.razon || p.cat_codigo) ? p : null;   // devolvemos todo: tambien el domicilio fiscal
-  } catch (e) { anotar({ error: String(e && e.message || e).slice(0, 150) }); return null; }
-}
-
-// El parametro "log" es opcional: si le pasas un array, va anotando que contesto
-// cada servidor en cada intento. Sirve para saber POR QUE no vino el padron en
-// vez de quedarnos con un null mudo.
-async function arcaPadron(cuit, log) {
-  // 1) Contabilium primero: es la fuente que hoy funciona.
-  const cb = await padronContabilium(cuit, log);
-  if (cb) return cb;
-  // 2) AFIP publico como respaldo (hoy devuelve 404, pero si lo reviven sirve).
-  return _arcaPadronAfip(cuit, log);
-}
-async function _arcaPadronAfip(cuit, log) {
-  const dormir = ms => new Promise(r => setTimeout(r, ms));
-  const urls = [
-    `https://soa.afip.gob.ar/sr-padron/v2/persona/${cuit}`,
-    `https://aws.afip.gov.ar/sr-padron/v2/persona/${cuit}`
-  ];
-  // ARCA/AFIP se cae seguido un ratito: hasta 3 vueltas por los 2 servidores,
-  // con espera creciente. Tope de 6s por consulta para no colgarnos.
-  // ARCA puede tardar bastante: la consulta al padron es lenta de por si (el
-  // boton de Contabilium tarda ~15 segundos). Con 6s de tope cortabamos antes
-  // de tiempo, asi que damos 20s por consulta y hacemos menos vueltas.
-  for (let vuelta = 0; vuelta < 2; vuelta++) {
-    if (vuelta > 0) await dormir(2000);
-    const res = await _arcaIntento(urls, log, vuelta + 1);
-    if (res) return res;
-  }
-  return null;
-}
-async function _arcaIntento(urls, log, vuelta) {
-  for (const u of urls) {
-    const anotar = o => { if (log) log.push(Object.assign({ vuelta, servidor: u.split('/')[2] }, o)); };
+  // Seguir la cadena de hermanos (tope 4 saltos, con guardia anti-ciclos).
+  // Las ordenes CANCELADAS (ej: la orden madre que ML cancela al partir la compra)
+  // no participan del grupo: ni sus unidades ni su envio. Pero la cadena las
+  // atraviesa para llegar al siguiente hermano real.
+  let siguiente = String(siblingShipId || '');
+  let saltos = 0;
+  while (siguiente && saltos < 4 && !shipsVistos.has(siguiente)) {
+    shipsVistos.add(siguiente);
+    saltos++;
     try {
-      const ctl = new AbortController();
-      const timer = setTimeout(() => ctl.abort(), 20000);   // ARCA es lento: 20s
-      const r = await fetch(u, { headers: { Accept: 'application/json' }, signal: ctl.signal }).finally(() => clearTimeout(timer));
-      if (!r.ok) { anotar({ status: r.status, cuerpo: (await r.text().catch(() => '')).slice(0, 160) }); continue; }
-      const j = await r.json().catch(() => null);
-      const p = (j && (j.data || j)) || null;
-      if (!p) { anotar({ status: r.status, nota: 'respondio OK pero sin cuerpo util' }); continue; }
-      const dg = p.datosGenerales || p;
-      const razon = dg.razonSocial || [dg.apellido, dg.nombre].filter(Boolean).join(' ').trim() || null;
-      let cat = null;
-      if (p.datosMonotributo) cat = 'MT';
-      else if (p.datosRegimenGeneral) cat = 'RI';
-      if (!cat) {
-        const imps = (p.datosRegimenGeneral && p.datosRegimenGeneral.impuesto) || p.impuestos || [];
-        if (Array.isArray(imps)) {
-          if (imps.some(x => (x.idImpuesto || x) == 32 || /monotrib/i.test(String(x.descripcionImpuesto || x.descripcion || '')))) cat = 'MT';
-          else if (imps.some(x => (x.idImpuesto || x) == 30)) cat = 'RI';
-        }
-      }
-      anotar({ status: r.status, razon, cat, claves: Object.keys(p).slice(0, 12) });
-      if (razon || cat) return { razon, cat };
-    } catch (e) { anotar({ error: String(e && e.message || e).slice(0, 160) }); }
-  }
-  return null;
-}
-
-// DIAGNOSTICO SOLO LECTURA del padron de ARCA/AFIP: proba el CUIT que le pases y
-// te devuelve lo que contesto cada servidor en cada intento. No modifica nada.
-app.get('/api/arca', soloPanel, async (req, res) => {
-  const cuit = String(req.query.cuit || '').replace(/\D/g, '');
-  if (!/^\d{11}$/.test(cuit)) return res.status(400).json({ error: 'pasame ?cuit= con 11 digitos' });
-  const intentos = [];
-  let r = null, err = null;
-  try { r = await arcaPadron(cuit, intentos); } catch (e) { err = String(e.message).slice(0, 200); }
-  res.json({ ok: true, cuit, resultado: r, error: err, intentos });
-});
-
-// SONDA: el boton ARCA de Contabilium llama a este metodo de su aplicacion web.
-// Probamos si se puede llamar desde afuera, sin la sesion del navegador.
-// Es una CONSULTA (Obtener...): manda un CUIT y no modifica nada de tu cuenta.
-// Si contesta los datos, tenemos padron sin depender de AFIP ni de un pago.
-// Si pide login, no hay forma de usarlo desde el backend.
-app.get('/api/arca-cb', soloPanel, requiereRol('master', 'dueno'), async (req, res) => {
-  const cuit = String(req.query.cuit || '').replace(/\D/g, '');
-  if (!/^\d{11}$/.test(cuit)) return res.status(400).json({ error: 'pasame ?cuit= con 11 digitos' });
-  const URL_CB = 'https://app.contabilium.com/common.aspx/ObtenerDatosAfipPersona';
-  // no sabemos como se llama el parametro: probamos los nombres mas probables
-  const cuerpos = [
-    { nroDocumento: cuit },
-    { nroDocumento: cuit, tipoDocumento: 'CUIT' },
-    { nroDocumento: cuit, idTipoDoc: 80 }
-  ];
-  const intentos = [];
-  for (const cuerpo of cuerpos) {
-    try {
-      const r = await fetch(URL_CB, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json; charset=utf-8', 'Accept': 'application/json' },
-        body: JSON.stringify(cuerpo)
-      });
-      const txt = await r.text().catch(() => '');
-      const pideLogin = /login|iniciar sesi|<html/i.test(txt);
-      let leido = null;
-      try { leido = _cbPadronParse(JSON.parse(txt)); } catch (e) {}
-      intentos.push({
-        envie: cuerpo, status: r.status, pide_login: pideLogin,
-        lo_que_entendi: leido ? { razon: leido.razon, cat: leido.cat, cat_texto: leido.cat_texto } : null,
-        muestra: txt.slice(0, 900)
-      });
-      if (r.ok && !pideLogin && leido && (leido.razon || leido.cat)) break;   // le pegamos
-    } catch (e) { intentos.push({ envie: cuerpo, error: String(e.message).slice(0, 150) }); }
-  }
-  res.json({ ok: true, nota: 'solo consulta: no modifica nada', url: URL_CB, intentos });
-});
-
-// DIAGNOSTICO SOLO LECTURA: como ve Contabilium a un cliente, con los NOMBRES
-// EXACTOS de cada campo. Sirve para saber, por ejemplo, en que campo guarda la
-// categoria impositiva. Solo hace GET: no modifica nada.
-app.get('/api/cb-cliente-json', soloPanel, requiereRol('master', 'dueno'), async (req, res) => {
-  try {
-    const filtro = String(req.query.filtro || req.query.cuit || '').trim();
-    if (!filtro) return res.status(400).json({ error: 'pasame ?filtro= con el CUIT, el nro de venta o el nombre' });
-    const s = await cbApi('GET', `/api/clientes/search?filtro=${encodeURIComponent(filtro)}&page=1&pageSize=10`);
-    const items = Array.isArray(s) ? s : ((s && (s.Items || s.items)) || []);
-    const detalles = [];
-    for (const it of items.slice(0, 3)) {
-      const id = it.Id || it.id || it.IdCliente || it.idCliente || null;
-      let ficha = null;
-      if (id) { try { ficha = await cbApi('GET', '/api/clientes/' + id); } catch (e) { ficha = { error: String(e.message).slice(0, 250) }; } }
-      detalles.push({ id, resumen_de_la_busqueda: it, ficha_completa: ficha });
-    }
-    res.json({ ok: true, encontrados: items.length, detalles });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// DIAGNOSTICO SOLO LECTURA de una ORDEN DE VENTA de integracion (ML).
-// Busca la orden por el nro de venta de ML (?nro=) o por su id interno (?id=) y
-// devuelve la orden completa + un resumen de los campos clave (IDVentaIntegracion,
-// IDIntegracion, cliente, items, si ya tiene comprobante). Solo GET: no modifica nada.
-// Sirve para armar/verificar la reasignacion de cliente sin tocar la orden.
-app.get('/api/cb-orden', soloPanel, requiereRol('master', 'dueno'), async (req, res) => {
-  try {
-    const nro = String(req.query.nro || req.query.orden || '').trim();
-    const idint = String(req.query.idint || req.query.idIntegracion || '').trim();
-    const id = String(req.query.id || '').trim();
-    const desde = String(req.query.desde || req.query.fechaDesde || '').trim();
-    const hasta = String(req.query.hasta || req.query.fechaHasta || '').trim();
-    if (!nro && !id) return res.status(400).json({ error: 'pasame ?nro= (nro de venta de ML) o ?id= (id interno de la orden). Opcional ?idint= y ?desde=&hasta=' });
-    let resumen = null, orden = null;
-    if (id) {
-      orden = await _cbOrdenDetalle(id);
-    } else {
-      resumen = await _cbBuscarOrden(nro, idint, { fechaDesde: desde || undefined, fechaHasta: hasta || undefined });
-      const oid = resumen && (resumen.Id || resumen.id);
-      if (oid) orden = await _cbOrdenDetalle(oid);
-    }
-    const b = (orden && !orden.error) ? orden : resumen;
-    const clave = b ? {
-      Id: b.Id || b.id,
-      NumeroOrden: b.NumeroOrden || b.numeroOrden,
-      IDVentaIntegracion: b.IDVentaIntegracion || b.idVentaIntegracion,
-      IDIntegracion: b.IDIntegracion || b.idIntegracion,
-      Integracion: b.Integracion || b.integracion,
-      IDPack: b.IDPack || b.idPack,
-      IDComprobante: b.IDComprobante || b.idComprobante || 0,
-      cliente: b.IDPersona || b.idPersona || b.IdCliente || b.idCliente || (b.Cliente && (b.Cliente.Id || b.Cliente.id)),
-      estado: b.Estado || b.estado || b.IDEstadoIntegracion,
-      total: b.Total || b.total,
-      items_n: Array.isArray(b.Items || b.items) ? (b.Items || b.items).length : null
-    } : null;
-    res.json({ ok: true, nota: 'solo lectura (GET): no modifica nada', encontrada: !!b, clave, resumen, orden });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// Valida el digito verificador de un CUIT. Es barato y evita escribir un numero
-// mal leido de un mensaje o de una foto en un dato fiscal.
-function cuitValido(cuit) {
-  const d = String(cuit || '').replace(/\D/g, '');
-  if (d.length !== 11) return false;
-  const pesos = [5, 4, 3, 2, 7, 6, 5, 4, 3, 2];
-  let suma = 0;
-  for (let i = 0; i < 10; i++) suma += Number(d[i]) * pesos[i];
-  let ver = 11 - (suma % 11);
-  if (ver === 11) ver = 0; else if (ver === 10) ver = 9;
-  return ver === Number(d[10]);
-}
-
-// LA VENTA PRIMERO (idea de Agustin, y es la correcta): la venta de Contabilium
-// apunta directo a su cliente, asi que buscamos el comprobante por el numero de
-// venta de ML y sacamos el cliente de ahi. No sabemos como se llama la ruta del
-// modulo de ventas en la API, asi que probamos las posibles UNA vez y nos
-// acordamos cual respondio (o que ninguna existe).
-// ORDENES DE VENTA DE INTEGRACION (Mercado Libre) EN CONTABILIUM.
-// La API tiene un modulo propio para las ordenes que llegan desde integraciones:
-//   GET /api/ordenesVenta/search?IDIntegracion=&filtro=   -> lista (resumen)
-//   GET /api/ordenesVenta/?id=<id interno>                 -> detalle con items
-// (Antes sondeabamos /api/ventas, /api/comprobantes, etc. que dan 404: el modulo
-//  real es /api/ordenesVenta, confirmado en la doc oficial de Contabilium.)
-// La orden apunta directo a SU cliente (IDPersona), asi que es la fuente mas
-// confiable para saber a quien se le va a facturar la venta de ML. Solo hace GET.
-async function _cbBuscarOrden(ordenNro, idIntegracion, opts) {
-  if (!ordenNro) return null;
-  const nro = String(ordenNro);
-  opts = opts || {};
-  const idInt = idIntegracion || opts.idIntegracion || null;
-  // OJO (probado en produccion): /api/ordenesVenta/search EXIGE fechaDesde, y el
-  // parametro "filtro" NO matchea por numero de orden (devuelve 0 aunque exista).
-  // Por eso listamos las ordenes de la integracion por rango de fechas y matcheamos
-  // el numero en codigo, paginando.
-  const iso = d => d.toISOString().slice(0, 10);
-  const hasta = opts.fechaHasta || iso(new Date());
-  let desde = opts.fechaDesde;
-  if (!desde) { const d = new Date(); d.setDate(d.getDate() - 120); desde = iso(d); }
-  const matchNro = x => [x.NumeroOrden, x.numeroOrden, x.IDVentaIntegracion, x.idVentaIntegracion, x.IDPack, x.idPack]
-    .map(v => String(v || '')).includes(nro);
-  const PAGE = 50;
-  for (let page = 1; page <= 15; page++) {
-    let s;
-    try {
-      const qs = ['fechaDesde=' + desde, 'fechaHasta=' + hasta, 'page=' + page, 'pageSize=' + PAGE];
-      if (idInt) qs.push('IDIntegracion=' + encodeURIComponent(idInt));
-      s = await cbApi('GET', '/api/ordenesVenta/search?' + qs.join('&'));
-    } catch (e) { break; }
-    const items = Array.isArray(s) ? s : ((s && (s.Items || s.items)) || []);
-    if (!items.length) break;
-    const it = items.find(matchNro);
-    if (it) return it;
-    const total = Number(s && (s.TotalItems || s.totalItems)) || 0;
-    if (total && page * PAGE >= total) break;
-    await new Promise(r => setTimeout(r, 300)); // respetar el rate limit de Contabilium
-  }
-  return null;
-}
-
-// Detalle completo de una orden (incluye los items). Solo GET.
-async function _cbOrdenDetalle(id) {
-  if (!id) return null;
-  try { return await cbApi('GET', '/api/ordenesVenta/?id=' + encodeURIComponent(id)); }
-  catch (e) { return null; }
-}
-
-// Saca el id del cliente al que apunta una orden de venta de ML.
-async function _cbClientePorVenta(ordenId, idIntegracion) {
-  const o = await _cbBuscarOrden(ordenId, idIntegracion);
-  if (!o) return null;
-  const cid = o.IDPersona || o.idPersona || o.IdCliente || o.idCliente
-    || (o.Cliente && (o.Cliente.Id || o.Cliente.id))
-    || (o.cliente && (o.cliente.Id || o.cliente.id)) || null;
-  return cid ? { clienteId: cid, ruta: '/api/ordenesVenta/search', orden: o } : null;
-}
-
-// Carga el CUIT del mensaje en el cliente de la venta + padron ARCA.
-// Lo usan el boton manual y el modo automatico del sync.
-async function cbCargarCuitVenta(cuenta, conv, categoria) {
-    // Antes de tocar nada: que el CUIT sea un CUIT. Si lo leimos mal de un
-    // mensaje o de una foto, mejor frenar aca que escribir el dato de otra persona.
-    if (!cuitValido(conv.fact_cuit_msg)) {
-      throw new Error('El CUIT "' + conv.fact_cuit_msg + '" no es valido (no cierra el digito verificador o no tiene 11 digitos). '
-        + 'Reviselo con el comprador antes de cargarlo: no lo escribo por las dudas.');
-    }
-    // el token primero, a cara descubierta: si faltan credenciales, que se vea
-    await cbToken();
-    // el NOMBRE REAL del comprador (asi figura como razon social en Contabilium)
-    let nombreReal = '';
-    // Ademas del nombre, juntamos TODOS los documentos que ML conoce del
-    // comprador. Ojo: el que viene en billing_info suele ser distinto del que
-    // figura como identificacion del comprador, y Contabilium crea el cliente
-    // con este ultimo. Buscando por uno solo, no lo encontrabamos.
-    const docsConocidos = new Set();
-    const sumarDoc = v => { const d = String(v || '').replace(/\D/g, ''); if (d.length >= 7) docsConocidos.add(d); };
-    sumarDoc(conv.fact_doc_nro);
-    try {
-      const ord = await mlGet(`/orders/${conv.orden_id}`, cuenta);
-      nombreReal = [ord?.buyer?.first_name, ord?.buyer?.last_name].filter(Boolean).join(' ').trim();
-      sumarDoc(ord?.buyer?.identification?.number);
-      sumarDoc(ord?.buyer?.billing_info?.doc_number);
-      sumarDoc(ord?.buyer?.billing_info?.identification?.number);
-      for (const p of (ord?.payments || [])) sumarDoc(p?.payer?.identification?.number);
-    } catch (e) {}
-    // buscar el cliente: 1) por nro de venta (el email de ML lo incluye)
-    // 2) por el documento cargado en la venta 3) por el nombre real
-    let cli = null, motivoMatch = null;
-    const intentosLog = [];
-    const candidatos = [];
-    const soloDig = s => String(s || '').replace(/\D/g, '');
-    const cuitPedido = soloDig(conv.fact_cuit_msg);
-    // Nombre normalizado: sin acentos, sin orden. Asi "ZAPATA DARIO IGNACIO"
-    // y "Dario Ignacio Zapata" se reconocen como la misma persona.
-    const normNombre = s => String(s || '').toUpperCase().normalize('NFD').replace(/[̀-ͯ]/g, '')
-      .replace(/[^A-Z ]/g, ' ').split(/\s+/).filter(Boolean).sort().join(' ');
-    const nombreBuscado = normNombre(nombreReal);
-
-    // CAMINO 1 — POR LA VENTA: el comprobante de Contabilium apunta directo a
-    // su cliente. Si esto anda, no hay nada que adivinar. Probamos por numero
-    // de venta y tambien por numero de carrito (los packs de ML facturan con
-    // el numero de carrito y el de venta segun el caso).
-    try {
-      const numerosVenta = [...new Set([conv.orden_id, conv.pack_id].filter(Boolean).map(String))];
-      for (const nro of numerosVenta) {
-        const porVenta = await _cbClientePorVenta(nro);
-        if (!porVenta) continue;
-        const f = await cbApi('GET', '/api/clientes/' + porVenta.clienteId);
-        if (f && (f.Id || f.id)) {
-          cli = f;
-          motivoMatch = 'la venta ' + nro + ' en Contabilium apunta a este cliente';
-          break;
-        }
-      }
-    } catch (e) {}
-
-    // CAMINO 2 — BUSQUEDAS: por numero de venta, por el CUIT que estamos
-    // cargando (si una corrida anterior ya lo puso, esta es la UNICA busqueda
-    // que lo encuentra), por los documentos que ML conoce, y por el nombre.
-    const filtros = [String(conv.orden_id || ''), cuitPedido, ...docsConocidos, nombreReal].filter(Boolean);
-    if (!cli) for (const filtro of filtros) {
-      try {
-        const s = await cbApi('GET', `/api/clientes/search?filtro=${encodeURIComponent(filtro)}&page=1&pageSize=50`);
-        const items = Array.isArray(s) ? s : ((s && (s.Items || s.items)) || []);
-        intentosLog.push(`"${filtro}": ${items.length} resultados`);
-        for (const it of items) {
-          const id = it.Id || it.id;
-          if (id && !candidatos.some(c => String(c.Id || c.id) === String(id))) candidatos.push(it);
-        }
-        // SOLO aceptamos coincidencias FUERTES. Elegir "el primero que aparezca"
-        // es la forma mas facil de escribirle el CUIT al cliente equivocado.
-        const nrosVenta = [conv.orden_id, conv.pack_id].filter(Boolean).map(String);
-        const porEmail = nrosVenta.length && items.find(x => { const e = String(x.Email || x.email || ''); return nrosVenta.some(n => e.includes(n)); });
-        if (porEmail) { cli = porEmail; motivoMatch = 'el email del cliente tiene el nro de esta venta'; break; }
-        const porDoc = items.find(x => docsConocidos.has(soloDig(x.NroDoc || x.nroDoc)));
-        if (porDoc) { cli = porDoc; motivoMatch = 'el documento del cliente (' + (porDoc.NroDoc || porDoc.nroDoc) + ') es uno de los que ML tiene del comprador'; break; }
-        const porCuit = cuitPedido && items.find(x => soloDig(x.NroDoc || x.nroDoc) === cuitPedido);
-        if (porCuit) { cli = porCuit; motivoMatch = 'el cliente ya tiene cargado ese CUIT'; break; }
-      } catch (e) {
-        intentosLog.push(`"${filtro}": ERROR ${e.message.slice(0, 180)}`);
-      }
-    }
-    // Ultimo recurso, y solo si es INEQUIVOCO: el nombre completo coincide exacto
-    // con el del comprador de ML y hay UN SOLO candidato con ese nombre.
-    if (!cli && nombreBuscado && nombreBuscado.split(' ').length >= 2) {
-      // ML suele traer menos partes del nombre que Contabilium ("Dario Zapata"
-      // vs "DARIO IGNACIO ZAPATA"), asi que pedimos que esten TODAS las del
-      // comprador, no que sean identicos. Y descartamos razones sociales de
-      // empresa: un "ZAPATA HERMANOS SRL" no es la persona que compro.
-      const esEmpresa = s => /(\bS\.?\s?R\.?\s?L\b|\bS\.?\s?A\.?\s?S?\b|\bSOC\b|\bSOCIEDAD\b|\bS\.?\s?H\b|\bCOOP|\bLTDA\b)/i.test(String(s || ''));
-      const tokensML = nombreBuscado.split(' ').filter(Boolean);
-      const porNombre = candidatos.filter(x => {
-        const bruto = x.RazonSocial || x.razonSocial || '';
-        if (!bruto || esEmpresa(bruto)) return false;
-        const suyos = new Set(normNombre(bruto).split(' ').filter(Boolean));
-        return tokensML.every(t => suyos.has(t));
-      });
-      if (porNombre.length === 1) {
-        cli = porNombre[0];
-        motivoMatch = 'el nombre del cliente ("' + (porNombre[0].RazonSocial || porNombre[0].razonSocial)
-          + '") contiene el del comprador de ML ("' + nombreReal + '") y es el unico asi';
-      }
-    }
-    if (!cli) {
-      const lista = candidatos.slice(0, 8)
-        .map(x => '#' + (x.Id || x.id) + ' ' + (x.RazonSocial || x.razonSocial || 'sin nombre') + ' (doc ' + (x.NroDoc || x.nroDoc || 's/d') + ')')
-        .join(' | ');
-      throw new Error('No pude identificar CON SEGURIDAD cual es el cliente de esta venta en Contabilium, asi que no toque nada. '
-        + 'Documentos que ML tiene del comprador: ' + ([...docsConocidos].join(', ') || 'ninguno')
-        + '. Nombre del comprador: "' + (nombreReal || 's/d') + '". '
-        + 'Busquedas hechas: ' + intentosLog.join(' ; ')
-        + (lista ? '. Aparecieron estos candidatos, pero ninguno coincide por nro de venta ni por documento: ' + lista : '')
-        + '. Cargalo a mano eligiendo vos el cliente correcto.');
-    }
-    // El id del cliente: sin el, no hay forma de actualizarlo (ver el PUT de abajo).
-    const cliId = cli.Id || cli.id || cli.IdCliente || cli.idCliente || null;
-    if (!cliId) throw new Error('El cliente encontrado no trae id. Campos que devolvio Contabilium: ' + Object.keys(cli).join(', '));
-    // QUE OBJETO LE MANDAMOS AL PUT.
-    // El resumen que devuelve /clientes/search es el que Contabilium acepta.
-    // La ficha completa de /clientes/{id} trae campos que el PUT rechaza con un
-    // 400 de cuerpo vacio, asi que va SOLO como plan B si el primero falla.
-    let ficha = cli;
-    let fichaCompleta = null;
-    try {
-      const full = await cbApi('GET', '/api/clientes/' + cliId);
-      if (full && (full.Id || full.id)) fichaCompleta = full;
-    } catch (e) { /* si no se puede leer, seguimos con el resumen nomas */ }
-
-    // El PRIMER intento de PUT va siempre con un cuerpo chico de claves
-    // conocidas (el PUT es un merge: lo que no mandas queda como esta). Esto
-    // importa sobre todo cuando el cliente vino del camino de la venta, donde
-    // "cli" es la ficha completa: mandarla entera de entrada es la forma que
-    // historicamente devolvio 400.
-    {
-      const CLAVES_BASE = ['Id', 'id', 'RazonSocial', 'razonSocial', 'Nombre', 'nombre',
-        'NroDoc', 'nroDoc', 'TipoDoc', 'tipoDoc', 'CondicionIva', 'condicionIva', 'Email', 'email'];
-      const chico = {};
-      for (const k of CLAVES_BASE) if (k in ficha) chico[k] = ficha[k];
-      if (chico.Id || chico.id) ficha = chico;
-    }
-
-    // Foto del cliente ANTES de tocarlo. Es la referencia honesta para despues
-    // saber si algo cambio: comparar contra el cuerpo que mandamos da falsos
-    // positivos, porque el resumen no trae todos los campos.
-    const base0 = fichaCompleta || cli;
-    const previo = {
-      razon: String(base0.RazonSocial || base0.razonSocial || ''),
-      iva: String((base0.CondicionIva !== undefined ? base0.CondicionIva : base0.condicionIva) || '')
-    };
-
-    const antes = ficha.NroDoc || ficha.nroDoc || '';
-    const cuitNuevo = String(conv.fact_cuit_msg).replace(/\D/g, '');
-    const docActual = String(antes).replace(/\D/g, '');
-    // IDEMPOTENCIA: si el cliente YA tiene ese CUIT (porque lo cargamos antes),
-    // no se lo volvemos a mandar. Contabilium valida que el CUIT sea unico y NO
-    // se excluye a si mismo: reenviarle el mismo numero devuelve
-    // 400 "El CUIT ingresado ya se encuentra registrado".
-    const yaLoTenia = !!cuitNuevo && docActual === cuitNuevo;
-
-    // CHEQUEO PREVIO ANTIDUPLICADO. Contabilium NO permite el mismo CUIT en dos
-    // clientes. Si el CUIT pedido ya pertenece a OTRO cliente, hay casos en que
-    // Contabilium NO tira el error "ya se encuentra registrado" sino que acepta el
-    // PUT y deja el numero de documento VACIO, corrompiendo la ficha del cliente de
-    // la venta (visto en produccion). Por eso, ANTES de tocar nada, buscamos si ese
-    // CUIT ya tiene dueno. Si lo tiene, cortamos sin ningun PUT (no se corrompe nada)
-    // y le decimos al operador a que cliente facturar.
-    if (!yaLoTenia && /^\d{11}$/.test(cuitNuevo)) {
-      let duenio = null;
-      try {
-        const s = await cbApi('GET', `/api/clientes/search?filtro=${encodeURIComponent(cuitNuevo)}&page=1&pageSize=10`);
-        const its = Array.isArray(s) ? s : ((s && (s.Items || s.items)) || []);
-        duenio = its.find(x => String(x.NroDoc || x.nroDoc || '').replace(/\D/g, '') === cuitNuevo
-          && String(x.Id || x.id) !== String(cliId)) || null;
-      } catch (e) { /* si la busqueda falla, seguimos con el flujo normal */ }
-      if (duenio) {
-        const dId = duenio.Id || duenio.id;
-        const dNom = duenio.RazonSocial || duenio.razonSocial || 'sin nombre';
-        throw new Error('El CUIT ' + conv.fact_cuit_msg + ' ya pertenece a OTRO cliente de Contabilium: "'
-          + dNom + '" (id ' + dId + '). Contabilium no permite el mismo CUIT en dos clientes, asi que NO lo puedo '
-          + 'poner en el cliente que creo Mercado Libre para esta venta (id ' + cliId + '). '
-          + 'Para emitir la Factura A: en Contabilium factura esta venta directamente al cliente "' + dNom + '" (id ' + dId + ').');
-      }
-    }
-
-    // EL TIPO DE DOCUMENTO NO ES UN DETALLE.
-    // Si el cliente queda con TipoDoc = DNI, Contabilium recorta el numero a 8
-    // digitos: un CUIT de 11 se guarda mutilado (27295540023 -> 27295540) y
-    // ademas no aparece el boton ARCA. SIEMPRE hay que pasarlo a CUIT, no solo
-    // cuando la ficha ya traia esa clave.
-    // Algunos sistemas usan el codigo de AFIP (80 = CUIT, 96 = DNI) en vez del
-    // texto. Deducimos cual usa este mirando que forma tiene el valor actual.
-    const tipoActual = (ficha.TipoDoc !== undefined) ? ficha.TipoDoc : ficha.tipoDoc;
-    const usaCodigos = tipoActual !== undefined && tipoActual !== null
-      && /^\d+$/.test(String(tipoActual).trim());
-    const valorCuit = usaCodigos ? 80 : 'CUIT';
-    const tipoYaEsCuit = /CUIT/i.test(String(tipoActual || '')) || String(tipoActual || '').trim() === '80';
-    if (!yaLoTenia) ficha.NroDoc = String(conv.fact_cuit_msg);
-    // se manda siempre: aunque el numero ya estuviera bien, el tipo puede estar mal
-    if ('tipoDoc' in ficha && !('TipoDoc' in ficha)) ficha.tipoDoc = valorCuit;
-    else ficha.TipoDoc = valorCuit;
-    // el "boton ARCA" automatico: padron -> razon social + categoria
-    let padron = null;
-    const padronLog = [];
-    try { padron = await arcaPadron(String(conv.fact_cuit_msg), padronLog); }
-    catch (e) { padronLog.push({ error: String(e && e.message || e).slice(0, 160) }); }
-    // Todos los datos del padron, cada uno en la clave que la ficha ya usa.
-    const aplicarPadron = obj => {
-      if (!padron) return;
-      _ponerCampo(obj, ['RazonSocial', 'razonSocial', 'Nombre', 'nombre'], padron.razon);
-      _ponerCampo(obj, ['Domicilio', 'domicilio', 'Direccion', 'direccion'], padron.domicilio);
-      _ponerCampo(obj, ['CodigoPostal', 'codigoPostal', 'CP', 'cp'], padron.cp);
-      _ponerCampo(obj, ['ProvinciaId', 'provinciaId', 'IdProvincia'], padron.provincia_id);
-      _ponerCampo(obj, ['CiudadId', 'ciudadId', 'IdCiudad'], padron.ciudad_id);
-      _ponerCampo(obj, ['ProvinciaNombre', 'provinciaNombre', 'Provincia', 'provincia'], padron.provincia);
-      _ponerCampo(obj, ['CiudadNombre', 'ciudadNombre', 'Ciudad', 'ciudad', 'Localidad', 'localidad'], padron.ciudad);
-    };
-    aplicarPadron(ficha);
-    const cat = (padron && padron.cat) || (categoria ? String(categoria).toUpperCase() : null);
-    // Si el padron vino de Contabilium, usamos SU codigo tal cual (MO/RI/CF...).
-    // Si no, traducimos lo que tengamos a los codigos que su sistema entiende.
-    const catCodigo = (padron && padron.cat_codigo) || (cat === 'MT' ? 'MO' : (cat === 'RI' ? 'RI' : null));
-    _ponerCategoria(ficha, catCodigo);
-
-    // Si el CUIT ya estaba, el tipo YA dice CUIT y ARCA no trajo nada, no hay
-    // literalmente nada que escribir: no molestamos a la API (y de paso evitamos
-    // el 400 por duplicado). Si el tipo esta mal, hay que escribir igual.
-    if (yaLoTenia && tipoYaEsCuit && !padron && !cat) {
-      return {
-        ok: true, sin_cambios: true, cliente_id: cliId, motivo_match: motivoMatch, verificado: true,
-        cliente: ficha.RazonSocial || ficha.razonSocial || '',
-        antes, ahora: String(conv.fact_cuit_msg),
-        razon_social: null, categoria: null, padron: false, padron_detalle: padronLog
-      };
-    }
-    // OJO CON LA RUTA: la API de Contabilium acepta POST en /api/clientes (que CREA
-    // uno nuevo) y PUT en /api/clientes/{id} (que actualiza). Un PUT a /api/clientes
-    // sin el id contesta 405, y un POST te crearia un cliente duplicado.
-    // Probamos en cascada, del cuerpo mas conservador al mas completo, y nos
-    // quedamos con el primero que Contabilium acepte.
-    const intentos = [{ como: 'resumen de la busqueda', cuerpo: ficha }];
-    if (yaLoTenia) {
-      // el cliente ya tiene ese CUIT: puede que la API se queje solo porque el
-      // numero viene en el cuerpo, aunque no lo estemos cambiando. Lo sacamos.
-      const sinDoc = Object.assign({}, ficha);
-      delete sinDoc.NroDoc; delete sinDoc.nroDoc;
-      delete sinDoc.TipoDoc; delete sinDoc.tipoDoc;
-      intentos.push({ como: 'sin el documento (el cliente ya lo tenia)', cuerpo: sinDoc });
-    }
-    if (fichaCompleta) {
-      const fc = Object.assign({}, fichaCompleta);
-      if (!yaLoTenia) { fc.NroDoc = String(conv.fact_cuit_msg); fc.TipoDoc = valorCuit; }
-      aplicarPadron(fc);
-      _ponerCategoria(fc, catCodigo);
-      intentos.push({ como: 'ficha completa', cuerpo: fc });
-    }
-
-    let formaQueAnduvo = null;
-    const errores = [];
-    for (const it of intentos) {
-      try {
-        await cbApi('PUT', '/api/clientes/' + cliId, it.cuerpo);
-        ficha = it.cuerpo; formaQueAnduvo = it.como; break;
-      } catch (ePut) {
-        errores.push(it.como + ' -> ' + ePut.message);
-        // CUIT DE OTRO CLIENTE: Contabilium no deja repetir el CUIT. Aca no sirve
-        // reintentar de otra forma; hay que facturarle al cliente que ya lo tiene.
-        if (/ya se encuentra registrado/i.test(ePut.message) && !yaLoTenia) {
-          let duenio = null;
-          try {
-            const s2 = await cbApi('GET', `/api/clientes/search?filtro=${encodeURIComponent(cuitNuevo)}&page=1&pageSize=10`);
-            const its = Array.isArray(s2) ? s2 : ((s2 && (s2.Items || s2.items)) || []);
-            duenio = its.find(x => String(x.NroDoc || x.nroDoc || '').replace(/\D/g, '') === cuitNuevo) || null;
-          } catch (e) {}
-          if (duenio && String(duenio.Id || duenio.id) !== String(cliId)) {
-            throw new Error('El CUIT ' + conv.fact_cuit_msg + ' ya esta registrado en OTRO cliente de Contabilium: "'
-              + (duenio.RazonSocial || duenio.razonSocial || 'sin nombre') + '" (id ' + (duenio.Id || duenio.id) + '). '
-              + 'Contabilium no permite el mismo CUIT en dos clientes, asi que no lo puedo mover. '
-              + 'Para facturar esta venta, en Contabilium elegi ese cliente en vez del que creo Mercado Libre.');
+      const rs = await fetch(`https://api.mercadolibre.com/shipments/${siguiente}`, H);
+      const sh = await rs.json();
+      if (!sh || sh.error) break;
+      let ordCancelada = false;
+      if (sh.order_id) {
+        const ro = await fetch(`https://api.mercadolibre.com/orders/${sh.order_id}`, H);
+        const ord = await ro.json();
+        if (ord && !ord.error) {
+          ordCancelada = (ord.status === 'cancelled');
+          if (!ordCancelada) {
+            const it = (ord.order_items && ord.order_items[0]) || {};
+            ordenes.push({
+              orderId: String(ord.id),
+              sku: String((it.item && (it.item.seller_sku || it.item.seller_custom_field)) || '').trim().toUpperCase(),
+              unitPrice: Number(it.unit_price) || 0,
+              qty: Number(it.quantity) || 1
+            });
           }
         }
       }
-    }
-    if (!formaQueAnduvo) {
-      throw new Error('Contabilium no acepto el cambio de ninguna forma:\n'
-        + errores.map((x, i) => (i + 1) + ') ' + x).join('\n'));
-    }
-    // VERIFICACION. Releemos el cliente y confirmamos DOS cosas: que el numero
-    // quedo completo y que el tipo de documento quedo en CUIT. Lo segundo es
-    // clave: con el tipo en DNI, Contabilium recorta el CUIT a 8 digitos y la
-    // factura sale con un numero mutilado.
-    // El resumen de la busqueda a veces no alcanza para cambiar el NOMBRE
-    // (Contabilium ignora las claves que no reconoce). Si el padron trajo razon
-    // social y no quedo aplicada, reintentamos con la ficha completa.
-    // LA RAZON SOCIAL ES LA MAS DURA DE CAMBIAR: vimos clientes donde el PUT
-    // aplica CUIT, categoria y domicilio pero deja el NOMBRE viejo. La causa mas
-    // probable es que para personas fisicas la API espere el nombre en otra
-    // clave. Cascada de formas, releyendo el cliente despues de cada una, y nos
-    // quedamos con la primera que efectivamente lo cambie.
-    const norm = s => String(s || '').trim().toUpperCase().replace(/\s+/g, ' ');
-    const intentoCompleto = intentos.find(x => x.como === 'ficha completa');
-    let nombreQuedo = null;
-    if (padron && (padron.razon || padron.domicilio)) {
-      const leer = async () => { try { return await cbApi('GET', '/api/clientes/' + cliId); } catch (e) { return null; } };
-      const nombreOk = d => !padron.razon || norm(d && (d.RazonSocial || d.razonSocial || d.Nombre || d.nombre)) === norm(padron.razon);
-      const domOk = d => !padron.domicilio || norm(d && (d.Domicilio || d.domicilio)) === norm(padron.domicilio);
-
-      const base = intentoCompleto ? JSON.parse(JSON.stringify(intentoCompleto.cuerpo)) : JSON.parse(JSON.stringify(ficha));
-      // forma 2: el nombre en TODAS las claves posibles, existan o no en la ficha
-      const conTodasLasClaves = Object.assign({}, base);
-      if (padron.razon) for (const k of ['RazonSocial', 'razonSocial', 'Nombre', 'nombre']) conTodasLasClaves[k] = padron.razon;
-      // forma 3: cuerpo minimo (el PUT es un merge: lo que no mandas queda como esta).
-      // SOLO si el padron trajo nombre: jamas mandar RazonSocial en null.
-      const formas = [
-        ['ficha completa', base],
-        ['nombre en todas las claves', conTodasLasClaves]
-      ];
-      if (padron.razon) {
-        formas.push(['cuerpo minimo solo nombre+doc',
-          { Id: cliId, id: cliId, RazonSocial: padron.razon, Nombre: padron.razon, NroDoc: String(conv.fact_cuit_msg), TipoDoc: valorCuit }]);
+      if (!ordCancelada) {
+        const sd2 = await getShipData(siguiente, token);
+        envioTotal += Number(sd2.costo_envio) || 0;
+        ingresoTotal += Number(sd2.precio_comprador_envio) || 0;
       }
-      for (const [como, cuerpo] of formas) {
-        let d = await leer();
-        if (d && nombreOk(d) && domOk(d)) { nombreQuedo = true; break; }   // ya esta bien: no tocar mas
-        if (!padron.razon && d && domOk(d)) { nombreQuedo = null; break; }
-        try {
-          await cbApi('PUT', '/api/clientes/' + cliId, cuerpo);
-          ficha = cuerpo;
-          if (formaQueAnduvo.indexOf(como) < 0) formaQueAnduvo += ' (+ ' + como + ')';
-        } catch (e) { continue; }
-      }
-      const fin = await leer();
-      nombreQuedo = fin ? nombreOk(fin) : null;
-    }
+      siguiente = (sh.sibling && sh.sibling.source === 'split' && sh.sibling.sibling_id) ? String(sh.sibling.sibling_id) : '';
+    } catch (e) { break; }
+  }
+  if (ordenes.length < 2) return null;
+  const out = { t: Date.now(), ordenes, envioTotal, ingresoTotal };
+  _packCache.set(clave, out);
+  console.log(`[PACK-SPLIT] orden=${order.id} agrupo ${ordenes.length} ordenes via siblings, envio total=${envioTotal}`);
+  return out;
+}
 
-    let verificado = null, tipoFinal = null, nroFinal = null, contabilium_completo = null, razon_ok = null;
+async function repartirEnvioPack(order, envioRealFallback, ingresoFallback, token, siblingShipId) {
+  try {
+    let info = null;
+    if (order.pack_id) info = await _ordenesDelPack(order.pack_id, token);
+    if (!info && siblingShipId) info = await _grupoPorSiblings(order, siblingShipId, token);
+    if (!info) return null; // sin grupo real → sin cambios
+    const ordenes = info.ordenes;
+    // Total real del pack: suma de todos sus envios (deduplicados). Si por algun
+    // motivo no se pudo sumar, caemos al costo de esta orden (comportamiento previo).
+    const envioRealTotal = info.envioTotal > 0 ? info.envioTotal : (envioRealFallback || 0);
+    const ingresoTotal = info.ingresoTotal > 0 ? info.ingresoTotal : (ingresoFallback || 0);
+    if (!(envioRealTotal > 0) && !(ingresoTotal > 0)) return null;
+
+    // Umbral vigente a la fecha de la venta (fb_config_umbral, fallback $33.000)
+    let umbral = 33000;
     try {
-      const despues = await cbApi('GET', '/api/clientes/' + cliId);
-      if (padron && padron.razon) {
-        const rz = String((despues && (despues.RazonSocial || despues.razonSocial)) || '').trim().toUpperCase();
-        razon_ok = rz === String(padron.razon).trim().toUpperCase();
+      const cfg = await _fbCargarConfig();
+      const u = _vigenteA(cfg.umbral, order.date_created);
+      if (u && Number(u.monto_umbral) > 0) umbral = Number(u.monto_umbral);
+    } catch (e) {}
+
+    // Quiénes pagan envío (precio unitario >= umbral)
+    const pagan = ordenes.filter(o => o.unitPrice >= umbral);
+    // Caso raro: nadie supera el umbral pero ML cobró igual → reparten todos por unidades
+    const grupo = pagan.length > 0 ? pagan : ordenes;
+
+    // Envío teórico del Drive (envioML c/IVA, por unidad) de cada ítem del grupo
+    let teoricos = null;
+    try {
+      const medidas = await getMedidas();
+      const t = {};
+      let suma = 0, completos = true;
+      for (const o of grupo) {
+        const m = medidas[o.sku];
+        const e = m && Number(m.envioML) > 0 ? Number(m.envioML) * o.qty : 0;
+        if (!(e > 0)) completos = false;
+        t[o.orderId] = e;
+        suma += e;
       }
-      nroFinal = String((despues && (despues.NroDoc || despues.nroDoc)) || '').replace(/\D/g, '');
-      tipoFinal = (despues && (despues.TipoDoc !== undefined ? despues.TipoDoc : despues.tipoDoc));
-      const nroOk = nroFinal === cuitNuevo;
-      const tipoOk = /CUIT/i.test(String(tipoFinal || '')) || String(tipoFinal || '').trim() === '80';
-      verificado = nroOk && tipoOk;
-      // De paso, sin esperar nada: si AFIP no nos contesto pero la razon social o
-      // la categoria cambiaron igual, quiere decir que las completo Contabilium.
-      if (!padron) {
-        const razonLuego = String((despues && (despues.RazonSocial || despues.razonSocial)) || '');
-        const ivaLuego = String((despues && (despues.CondicionIva !== undefined ? despues.CondicionIva : despues.condicionIva)) || '');
-        contabilium_completo = (razonLuego !== previo.razon || ivaLuego !== previo.iva)
-          ? { razon: razonLuego, iva: ivaLuego } : false;
-      }
-    } catch (e) { /* si no se puede releer, queda en null: lo avisamos igual */ }
-    if (verificado === false) {
-      throw new Error('Contabilium acepto el cambio pero al releer el cliente ' + cliId + ' quedo mal: '
-        + 'documento "' + nroFinal + '" (esperaba "' + cuitNuevo + '") y tipo "' + tipoFinal + '" (esperaba CUIT). '
-        + (nroFinal && nroFinal.length === 8
-            ? 'El numero quedo recortado a 8 digitos: eso pasa cuando el tipo quedo en DNI. '
-            : '')
-        + 'NO factures esta venta hasta corregirlo a mano en Contabilium.');
+      if (completos && suma > 0) teoricos = { porOrden: t, suma };
+    } catch (e) {}
+
+    // Asignación del COSTO
+    const asignado = {};
+    if (teoricos && Math.abs(teoricos.suma - envioRealTotal) <= 2) {
+      // Coincide con lo que descontó ML → usar los valores del Drive tal cual
+      for (const o of ordenes) asignado[o.orderId] = teoricos.porOrden[o.orderId] || 0;
+      console.log(`[PACK-ENVIO] pack=${order.pack_id} DRIVE (suma=${teoricos.suma} vs real=${envioRealTotal})`);
+    } else {
+      // No coincide (o faltan datos en el Drive) → dividir el real por unidades
+      const totalUnidades = grupo.reduce((a, o) => a + o.qty, 0) || 1;
+      const porUnidad = envioRealTotal / totalUnidades;
+      for (const o of ordenes) asignado[o.orderId] = grupo.indexOf(o) > -1 ? porUnidad * o.qty : 0;
+      console.log(`[PACK-ENVIO] pack=${order.pack_id} POR-UNIDADES (teorico=${teoricos ? teoricos.suma : 'sin datos'} vs real=${envioRealTotal})`);
     }
-    return {
-      ok: true, cliente_id: cliId, motivo_match: motivoMatch,
-      verificado, razon_ok, tipo_doc: tipoFinal, nro_doc: nroFinal, forma: formaQueAnduvo,
-      // si el nombre no entro de ninguna forma, mostramos las claves reales de la
-      // ficha: ahi se ve en que campo guarda el nombre este cliente, sin adivinar.
-      claves_ficha: (razon_ok === false && fichaCompleta) ? Object.keys(fichaCompleta) : undefined,
-      domicilio_padron: padron ? [padron.domicilio, padron.ciudad, padron.provincia].filter(Boolean).join(', ') : null,
-      contabilium_completo,
-      cliente: ficha.RazonSocial || ficha.razonSocial || '', antes, ahora: String(conv.fact_cuit_msg),
-      razon_social: (padron && padron.razon) || null,
-      categoria: (cat === 'MT' ? 'Monotributista' : (cat === 'RI' ? 'Responsable Inscripto' : null))
-        || (catCodigo ? ('código ' + catCodigo) : null),
-      categoria_codigo: catCodigo || null,
-      padron: !!padron,
-      // si el padron no vino, aca queda el detalle de que contesto cada servidor
-      padron_detalle: padron ? null : padronLog
-    };
-}
-// Marca que el padron YA se aplico en esta venta. Va en su propio try porque si
-// la columna cb_padron_at todavia no existe en la base, no queremos romper el
-// flujo principal: el CUIT ya se cargo igual.
-async function _marcarPadronHecho(convId) {
-  try { await db.from('pq_conversaciones').update({ cb_padron_at: new Date().toISOString() }).eq('id', convId); }
-  catch (e) {}
-}
 
-// REINTENTO DEL PADRON DE ARCA
-// Cuando ARCA se cae, el CUIT igual queda cargado en Contabilium pero la razon
-// social y la categoria impositiva quedan sin completar. Este trabajo las vuelve
-// a pedir cada 20 minutos durante las 48hs siguientes, hasta que ARCA conteste.
-// Es idempotente: volver a llamar a cbCargarCuitVenta reescribe el mismo CUIT.
-let _padronJob = { corriendo: false, ultimo: null, pendientes: 0, resueltos: 0, error: null, falta_columna: false };
-async function reintentarPadronPendiente() {
-  if (_padronJob.corriendo) return;
-  _padronJob.corriendo = true;
-  try {
-    const { data: cuentas } = await db.from('pq_cuentas').select('*').eq('activa', true);
-    let pendientes = 0;
-    for (const cuenta of (cuentas || [])) {
-      const desde = new Date(Date.now() - 48 * 3600 * 1000).toISOString();
-      const { data, error } = await db.from('pq_conversaciones')
-        .select('id, orden_id, pack_id, fact_cuit_msg, fact_doc_nro, cb_cuit_at')
-        .eq('cuenta_id', cuenta.id)
-        .not('cb_cuit_at', 'is', null)
-        .is('cb_padron_at', null)
-        .gte('cb_cuit_at', desde)
-        .limit(10);
-      if (error) {
-        // tipico: la columna todavia no fue creada en Supabase
-        _padronJob.falta_columna = true;
-        _padronJob.error = 'No puedo leer cb_padron_at: ' + String(error.message).slice(0, 140)
-          + ' -> corre en Supabase: alter table pq_conversaciones add column if not exists cb_padron_at timestamptz;';
-        continue;
-      }
-      _padronJob.falta_columna = false;
-      pendientes += (data || []).length;
-      for (const conv of (data || [])) {
-        // sin CUIT no hay nada que consultar: la damos por cerrada
-        if (!conv.fact_cuit_msg) { await _marcarPadronHecho(conv.id); continue; }
-        try {
-          const r = await cbCargarCuitVenta(cuenta, conv, null);
-          if (r && r.padron && r.razon_ok !== false) { await _marcarPadronHecho(conv.id); _padronJob.resueltos++; }
-        } catch (e) { /* esta venta fallo, seguimos con las otras */ }
-        await new Promise(r => setTimeout(r, 800));
-      }
-    }
-    _padronJob.pendientes = pendientes;
-    _padronJob.ultimo = new Date().toISOString();
-    if (!_padronJob.falta_columna) _padronJob.error = null;
-  } catch (e) { _padronJob.error = String(e.message).slice(0, 200); }
-  finally { _padronJob.corriendo = false; }
-}
-setTimeout(reintentarPadronPendiente, 5 * 60 * 1000);
-setInterval(reintentarPadronPendiente, 20 * 60 * 1000);
+    // Ingreso del comprador: misma proporción que el costo asignado
+    const miCosto = asignado[String(order.id)];
+    if (miCosto == null) return null; // esta orden no está en el pack (raro) → sin cambios
+    const sumaAsignada = Object.values(asignado).reduce((a, b) => a + b, 0) || 1;
+    const miIngreso = (ingresoTotal > 0) ? ingresoTotal * (miCosto / sumaAsignada) : 0;
 
-// Disparar el reintento a mano, sin esperar los 20 minutos
-app.post('/api/pv/padron-reintentar', soloPanel, requiereRol('master', 'dueno', 'gerente'), async (req, res) => {
-  reintentarPadronPendiente();
-  res.json({ ok: true, msg: 'reintento del padron arrancado, mira el avance en Ajustes' });
-});
-
-app.post('/api/pv/cb-cliente', soloPanel, requiereRol('master', 'dueno', 'gerente'), async (req, res) => {
-  try {
-    const cuenta = await resolverCuenta(req);
-    if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-    const { id, categoria } = req.body || {};
-    const { data: conv } = await db.from('pq_conversaciones').select('*').eq('id', id).eq('cuenta_id', cuenta.id).single();
-    if (!conv) return res.status(404).json({ error: 'conversacion no encontrada' });
-    if (!conv.fact_cuit_msg) return res.status(400).json({ error: 'esta conversacion no tiene un CUIT detectado en los mensajes' });
-    const r = await cbCargarCuitVenta(cuenta, conv, categoria);
-    await db.from('pq_conversaciones').update({ cb_cuit_at: new Date().toISOString(), cb_cuit_err: null }).eq('id', conv.id);
-    // Queda cerrado SOLO si el padron contesto Y el nombre realmente quedo
-    // escrito. Si el nombre no entro, el reintento lo sigue peleando despues.
-    if (r && r.padron && r.razon_ok !== false) await _marcarPadronHecho(conv.id);
-    res.json(r);
+    return { costo: Math.round(miCosto * 100) / 100, ingreso: Math.round(miIngreso * 100) / 100 };
   } catch (e) {
-    // que el motivo SIEMPRE llegue al panel legible, y quede en el log de Railway
-    console.error('cb-cliente ERROR:', e && e.stack || e);
-    res.status(500).json({ error: String(e && e.message || e).slice(0, 500) });
+    console.error('[PACK-ENVIO] error:', e.message);
+    return null; // ante cualquier duda, no tocar (queda el comportamiento anterior)
   }
-});
+}
 
-// ============================================================================
-// REASIGNAR EL CLIENTE DE UNA ORDEN DE VENTA DE ML  (Factura A a un tercero)
-// ----------------------------------------------------------------------------
-// Caso: el comprador pide la factura a nombre de OTRO CUIT (por ej. el de su
-// empresa). Cambiarle el CUIT a la ficha del comprador no sirve, y ademas
-// Contabilium bloquea repetir un CUIT que ya es de otro cliente. La forma correcta
-// segun la doc de Contabilium es REENVIAR la orden de venta de integracion con el
-// MISMO IDVentaIntegracion + IDIntegracion pero con el objeto Cliente apuntando al
-// CUIT destino: eso ACTUALIZA la orden (no crea otra) y la deja a nombre del cliente
-// correcto, lista para facturar con emitirFE.
-//   POST https://rest.contabilium.com/notificador/ecommerce
-//
-// SEGURIDAD:
-//  - NO emite la factura. Solo reasigna el cliente. La emision a AFIP (emitirFE) es
-//    un paso aparte, consecuente e irreversible, que queda a criterio del operador.
-//  - Reenvia los MISMOS items de la orden (leidos del detalle) para no alterar el
-//    contenido ni el importe, y despues verifica que el total no cambio.
-//  - Si la orden YA tiene comprobante (IDComprobante != 0), NO toca nada.
-//  - Pendiente de confirmacion de Contabilium (ticket api@contabilium.com) sobre el
-//    comportamiento del reenvio en ordenes creadas por la integracion de ML. Por eso
-//    queda detras de un endpoint MANUAL con confirmar:true, sin auto-run.
-// ============================================================================
-async function cbReasignarClienteOrden(cuenta, opts) {
-  const { ordenNro, cuit, idIntegracion } = opts || {};
-  if (!ordenNro) throw new Error('falta el numero de la orden de venta de ML');
-  if (!cuitValido(cuit)) throw new Error('El CUIT "' + cuit + '" no es valido: no lo uso por las dudas.');
-  await cbToken();
-  const cuitLimpio = String(cuit).replace(/\D/g, '');
+// ── Helper: construir objeto venta completo ───────────────────────
+async function buildVentaRow(order, userId, token, incluirEnvio = true) {
+  const item     = (order.order_items && order.order_items[0]) || {};
+  const payment  = (order.payments && order.payments[0]) || {};
+  const sku      = (item.item && (item.item.seller_sku || item.item.seller_custom_field)) || '';
+  // sale_fee de ML es POR UNIDAD → multiplicar por la cantidad de cada item
+  const comision = order.order_items
+    ? order.order_items.reduce((a, i) => a + (i.sale_fee || 0) * (i.quantity || 1), 0) : 0;
 
-  // 1) ubicar la orden y su detalle (items, integracion, estado, comprobante)
-  const resumen = await _cbBuscarOrden(ordenNro, idIntegracion);
-  if (!resumen) throw new Error('No encontre la orden de venta ' + ordenNro + ' en Contabilium (Ventas - Integraciones).');
-  const ordenId = resumen.Id || resumen.id;
-  const detalle = (await _cbOrdenDetalle(ordenId)) || resumen;
-  const idInt = idIntegracion || detalle.IDIntegracion || detalle.idIntegracion || resumen.IDIntegracion || resumen.idIntegracion;
-  const idVentaInt = detalle.IDVentaIntegracion || detalle.idVentaIntegracion || detalle.NumeroOrden || detalle.numeroOrden || resumen.NumeroOrden || ordenNro;
-  const idComprobante = detalle.IDComprobante || detalle.idComprobante || resumen.IDComprobante || 0;
-  if (idComprobante && String(idComprobante) !== '0') {
-    throw new Error('La orden ' + ordenNro + ' YA esta facturada (comprobante ' + idComprobante + '). No la toco: '
-      + 'para cambiar el cliente de una factura emitida hay que anularla con nota de credito y rehacerla.');
+  // Cuotas y costo financiero
+  const cuotas = payment.installments || 1;
+  // ML cobra un costo financiero por cuotas: total_paid - transaction - envio del comprador.
+  // Con 1 cuota NO hay costo financiero (antes se colaba el envio pagado por el comprador).
+  const costoFinanciero = (cuotas > 1 && payment.total_paid_amount && payment.transaction_amount)
+    ? Math.max(0, payment.total_paid_amount - payment.transaction_amount - (Number(payment.shipping_cost) || 0))
+    : 0;
+
+  // Tipo de publicación
+  const itemData = incluirEnvio && item.item && item.item.id
+    ? await getItemData(item.item.id, token)
+    : {};
+
+  // Envío
+  const shipData = incluirEnvio && order.shipping && order.shipping.id
+    ? await getShipData(order.shipping.id, token)
+    : {};
+
+  // Pack (carrito) u orden PARTIDA por ML en varios paquetes: repartir el envio
+  // total del grupo para no cargarlo doble ni todo en una sola linea
+  let envioCosto   = shipData.costo_envio           || 0;
+  let envioIngreso = shipData.precio_comprador_envio || 0;
+  if (incluirEnvio && order.status !== 'cancelled' && (order.pack_id || shipData.sibling_ship_id)) {
+    const rep = await repartirEnvioPack(order, envioCosto, envioIngreso, token, shipData.sibling_ship_id);
+    if (rep) { envioCosto = rep.costo; envioIngreso = rep.ingreso; }
   }
-  if (!idInt) throw new Error('No pude determinar el IDIntegracion de la orden ' + ordenNro + '. Pasalo a mano como idIntegracion.');
 
-  // 2) padron ARCA del CUIT destino -> razon social, categoria, domicilio
-  const padronLog = [];
-  let padron = null;
-  try { padron = await arcaPadron(cuitLimpio, padronLog); } catch (e) { padronLog.push({ error: String(e && e.message || e).slice(0, 150) }); }
-
-  // 3) armar los items TAL CUAL estan en la orden (no alterar importes)
-  const itemsOrden = detalle.Items || detalle.items || resumen.Items || resumen.items || [];
-  const items = (Array.isArray(itemsOrden) ? itemsOrden : []).map(x => ({
-    Cantidad: Number(x.Cantidad || x.cantidad || 1),
-    Codigo: String(x.Codigo || x.codigo || (x.Concepto && (x.Concepto.Codigo || x.Concepto.codigo)) || ''),
-    Concepto: String((x.Concepto && (x.Concepto.Nombre || x.Concepto.nombre)) || x.Descripcion || x.descripcion || x.Detalle || x.detalle || (typeof x.Concepto === 'string' ? x.Concepto : '') || ''),
-    PrecioUnitario: Number(x.PrecioUnitario || x.precioUnitario || x.Precio || x.precio || 0),
-    Bonificacion: Number(x.Bonificacion || x.bonificacion || 0)
-  })).filter(i => i.Cantidad > 0 && i.PrecioUnitario !== 0);
-  if (!items.length) throw new Error('No pude leer los items de la orden ' + ordenNro + ' para reenviarla sin alterarla. Aborto por seguridad.');
-
-  // 4) cliente destino: por documento (Contabilium lo resuelve/crea por el CUIT)
-  const cli = {
-    Nombre: (padron && padron.razon) ? String(padron.razon) : '',
-    Apellido: '',
-    TipoDocumento: 'CUIT',
-    Documento: cuitLimpio,
-    Email: '', Telefono: '',
-    LineaDireccion1: (padron && padron.domicilio) ? String(padron.domicilio) : '',
-    LineaDireccion2: '',
-    Ciudad: (padron && padron.ciudad) ? String(padron.ciudad) : '',
-    Provincia: (padron && padron.provincia) ? String(padron.provincia) : '',
-    Pais: 'Argentina',
-    CodigoPostal: (padron && padron.cp) ? String(padron.cp) : ''
-  };
-
-  // 5) reenviar la orden (MISMO IDVentaIntegracion + IDIntegracion => actualiza)
-  const estado = detalle.IDEstadoIntegracion || detalle.Estado || detalle.estado || 'Aceptada';
-  const cuerpo = {
-    Cliente: cli,
-    IDVentaIntegracion: Number(idVentaInt) || idVentaInt,
-    IDEstadoIntegracion: estado,
-    IDIntegracion: Number(idInt) || idInt,
-    Observaciones: 'Reasignacion de cliente por pedido del comprador (RespondIA). Orden ' + ordenNro,
-    Items: items
-  };
-  const antes = {
-    cliente: resumen.IDPersona || resumen.idPersona || resumen.IdCliente || resumen.idCliente || (detalle.Cliente && (detalle.Cliente.Id || detalle.Cliente.id)) || null,
-    total: detalle.Total || detalle.total || resumen.Total || null,
-    items_n: items.length
-  };
-  const resp = await fetch('https://rest.contabilium.com/notificador/ecommerce', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + (await cbToken()) },
-    body: JSON.stringify(cuerpo)
-  });
-  const txt = await resp.text().catch(() => '');
-  let out = null; try { out = txt ? JSON.parse(txt) : null; } catch (e) {}
-  // la API devuelve -3 (IDIntegracion no existe / body vacio) o -1 (item invalido)
-  if (String(out) === '-3' || String(out) === '-1' || (out && typeof out === 'object' && (out.Error || out.error))) {
-    throw new Error('Contabilium rechazo el reenvio (respuesta: ' + String(txt || '').slice(0, 120) + '). No se modifico la orden.');
+  // Flex Baires: identificar el depósito de origen por DOS vías:
+  // 1) sender_address.node.logistic_center_id del shipment (cuando se consultó el envío)
+  // 2) stock.node_id de los items de la orden (viene SIEMPRE, incluso en syncs sin envío)
+  const nodoOrden = ((order.order_items || [])
+    .map(i => i && i.stock && i.stock.node_id).find(n => n)) || '';
+  const centroLogistico = shipData.logistic_center_id || nodoOrden || '';
+  const esFlexBaires = centroLogistico === FLEX_BAIRES_NODE;
+  let fbCostos = { fb_cbm_m3: 0, fb_costo_cbm: 0, fb_costo_unificado: 0, fb_costo_zona: 0, fb_ahorro_ml: 0 };
+  if (esFlexBaires) {
+    try {
+      fbCostos = await calcularCostosFlexBaires({
+        sku: sku ? String(sku).trim() : '',
+        unidades: item.quantity || 1,
+        ciudad: shipData.ciudad || '',
+        fecha: order.date_created,
+        precio: order.total_amount
+      });
+    } catch (e) { console.error('[FLEX-BAIRES] error calculando costos:', e.message); }
   }
-  if (!resp.ok) throw new Error('Contabilium /notificador/ecommerce -> ' + resp.status + ' ' + String(txt || '').slice(0, 200));
 
-  // 6) releer y verificar: mismo total, cliente cambiado
-  await new Promise(r => setTimeout(r, 1500));
-  const despues = await _cbBuscarOrden(ordenNro, idInt);
-  const detDesp = despues ? ((await _cbOrdenDetalle(despues.Id || despues.id)) || despues) : null;
-  const totalDesp = detDesp && (detDesp.Total || detDesp.total);
-  const clienteDesp = detDesp && (detDesp.IDPersona || detDesp.idPersona || detDesp.IdCliente || detDesp.idCliente || (detDesp.Cliente && (detDesp.Cliente.Id || detDesp.Cliente.id)));
   return {
-    ok: true, no_facturado: true,
-    orden: ordenNro, id_interno: ordenId, idIntegracion: idInt,
-    cuit_destino: cuitLimpio, razon_social: (padron && padron.razon) || null,
-    padron: !!padron, padron_detalle: padron ? null : padronLog,
-    antes,
-    despues: { cliente: clienteDesp || null, total: totalDesp != null ? totalDesp : null, items_n: detDesp ? (detDesp.Items || detDesp.items || []).length : null },
-    total_preservado: (antes.total != null && totalDesp != null) ? (Number(antes.total) === Number(totalDesp)) : null,
-    cliente_cambio: (antes.cliente != null && clienteDesp != null) ? (String(antes.cliente) !== String(clienteDesp)) : null,
-    respuesta_cb: out,
-    aviso: 'Solo se reasigno el cliente. La factura NO se emitio. Para emitir la Factura A al nuevo CUIT: emitirFE cuando lo confirmes.'
+    nro_venta:             String(order.id),
+    user_id:               String(userId),
+    fecha:                 order.date_created,
+    fecha_cierre:          order.date_closed || null,
+    sku:                   sku ? String(sku).trim() : '',
+    titulo:                item.item ? item.item.title : '',
+    unidades:              item.quantity || 1,
+    precio:                order.total_amount,
+    comision,
+    costo_envio:           envioCosto,
+    precio_comprador_envio:envioIngreso,
+    logistic_type:         shipData.logistic_type          || '',
+    provincia:             shipData.provincia              || '',
+    ciudad:                shipData.ciudad                 || '',
+    logistic_center_id:    centroLogistico,
+    deposito_flex_baires:  esFlexBaires,
+    fb_cbm_m3:             fbCostos.fb_cbm_m3,
+    fb_costo_cbm:          fbCostos.fb_costo_cbm,
+    fb_costo_unificado:    fbCostos.fb_costo_unificado,
+    fb_costo_zona:         fbCostos.fb_costo_zona,
+    fb_ahorro_ml:          fbCostos.fb_ahorro_ml,
+    estado:                order.status,
+    con_cuotas:            cuotas > 1,
+    cuotas:                cuotas,
+    costo_financiero:      costoFinanciero,
+    tipo_publicacion:      itemData.tipo_publicacion       || '',
+    pack_id:               order.pack_id ? String(order.pack_id) : null,
+    item_id:               (item.item && item.item.id) ? String(item.item.id) : null,
+    raw:                   order
   };
 }
 
-// Endpoint MANUAL. Reasigna el cliente de una orden REAL: exige confirmar:true.
-// NO emite factura. Solo master/dueno.
-app.post('/api/pv/cb-orden-cliente', soloPanel, requiereRol('master', 'dueno'), async (req, res) => {
+// ── Helper: encontrar la orden asociada a un envío (Flex/shipments) ─
+async function getOrderIdFromShipment(shipmentId, token) {
+  if (!shipmentId) return null;
   try {
-    const cuenta = await resolverCuenta(req);
-    if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-    const { orden, cuit, idIntegracion, confirmar } = req.body || {};
-    if (confirmar !== true) {
-      return res.status(400).json({ error: 'Esto reasigna el cliente de una orden REAL en Contabilium. Volve a llamarlo con confirmar:true para ejecutarlo.', requiere_confirmar: true });
-    }
-    const r = await cbReasignarClienteOrden(cuenta, { ordenNro: orden, cuit, idIntegracion });
-    res.json(r);
-  } catch (e) {
-    console.error('cb-orden-cliente ERROR:', e && e.stack || e);
-    res.status(500).json({ error: String(e && e.message || e).slice(0, 500) });
-  }
-});
-
-// AUDITORIA DE FACTURACION: que ventas se tocaron en Contabilium y cuales fallaron.
-// Es SOLO LECTURA: no llama a Contabilium ni a ML, solo mira lo que quedo anotado
-// en la base. cb_cuit_at se escribe UNICAMENTE despues de un PUT exitoso, asi que
-// si la lista vuelve vacia es porque no se modifico ningun cliente.
-app.get('/api/pv/cb-log', soloPanel, async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-  const COLS = 'id, orden_id, comprador_nick, titulo, fact_doc_tipo, fact_doc_nro, fact_cuit_msg, cb_cuit_at, cb_cuit_err, actualizado_at';
-  let filas = null;
-  // camino rapido: que filtre la base
-  try {
-    const r = await db.from('pq_conversaciones').select(COLS).eq('cuenta_id', cuenta.id)
-      .or('cb_cuit_at.not.is.null,cb_cuit_err.not.is.null')
-      .order('cb_cuit_at', { ascending: false }).limit(300);
-    if (!r.error && Array.isArray(r.data)) filas = r.data;
-  } catch (e) {}
-  // plan B por si la sintaxis del .or() no le gusta a esta version: filtramos aca
-  if (!filas) {
-    const { data } = await db.from('pq_conversaciones').select(COLS).eq('cuenta_id', cuenta.id)
-      .order('actualizado_at', { ascending: false }).limit(2000);
-    filas = (data || []).filter(f => f.cb_cuit_at || f.cb_cuit_err);
-  }
-  res.json({
-    auto: configDe(cuenta).pv_auto_cuit === true,   // lo que dice la BASE, no el checkbox
-    cargadas: filas.filter(f => f.cb_cuit_at).length,
-    fallidas: filas.filter(f => !f.cb_cuit_at && f.cb_cuit_err).length,
-    padron_job: _padronJob,
-    filas
-  });
-});
-
-// ---- biblioteca de archivos (manuales) ----
-app.get('/api/pv/archivos', soloPanel, async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-  const { data } = await db.from('pq_archivos').select('*')
-    .eq('cuenta_id', cuenta.id).order('creado_at', { ascending: false }).limit(200);
-  res.json(data || []);
-});
-
-app.post('/api/pv/archivos', soloPanel, requiereRol('master', 'dueno', 'gerente'), async (req, res) => {
-  try {
-    const cuenta = await resolverCuenta(req);
-    if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-    const { nombre, sku_madre, base64, mime, ambito, patron, disparador } = req.body;
-    if (!nombre || !base64) return res.status(400).json({ error: 'faltan datos' });
-    const AMBITOS = ['global', 'sku', 'madre', 'prefijo', 'lista'];
-    const amb = AMBITOS.includes(ambito) ? ambito : (sku_madre ? 'madre' : 'global');
-    const pat = (patron || sku_madre || '').trim().toUpperCase() || null;
-    if (amb !== 'global' && !pat) return res.status(400).json({ error: 'indica el SKU / familia / prefijo para ese ambito' });
-    const buf = Buffer.from(String(base64).replace(/^data:[^;]+;base64,/, ''), 'base64');
-    // 25MB: es el tope de la mensajeria de ML para adjuntos. Subir algo mas
-    // grande seria guardarlo para despues no poder mandarlo nunca.
-    if (buf.length > 25 * 1024 * 1024) {
-      return res.status(400).json({ error: 'archivo muy grande: ' + (buf.length / 1024 / 1024).toFixed(1)
-        + 'MB. El maximo es 25MB porque es lo que acepta la mensajeria de Mercado Libre. Comprimi el PDF (ilovepdf.com/compress_pdf) y volve a subirlo.' });
-    }
-    const limpio = String(nombre).replace(/[^a-zA-Z0-9._-]+/g, '_').slice(0, 80);
-    const ruta = `${cuenta.id}/${Date.now()}_${limpio}`;
-    const up = await fetch(`${SUPABASE_URL}/storage/v1/object/manuales/${ruta}`, {
-      method: 'POST',
-      headers: { Authorization: 'Bearer ' + SUPABASE_KEY, apikey: SUPABASE_KEY, 'Content-Type': mime || 'application/pdf' },
-      body: buf
+    // 1) El detalle del envío a veces ya trae order_id
+    const r = await fetch(`https://api.mercadolibre.com/shipments/${shipmentId}`, {
+      headers: { Authorization: `Bearer ${token}` }
     });
-    if (!up.ok) return res.status(500).json({ error: 'no pude subir al bucket "manuales" (' + up.status + '). ¿Creaste el bucket en Supabase → Storage?' });
-    const { data, error } = await db.from('pq_archivos').insert({
-      cuenta_id: cuenta.id, sku_madre: amb === 'madre' ? pat : null,
-      ambito: amb, patron: amb === 'global' ? null : pat,
-      disparador: (disparador || '').trim().slice(0, 200) || null,
-      nombre: limpio, ruta, mime: mime || 'application/pdf'
-    }).select('*').single();
-    if (error) return res.status(500).json({ error: error.message });
-    res.json({ ok: true, archivo: data });
+    const ship = await r.json();
+    if (ship && ship.order_id) return String(ship.order_id);
+
+    // 2) Si no, /shipments/{id}/items devuelve el order_id de cada ítem
+    const ri = await fetch(`https://api.mercadolibre.com/shipments/${shipmentId}/items`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    const items = await ri.json();
+    if (Array.isArray(items) && items[0] && items[0].order_id) {
+      return String(items[0].order_id);
+    }
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// ── WEBHOOK ───────────────────────────────────────────────────────
+// ── Helper: costo interno de Contabilium para un SKU ──────────────
+async function getCostoInterno(sku) {
+  try {
+    if (!sku) return null;
+    const token = await getContabiliumToken();
+    if (!token) return null;
+    const r = await fetch(`https://rest.contabilium.com/api/conceptos/getByCodigo?codigo=${encodeURIComponent(sku)}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    const data = await r.json();
+    if (data && data.CostoInterno != null) return data.CostoInterno;
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// ── Reenvío de webhooks al backend del Depósito ───────────────────
+// Una sola app de ML notifica acá (MargenML). Le pasamos una copia de
+// cada notificación al Depósito para que mantenga su panel al día.
+// Es "fire-and-forget": no esperamos la respuesta y cualquier error se
+// traga en silencio, así NUNCA afecta el procesamiento de MargenML.
+const DEPOSITO_WEBHOOK_URL = process.env.DEPOSITO_WEBHOOK_URL
+  || 'https://depositoml-backend-production.up.railway.app/api/despacho/webhook';
+
+function reenviarADeposito(payload) {
+  try {
+    if (!payload || typeof payload !== 'object') return;
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 4000); // corta a los 4s, no cuelga
+    fetch(DEPOSITO_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: ctrl.signal
+    }).then(() => clearTimeout(t))
+      .catch(e => { clearTimeout(t); console.error('[REENVIO-DEPOSITO]', e.message); });
+  } catch (e) {
+    console.error('[REENVIO-DEPOSITO] sync', e.message);
+  }
+}
+
+app.post('/api/webhook/ml', async (req, res) => {
+  // Reenvío al backend del Depósito (fire-and-forget): le mandamos una
+  // copia de TODA notificación. Si falla, no afecta a MargenML.
+  reenviarADeposito(req.body);
+  try {
+    const { topic, resource, user_id } = req.body || {};
+    if (typeof resource !== 'string') return res.sendStatus(200);
+
+    const token = await getValidToken(user_id);
+    if (!token) return res.sendStatus(200);
+
+    let orderId = null;
+
+    if (resource.startsWith('/orders/')) {
+      // Ventas normales (Full / Colecta / M1) y cambios de estado (cancela/devuelve)
+      orderId = resource.split('/').pop();
+    } else if (resource.startsWith('/shipments/')) {
+      // Envíos (incluye Flex): hay que sacar la orden asociada al envío
+      const shipmentId = resource.split('/').pop();
+      orderId = await getOrderIdFromShipment(shipmentId, token);
+    } else {
+      // Cualquier otro tópico que no nos interesa
+      return res.sendStatus(200);
+    }
+
+    if (!orderId) return res.sendStatus(200);
+
+    const orderResp = await fetch(`https://api.mercadolibre.com/orders/${orderId}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    const order = await orderResp.json();
+    if (order.error || !order.id) return res.sendStatus(200);
+
+    // upsert: si la orden ya existía, se actualiza su estado (cancelada / devuelta / etc.)
+    const row = await buildVentaRow(order, user_id, token, true);
+    await supabase.from('ventas').upsert(row, { onConflict: 'nro_venta' });
+
+    // Congelar el costo de Contabilium al momento de la venta (solo si aun no lo tiene)
+    if (row.sku) {
+      const cInterno = await getCostoInterno(row.sku);
+      if (cInterno != null) {
+        const totalCosto = cInterno * (Number(row.unidades) || 1);
+        await supabase.from('ventas')
+          .update({ costo_congelado: totalCosto })
+          .eq('nro_venta', row.nro_venta)
+          .is('costo_congelado', null);
+      }
+    }
+
+    console.log('Venta guardada (webhook):', order.id, order.status, '/', topic || resource.split('/')[1]);
+    return res.sendStatus(200);
+  } catch (e) {
+    console.error('Webhook error:', e.message);
+    return res.sendStatus(200);
+  }
+});
+
+// ── VENTAS: obtener ventas guardadas (paginado para superar límite de 1000) ─
+app.get('/api/ventas', requireAuth, async (req, res) => {
+  try {
+    const { user_id, desde, hasta } = req.query;
+    if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
+
+    let todas = [];
+    let offset = 0;
+    const lote = 1000;
+
+    while (true) {
+      let query = supabase.from('ventas').select('nro_venta,user_id,fecha,fecha_cierre,sku,titulo,unidades,precio,comision,costo_envio,precio_comprador_envio,logistic_type,provincia,ciudad,estado,con_cuotas,cuotas,costo_financiero,tipo_publicacion,pack_id,item_id,costo_congelado,cancel_code:raw->cancel_detail->>code,ml_tags:raw->tags,dev_return,dev_benef,dev_cargo,logistic_center_id,deposito_flex_baires,fb_cbm_m3,fb_costo_cbm,fb_costo_unificado,fb_costo_zona,fb_ahorro_ml').eq('user_id', user_id);
+      if (desde) query = query.gte('fecha', desde);
+      if (hasta) query = query.lte('fecha', hasta);
+      query = query.order('fecha', { ascending: false }).range(offset, offset + lote - 1);
+
+      const { data, error } = await query;
+      if (error) return res.status(500).json({ error: error.message });
+
+      todas = todas.concat(data);
+      if (data.length < lote) break;   // último lote
+      offset += lote;
+      if (offset > 500000) break;       // tope de seguridad
+    }
+
+    // monto_bonificado (reembolsos parciales): se calcula del raw YA guardado, sin re-sync
+    try {
+      const refundIds = todas.filter(v => String(v.estado||'').includes('partially_refunded')).map(v => v.nro_venta);
+      if (refundIds.length) {
+        const bonifMap = {};
+        for (let i = 0; i < refundIds.length; i += 200) {
+          const chunk = refundIds.slice(i, i + 200);
+          const { data: rawRows } = await supabase.from('ventas').select('nro_venta,raw').in('nro_venta', chunk);
+          (rawRows || []).forEach(r => {
+            const o = r.raw || {};
+            let mb = (o.total_amount != null && o.paid_amount != null) ? (Number(o.total_amount) - Number(o.paid_amount)) : 0;
+            if (!(mb > 0) && Array.isArray(o.payments)) mb = o.payments.reduce((a, p) => a + (Number(p.transaction_amount_refunded) || 0), 0);
+            bonifMap[r.nro_venta] = mb > 0 ? mb : 0;
+          });
+        }
+        todas.forEach(v => { v.monto_bonificado = bonifMap[v.nro_venta] || 0; });
+      }
+    } catch (eb) { console.error('monto_bonificado enrich error:', eb.message); }
+
+    // NUEVO v13: el rol operador NO recibe el costo del producto (dato sensible).
+    // El frontend le esconde la pestaña, y aca el backend lo bloquea de verdad.
+    if (req.rol === 'operador') {
+      todas.forEach(v => { delete v.costo_congelado; });
+    }
+
+    res.json({ ventas: todas, total: todas.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── DIAGNOSTICO devoluciones (TEMPORAL): estados reales + reembolsos ──
+// GET /api/ventas/estados?user_id=67619515
+app.get('/api/ventas/estados', async (req, res) => {
+  try {
+    const user_id = req.query.user_id;
+    if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
+    const counts = {};
+    let offset = 0; const lote = 1000;
+    while (true) {
+      const { data, error } = await supabase.from('ventas').select('estado').eq('user_id', String(user_id)).range(offset, offset + lote - 1);
+      if (error) return res.status(500).json({ error: error.message });
+      if (!data || !data.length) break;
+      data.forEach(r => { const e = String(r.estado == null ? '(null)' : r.estado); counts[e] = (counts[e] || 0) + 1; });
+      if (data.length < lote) break;
+      offset += lote; if (offset > 500000) break;
+    }
+    const estados = Object.entries(counts).map(([estado, n]) => ({ estado, n })).sort((a, b) => b.n - a.n);
+    // histograma de cancel_detail.code entre canceladas (para decidir cuales son devoluciones)
+    let codes = {};
+    try {
+      let off2 = 0; const lote2 = 1000;
+      while (true) {
+        const { data, error } = await supabase.from('ventas')
+          .select('ccode:raw->cancel_detail->>code, cgrp:raw->cancel_detail->>group')
+          .eq('user_id', String(user_id)).eq('estado', 'cancelled')
+          .range(off2, off2 + lote2 - 1);
+        if (error) { codes = { _error: error.message }; break; }
+        if (!data || !data.length) break;
+        data.forEach(r => { const c = r.ccode || r.cgrp || '(sin code)'; codes[c] = (codes[c] || 0) + 1; });
+        if (data.length < lote2) break;
+        off2 += lote2; if (off2 > 500000) break;
+      }
+    } catch (e) { codes = { _error: e.message }; }
+    const cancelCodes = Object.entries(codes).map(([code, n]) => ({ code, n })).sort((a, b) => (b.n || 0) - (a.n || 0));
+    res.json({ estados, cancelCodes, nota: 'diagnostico temporal' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.delete('/api/pv/archivos', soloPanel, requiereRol('master', 'dueno', 'gerente'), async (req, res) => {
-  const cuenta = await resolverCuenta(req);
-  if (!cuenta) return res.status(400).json({ error: 'sin cuenta' });
-  const { data: arch } = await db.from('pq_archivos').select('*')
-    .eq('id', req.query.id).eq('cuenta_id', cuenta.id).single();
-  if (!arch) return res.status(404).json({ error: 'no encontrado' });
+// ── DIAGNOSTICO devoluciones (TEMPORAL): estructura de una orden con mediacion ──
+// GET /api/ventas/raw-devol?user_id=67619515  -> campos NO sensibles para saber si volvio el producto
+app.get('/api/ventas/raw-devol', async (req, res) => {
   try {
-    await fetch(`${SUPABASE_URL}/storage/v1/object/manuales/${arch.ruta}`, {
-      method: 'DELETE', headers: { Authorization: 'Bearer ' + SUPABASE_KEY, apikey: SUPABASE_KEY }
-    });
-  } catch (e) {}
-  await db.from('pq_archivos').delete().eq('id', arch.id);
-  res.json({ ok: true });
+    const user_id = req.query.user_id;
+    if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
+    const out = [];
+    let offset = 0; const lote = 500;
+    while (out.length < 4 && offset < 6000) {
+      const { data, error } = await supabase.from('ventas')
+        .select('raw').eq('user_id', String(user_id)).eq('estado', 'cancelled')
+        .range(offset, offset + lote - 1);
+      if (error) return res.status(500).json({ error: error.message });
+      if (!data || !data.length) break;
+      for (const r of data) {
+        const o = r.raw || {};
+        const code = o.cancel_detail ? (o.cancel_detail.code || '') : '';
+        if (code !== 'mediations') continue;
+        const sh = o.shipping || {};
+        out.push({
+          topKeys: Object.keys(o),
+          status: o.status || null,
+          status_detail: o.status_detail || null,
+          cancel_detail: o.cancel_detail || null,
+          tags: o.tags || null,
+          mediationsRaw: o.mediations || null,
+          shipping_keys: Object.keys(sh),
+          shipping_status: sh.status || null,
+          shipping_substatus: sh.substatus || null,
+          shipping_tags: sh.tags || null,
+          logistic: sh.logistic || sh.logistic_type || null,
+          payments: Array.isArray(o.payments) ? o.payments.map(p => ({ status: p.status, refundedPct: o.total_amount ? Math.round((Number(p.transaction_amount_refunded) || 0) / Number(o.total_amount) * 100) : null })) : null
+        });
+        if (out.length >= 4) break;
+      }
+      if (data.length < lote) break;
+      offset += lote;
+    }
+    res.json({ muestra: out, nota: 'para detectar si el producto volvio al stock' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (req, res) => res.send('RespondIA backend v13.36 (facturacion ML: busqueda de orden por rango de fechas+match de numero; reasignar el cliente de la orden por API /notificador/ecommerce, sin emitir factura, endpoint manual /api/pv/cb-orden-cliente + diagnostico /api/cb-orden) OK. /oauth para autorizar una cuenta de ML.'));
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('RespondIA backend v2 escuchando en ' + PORT));
+// ── PROBE devoluciones (TEMPORAL): detectar "se lo queda" vs "lo devuelve" ──
+// GET /api/devol/probe?user_id=67619515
+app.get('/api/devol/probe', async (req, res) => {
+  try {
+    const user_id = req.query.user_id;
+    if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
+    const token = await getValidToken(user_id);
+    const { data } = await supabase.from('ventas')
+      .select('raw').eq('user_id', String(user_id)).eq('estado', 'cancelled')
+      .order('fecha', { ascending: false }).limit(400);
+    const casos = [];
+    for (const r of (data || [])) {
+      const o = r.raw || {};
+      if (!(o.cancel_detail && o.cancel_detail.code === 'mediations')) continue;
+      const shipId = o.shipping && o.shipping.id;
+      const medId = Array.isArray(o.mediations) && o.mediations[0] && o.mediations[0].id;
+      const caso = { fecha: o.date_created ? String(o.date_created).slice(0,10) : null, tieneShip: !!shipId, tieneMed: !!medId, related_orders: o.related_orders || null, probes: {} };
+      if (shipId) {
+        try {
+          const rs = await fetch('https://api.mercadolibre.com/shipments/' + shipId, { headers: { Authorization: 'Bearer ' + token, 'x-format-new': 'true' } });
+          const js = await rs.json();
+          caso.probes.shipment = { http: rs.status, status: js.status, substatus: js.substatus, mode: js.mode, logistic_type: js.logistic_type, return_keys: js.return_details ? Object.keys(js.return_details) : null, hasReturn: !!(js.return_details || js.returns), keys: Object.keys(js || {}) };
+        } catch (e) { caso.probes.shipment = { error: e.message }; }
+      }
+      if (medId) {
+        const urls = [
+          'post-purchase/v1/claims/' + medId,
+          'post-purchase/v1/claims/' + medId + '/returns',
+          'post-purchase/v1/claims/' + medId + '/returns/shipments'
+        ];
+        for (const path of urls) {
+          try {
+            const rc = await fetch('https://api.mercadolibre.com/' + path, { headers: { Authorization: 'Bearer ' + token } });
+            let jc = {}; try { jc = await rc.json(); } catch(e2) {}
+            caso.probes[path.replace('post-purchase/v1/claims/'+medId,'claim')] = { http: rc.status, keys: Array.isArray(jc) ? ('array:' + jc.length) : Object.keys(jc || {}), status: jc && jc.status, type: jc && jc.type, stage: jc && jc.stage };
+          } catch (e) { caso.probes[path] = { error: e.message }; }
+        }
+      }
+      casos.push(caso);
+      if (casos.length >= 3) break;
+    }
+    res.json({ casos, nota: 'probe se-lo-queda vs lo-devuelve' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
-// exports para testing local (no afecta a Railway)
-if (typeof module !== 'undefined') {
-  module.exports = { horaLocal, aMinutos, franjaActiva, minutosHastaProximaFranja, calcularEnvio, configDe, CONFIG_DEFAULT };
+// ── PROBE2 devoluciones (TEMPORAL): comparar caso conocido "se lo queda" vs "lo devuelve" ──
+// GET /api/devol/probe2?user_id=67619515   (usa freidora vs silla por defecto; ?nros=a,b para otros)
+app.get('/api/devol/probe2', async (req, res) => {
+  try {
+    const user_id = req.query.user_id;
+    if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
+    const nros = String(req.query.nros || '2000017077382238,2000017080396472').split(',').map(x => x.trim()).filter(Boolean);
+    const token = await getValidToken(user_id);
+    const out = [];
+    for (const nro of nros) {
+      const { data } = await supabase.from('ventas').select('nro_venta,sku,raw').eq('user_id', String(user_id)).eq('nro_venta', nro).limit(1);
+      const row = data && data[0];
+      if (!row) { out.push({ nro, error: 'no encontrado en la base' }); continue; }
+      const o = row.raw || {};
+      const medId = Array.isArray(o.mediations) && o.mediations[0] && o.mediations[0].id;
+      const caso = { nro, sku: row.sku, cancelCode: o.cancel_detail && o.cancel_detail.code, medId: medId || null };
+      if (medId) {
+        try {
+          const rc = await fetch('https://api.mercadolibre.com/post-purchase/v1/claims/' + medId, { headers: { Authorization: 'Bearer ' + token } });
+          const jc = await rc.json();
+          caso.type = jc.type; caso.stage = jc.stage; caso.status = jc.status; caso.reason_id = jc.reason_id;
+          caso.resolution = jc.resolution || null;
+          caso.related_entities = jc.related_entities || null;
+          caso.players = Array.isArray(jc.players) ? jc.players.map(p => ({ type: p.type, role: p.role })) : null;
+        } catch (e) { caso.claimError = e.message; }
+      }
+      out.push(caso);
+    }
+    res.json({ casos: out, nota: 'probe2: se-lo-queda (freidora) vs lo-devuelve (silla)' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── DEVOLUCIONES: enriquecer con el reclamo de ML (se lo queda vs lo devuelve) ──
+// GET /api/devol/enrich?user_id=67619515&limit=150  (llamar en loop hasta faltan=0)
+app.get('/api/devol/enrich', async (req, res) => {
+  try {
+    const user_id = req.query.user_id;
+    if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
+    const limit = Math.min(parseInt(req.query.limit) || 150, 300);
+    const token = await getValidToken(user_id);
+    const { data, error } = await supabase.from('ventas')
+      .select('nro_venta, med:raw->mediations')
+      .eq('user_id', String(user_id)).eq('estado', 'cancelled')
+      .filter('raw->cancel_detail->>code', 'eq', 'mediations')
+      .is('dev_checked', null)
+      .limit(limit);
+    if (error) return res.status(500).json({ error: error.message, hint: 'faltan las columnas dev_return/dev_benef/dev_checked?' });
+    let procesados = 0, seQueda = 0, devuelve = 0, aFavor = 0, errores = 0;
+    for (const r of (data || [])) {
+      const med = r.med;
+      const medId = Array.isArray(med) && med[0] && med[0].id;
+      let dev_return = null, dev_benef = null;
+      if (medId) {
+        try {
+          const rc = await fetch('https://api.mercadolibre.com/post-purchase/v1/claims/' + medId, { headers: { Authorization: 'Bearer ' + token } });
+          const jc = await rc.json();
+          const rel = Array.isArray(jc.related_entities) ? jc.related_entities : [];
+          dev_return = rel.indexOf('return') > -1;
+          dev_benef = (jc.resolution && Array.isArray(jc.resolution.benefited) && jc.resolution.benefited[0]) || null;
+          if (dev_benef === 'respondent') aFavor++; else if (dev_return) devuelve++; else seQueda++;
+        } catch (e) { errores++; }
+      } else { errores++; }
+      await supabase.from('ventas').update({ dev_return, dev_benef, dev_checked: new Date().toISOString() }).eq('user_id', String(user_id)).eq('nro_venta', r.nro_venta);
+      procesados++;
+      await new Promise(rs => setTimeout(rs, 110));
+    }
+    const { count: faltan } = await supabase.from('ventas').select('nro_venta', { count: 'exact', head: true })
+      .eq('user_id', String(user_id)).eq('estado', 'cancelled')
+      .filter('raw->cancel_detail->>code', 'eq', 'mediations')
+      .is('dev_checked', null);
+    res.json({ procesados, seQueda, devuelve, aFavor, errores, faltan: faltan == null ? 0 : faltan });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── LOOKUP devolucion (TEMPORAL): ver como quedo analizada una venta ──
+// GET /api/devol/ver?user_id=67619515&nro=2000017080396472
+app.get('/api/devol/ver', async (req, res) => {
+  try {
+    const user_id = req.query.user_id;
+    const nros = String(req.query.nro || '2000017080396472,2000017080396318').split(',').map(x => x.trim()).filter(Boolean);
+    if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
+    const out = [];
+    for (const nro of nros) {
+      const { data, error } = await supabase.from('ventas')
+        .select('nro_venta, sku, estado, dev_return, dev_benef, dev_checked, cc:raw->cancel_detail->>code, med:raw->mediations')
+        .eq('user_id', String(user_id)).eq('nro_venta', nro).limit(1);
+      if (error) return res.status(500).json({ error: error.message });
+      const r = data && data[0];
+      if (!r) { out.push({ nro, error: 'no encontrado' }); continue; }
+      out.push({ nro: r.nro_venta, sku: r.sku, estado: r.estado, cancelCode: r.cc, tieneMed: Array.isArray(r.med) && !!r.med.length, dev_return: r.dev_return, dev_benef: r.dev_benef, dev_checked: r.dev_checked });
+    }
+    res.json({ casos: out });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── INSPECTOR de venta (TEMPORAL): todo lo que ML devuelve de una venta ──
+// GET /api/venta/inspect?user_id=67619515&nro=2000013785412851
+app.get('/api/venta/inspect', async (req, res) => {
+  try {
+    const user_id = req.query.user_id;
+    const nro = String(req.query.nro || '').trim();
+    if (!user_id || !nro) return res.status(400).json({ error: 'user_id y nro requeridos' });
+    const token = await getValidToken(user_id);
+    const H = { Authorization: 'Bearer ' + token };
+    const out = { nro };
+
+    // 1) fila en nuestra base (por nro_venta o pack_id)
+    let { data: rows } = await supabase.from('ventas')
+      .select('nro_venta,pack_id,sku,titulo,unidades,precio,comision,costo_envio,precio_comprador_envio,logistic_type,estado,fecha,dev_return,dev_benef,raw')
+      .eq('user_id', String(user_id)).or('nro_venta.eq.' + nro + ',pack_id.eq.' + nro);
+    out.enBase = (rows || []).map(r => ({ nro_venta: r.nro_venta, pack_id: r.pack_id, sku: r.sku, unidades: r.unidades, precio: r.precio, comision: r.comision, costo_envio: r.costo_envio, ingreso_envio_comprador: r.precio_comprador_envio, logistic: r.logistic_type, estado: r.estado, fecha: r.fecha, dev_return: r.dev_return, dev_benef: r.dev_benef }));
+
+    let orderIds = (rows || []).map(r => r.nro_venta);
+    if (!orderIds.length) orderIds = [nro];
+
+    // 2) orden fresca de ML (montos y pagos)
+    out.ordenes = [];
+    for (const oid of orderIds.slice(0, 4)) {
+      try {
+        const r1 = await fetch('https://api.mercadolibre.com/orders/' + oid, { headers: H });
+        const o = await r1.json();
+        if (o && o.id) {
+          out.ordenes.push({
+            id: o.id, status: o.status,
+            cancel_code: o.cancel_detail ? o.cancel_detail.code : null,
+            total_amount: o.total_amount, paid_amount: o.paid_amount,
+            pagos: Array.isArray(o.payments) ? o.payments.map(p => ({ status: p.status, transaction_amount: p.transaction_amount, refunded: p.transaction_amount_refunded, shipping_cost: p.shipping_cost, marketplace_fee: p.marketplace_fee })) : [],
+            mediations: Array.isArray(o.mediations) ? o.mediations.map(m => m.id) : [],
+            shipping_id: o.shipping && o.shipping.id, tags: o.tags
+          });
+        } else out.ordenes.push({ id: oid, error: o && (o.message || o.error) });
+      } catch (e) { out.ordenes.push({ id: oid, error: e.message }); }
+    }
+
+    // 3) costos reales del envio
+    out.envios = [];
+    const shipIds = [...new Set(out.ordenes.map(o => o.shipping_id).filter(Boolean))];
+    for (const sid of shipIds.slice(0, 3)) {
+      try {
+        const r2 = await fetch('https://api.mercadolibre.com/shipments/' + sid + '/costs', { headers: { ...H, 'x-format-new': 'true' } });
+        const c = await r2.json();
+        out.envios.push({ shipment: sid, gross_amount: c.gross_amount, receiver_cost: c.receiver ? c.receiver.cost : null, senders: Array.isArray(c.senders) ? c.senders.map(x => ({ cost: x.cost, save: x.save, compensation: x.compensation, charges: x.charges })) : c.senders });
+      } catch (e) { out.envios.push({ shipment: sid, error: e.message }); }
+    }
+
+    // 4) reclamo / mediacion
+    out.reclamos = [];
+    const medIds = [...new Set([].concat(...out.ordenes.map(o => o.mediations || [])))];
+    for (const mid of medIds.slice(0, 3)) {
+      try {
+        const r3 = await fetch('https://api.mercadolibre.com/post-purchase/v1/claims/' + mid, { headers: H });
+        const j = await r3.json();
+        out.reclamos.push({ claim: mid, type: j.type, stage: j.stage, status: j.status, reason_id: j.reason_id, resolution: j.resolution || null, related_entities: j.related_entities || null });
+      } catch (e) { out.reclamos.push({ claim: mid, error: e.message }); }
+    }
+
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── PROBE3 (TEMPORAL): donde vive el cargo real por devolucion ──
+// GET /api/devol/probe3?user_id=67619515&claims=5539834073,5533529331,5535841572
+app.get('/api/devol/probe3', async (req, res) => {
+  try {
+    const user_id = req.query.user_id;
+    if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
+    const claims = String(req.query.claims || '5539834073,5533529331,5535841572').split(',').map(x => x.trim()).filter(Boolean);
+    const token = await getValidToken(user_id);
+    const H = { Authorization: 'Bearer ' + token };
+    const out = [];
+    for (const cid of claims.slice(0, 5)) {
+      const caso = { claim: cid, probes: {} };
+      const paths = [
+        ['charges', 'post-purchase/v1/claims/' + cid + '/charges'],
+        ['charges_rsc', 'post-purchase/v1/claims/' + cid + '/charges/return-shipping-costs'],
+        ['returns_v2', 'post-purchase/v2/claims/' + cid + '/returns'],
+        ['returns_v1', 'post-purchase/v1/claims/' + cid + '/returns'],
+        ['detail_returns', 'post-purchase/v1/claims/' + cid + '?with=returns']
+      ];
+      for (const [k, path] of paths) {
+        try {
+          const r = await fetch('https://api.mercadolibre.com/' + path, { headers: H });
+          let j = null; try { j = await r.json(); } catch (e2) {}
+          let resumen = null;
+          if (j) {
+            const txt = JSON.stringify(j);
+            resumen = txt.length > 1200 ? (Array.isArray(j) ? { array: j.length, primer: j[0] } : { keys: Object.keys(j) }) : j;
+          }
+          caso.probes[k] = { http: r.status, body: resumen };
+        } catch (e) { caso.probes[k] = { error: e.message }; }
+        await new Promise(rs => setTimeout(rs, 120));
+      }
+      out.push(caso);
+    }
+    res.json({ casos: out, ref: { malacate: '5539834073 (3 envios cobrados)', freidora: '5533529331 (1 envio)', silla: '5535841572 ($0)' } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── PROBE4 (TEMPORAL): retorno completo + costos de envios de devolucion ──
+// GET /api/devol/probe4?user_id=67619515&claims=5539834073,5535841572
+app.get('/api/devol/probe4', async (req, res) => {
+  try {
+    const user_id = req.query.user_id;
+    if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
+    const claims = String(req.query.claims || '5539834073,5535841572').split(',').map(x => x.trim()).filter(Boolean);
+    const token = await getValidToken(user_id);
+    const H = { Authorization: 'Bearer ' + token };
+    const out = [];
+    for (const cid of claims.slice(0, 4)) {
+      const caso = { claim: cid };
+      try {
+        const r = await fetch('https://api.mercadolibre.com/post-purchase/v2/claims/' + cid + '/returns', { headers: H });
+        const j = await r.json();
+        caso.return_http = r.status;
+        caso.subtype = j.subtype; caso.status = j.status; caso.status_money = j.status_money; caso.refund_at = j.refund_at;
+        caso.intermediate_check = j.intermediate_check;
+        caso.shipments_raw = j.shipments;
+        const shipIds = [];
+        (Array.isArray(j.shipments) ? j.shipments : []).forEach(sh => { const id = sh && (sh.id || sh.shipment_id); if (id) shipIds.push(id); });
+        caso.envios_devolucion = [];
+        for (const sid of shipIds.slice(0, 3)) {
+          const e = { shipment: sid };
+          try {
+            const r2 = await fetch('https://api.mercadolibre.com/shipments/' + sid, { headers: { ...H, 'x-format-new': 'true' } });
+            const js = await r2.json();
+            e.status = js.status; e.substatus = js.substatus; e.logistic = js.logistic && js.logistic.type;
+          } catch (e2) { e.shipErr = e2.message; }
+          try {
+            const r3 = await fetch('https://api.mercadolibre.com/shipments/' + sid + '/costs', { headers: { ...H, 'x-format-new': 'true' } });
+            const jc = await r3.json();
+            e.costs = { gross_amount: jc.gross_amount, receiver: jc.receiver ? { cost: jc.receiver.cost, save: jc.receiver.save } : null, senders: Array.isArray(jc.senders) ? jc.senders.map(x => ({ cost: x.cost, save: x.save, compensation: x.compensation, charges: x.charges })) : jc.senders };
+          } catch (e3) { e.costErr = e3.message; }
+          caso.envios_devolucion.push(e);
+          await new Promise(rs => setTimeout(rs, 120));
+        }
+      } catch (e) { caso.error = e.message; }
+      out.push(caso);
+    }
+    res.json({ casos: out, ref: { malacate: '5539834073 (cargo devolucion $19.720 + ida $9.860)', silla: '5535841572 ($0)' } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── PROBE5 (TEMPORAL): API de facturacion ML (cargos reales por devolucion) ──
+// GET /api/devol/probe5?user_id=67619515&order=2000017191703550
+app.get('/api/devol/probe5', async (req, res) => {
+  try {
+    const user_id = req.query.user_id;
+    if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
+    const orderId = String(req.query.order || '2000017191703550').trim();
+    const token = await getValidToken(user_id);
+    const H = { Authorization: 'Bearer ' + token };
+    const out = { orderBuscada: orderId };
+
+    // 1) periodos de facturacion
+    try {
+      const r1 = await fetch('https://api.mercadolibre.com/billing/integration/monthly/periods?group=ML&document_type=BILL&offset=0&limit=3', { headers: H });
+      const j1 = await r1.json();
+      out.periodos = { http: r1.status, body: (JSON.stringify(j1).length > 1500 ? { keys: Object.keys(j1), primer: (j1.results && j1.results[0]) || null } : j1) };
+      // 2) detalles del periodo mas reciente, probando variantes de filtro por orden
+      const key = j1 && j1.results && j1.results[0] && (j1.results[0].key || (j1.results[0].period && j1.results[0].period.key));
+      out.periodKey = key || null;
+      if (key) {
+        const variantes = [
+          ['det_orderfilter', 'https://api.mercadolibre.com/billing/integration/periods/key/' + key + '/group/ML/details?document_type=BILL&limit=5&offset=0&order_id=' + orderId],
+          ['det_sample', 'https://api.mercadolibre.com/billing/integration/periods/key/' + key + '/group/ML/details?document_type=BILL&limit=3&offset=0']
+        ];
+        out.detalles = {};
+        for (const [k, url] of variantes) {
+          try {
+            const r2 = await fetch(url, { headers: H });
+            let j2 = null; try { j2 = await r2.json(); } catch (e2) {}
+            let resumen = null;
+            if (j2) {
+              const txt = JSON.stringify(j2);
+              if (txt.length <= 3000) resumen = j2;
+              else resumen = { keys: Object.keys(j2), total: j2.total || (j2.paging && j2.paging.total), primer: (j2.results && j2.results[0]) || null };
+            }
+            out.detalles[k] = { http: r2.status, body: resumen };
+          } catch (e) { out.detalles[k] = { error: e.message }; }
+          await new Promise(rs => setTimeout(rs, 150));
+        }
+      }
+    } catch (e) { out.periodos = { error: e.message }; }
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── PROBE6 (TEMPORAL): lineas de facturacion de ordenes especificas ──
+// GET /api/devol/probe6?user_id=67619515&orders=2000017191703550,2000017077382238,2000017080396472&periods=2026-07-01,2026-06-01
+app.get('/api/devol/probe6', async (req, res) => {
+  try {
+    const user_id = req.query.user_id;
+    if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
+    const orders = new Set(String(req.query.orders || '2000017191703550,2000017077382238,2000017080396472').split(',').map(x => x.trim()).filter(Boolean));
+    const periods = String(req.query.periods || '2026-07-01,2026-06-01').split(',').map(x => x.trim()).filter(Boolean);
+    const token = await getValidToken(user_id);
+    const H = { Authorization: 'Bearer ' + token };
+    const encontrados = [];
+    const meta = { paginas: 0, detallesRecorridos: 0, porPeriodo: {} };
+    const limit = Math.min(parseInt(req.query.limit) || 300, 1000);
+    for (const key of periods.slice(0, 3)) {
+      let offset = 0; let total = null; let vueltas = 0;
+      while (vueltas < 80) {
+        vueltas++;
+        const url = 'https://api.mercadolibre.com/billing/integration/periods/key/' + key + '/group/ML/details?document_type=BILL&limit=' + limit + '&offset=' + offset;
+        let r = null;
+        for (let intento = 0; intento < 6; intento++) {
+          r = await fetch(url, { headers: H });
+          if (r.status !== 429) break;
+          await new Promise(rp => setTimeout(rp, 15000));
+        }
+        if (r.status !== 200) { meta.porPeriodo[key] = { http: r.status, offsetAlFallar: offset }; break; }
+        const j = await r.json();
+        const rs = Array.isArray(j.results) ? j.results : [];
+        total = j.total;
+        meta.paginas++;
+        meta.detallesRecorridos += rs.length;
+        for (const d of rs) {
+          const sales = Array.isArray(d.sales_info) ? d.sales_info : [];
+          const hit = sales.find(si => si && orders.has(String(si.order_id)));
+          if (hit) {
+            const ci = d.charge_info || {};
+            encontrados.push({
+              period: key,
+              order_id: String(hit.order_id),
+              concepto: ci.transaction_detail,
+              monto: ci.detail_amount,
+              tipo: ci.detail_type,
+              sub_tipo: ci.detail_sub_type,
+              debitado_de_venta: ci.debited_from_operation,
+              bonificado_id: ci.charge_bonified_id,
+              fecha: ci.creation_date_time,
+              descuento: d.discount_info ? { sin_desc: d.discount_info.charge_amount_without_discount, desc: d.discount_info.discount_amount } : null
+            });
+          }
+        }
+        if (!rs.length || offset + rs.length >= (total || 0)) break;
+        offset += limit;
+        await new Promise(rp => setTimeout(rp, 700));
+      }
+      meta.porPeriodo[key] = meta.porPeriodo[key] || { total, paginas: vueltas };
+    }
+    res.json({ encontrados, meta, ref: { malacate: '2000017191703550 (espero ~9860+19720)', freidora: '2000017077382238 (espero ~13920)', silla: '2000017080396472 (espero $0 o bonificado)' } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── DEVOLUCIONES: cargos reales desde la facturacion de ML (incremental con cursor) ──
+// 1) GET /api/devol/cargos-prep?user_id=..&periods=p1,p2  -> prepara cursores (full scan solo la 1ra vez)
+// 2) GET /api/devol/cargos-sync?user_id=..&period=..      -> procesa UNA pagina desde el cursor guardado
+app.get('/api/devol/cargos-prep', async (req, res) => {
+  try {
+    const user_id = req.query.user_id;
+    const periods = String(req.query.periods || '').split(',').map(x => x.trim()).filter(Boolean);
+    if (!user_id || !periods.length) return res.status(400).json({ error: 'user_id y periods requeridos' });
+    const { data: cur, error } = await supabase.from('margen_billing_cursor').select('period,next_offset').eq('user_id', String(user_id)).in('period', periods);
+    if (error) return res.status(500).json({ error: error.message, hint: 'falta la tabla margen_billing_cursor?' });
+    const existentes = new Set((cur || []).map(r => r.period));
+    const faltantes = periods.filter(p => !existentes.has(p));
+    let fullScan = false;
+    if (faltantes.length) {
+      fullScan = true;
+      // primera vez: limpiar cargos y arrancar todos los cursores de cero
+      await supabase.from('ventas').update({ dev_cargo: null })
+        .eq('user_id', String(user_id)).eq('estado', 'cancelled')
+        .filter('raw->cancel_detail->>code', 'eq', 'mediations');
+      await supabase.from('margen_billing_cursor').delete().eq('user_id', String(user_id)).in('period', periods);
+      for (const p of periods) {
+        await supabase.from('margen_billing_cursor').insert({ user_id: String(user_id), period: p, next_offset: 0, updated_at: new Date().toISOString() });
+      }
+    }
+    const { data: cur2 } = await supabase.from('margen_billing_cursor').select('period,next_offset').eq('user_id', String(user_id)).in('period', periods);
+    res.json({ fullScan, cursores: (cur2 || []) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+const _devolCache = {};
+app.get('/api/devol/cargos-sync', async (req, res) => {
+  try {
+    const user_id = req.query.user_id;
+    const period = String(req.query.period || '').trim();
+    if (!user_id || !period) return res.status(400).json({ error: 'user_id y period requeridos' });
+    const token = await getValidToken(user_id);
+    const H = { Authorization: 'Bearer ' + token };
+
+    // cursor guardado
+    const { data: curRows, error: curErr } = await supabase.from('margen_billing_cursor').select('next_offset').eq('user_id', String(user_id)).eq('period', period).limit(1);
+    if (curErr) return res.status(500).json({ error: curErr.message, hint: 'falta la tabla margen_billing_cursor?' });
+    let offset = (curRows && curRows[0] && curRows[0].next_offset) || 0;
+
+    // set de ordenes que son devoluciones (mediations) - cacheado 10 min
+    const cacheKey = String(user_id);
+    let devolSet, devolPacks;
+    if (_devolCache[cacheKey] && (Date.now() - _devolCache[cacheKey].ts) < 600000) {
+      devolSet = _devolCache[cacheKey].set; devolPacks = _devolCache[cacheKey].packs;
+    } else {
+    devolSet = new Set();
+    devolPacks = {};
+    let off2 = 0;
+    while (true) {
+      const { data, error } = await supabase.from('ventas').select('nro_venta,pack_id')
+        .eq('user_id', String(user_id)).eq('estado', 'cancelled')
+        .filter('raw->cancel_detail->>code', 'eq', 'mediations')
+        .range(off2, off2 + 999);
+      if (error || !data || !data.length) break;
+      data.forEach(r => { devolSet.add(String(r.nro_venta)); if (r.pack_id) devolPacks[String(r.pack_id)] = String(r.nro_venta); });
+      if (data.length < 1000) break;
+      off2 += 1000;
+    }
+    _devolCache[cacheKey] = { set: devolSet, packs: devolPacks, ts: Date.now() };
+    }
+
+    let rs = [];
+    let total = null;
+    let paginasOk = 0;
+    for (let pg = 0; pg < 6; pg++) {
+      const url = 'https://api.mercadolibre.com/billing/integration/periods/key/' + period + '/group/ML/details?document_type=BILL&limit=150&offset=' + (offset + rs.length);
+      let r = null;
+      for (let i = 0; i < 4; i++) {
+        r = await fetch(url, { headers: H });
+        if (r.status !== 429) break;
+        await new Promise(rp => setTimeout(rp, 5000));
+      }
+      if (!r || r.status !== 200) {
+        if (!paginasOk) return res.json({ period, offset, http: r ? r.status : null, reintentar: true, done: false });
+        break;
+      }
+      const j = await r.json();
+      const pagina = Array.isArray(j.results) ? j.results : [];
+      if (j.total != null) total = j.total;
+      rs = rs.concat(pagina);
+      paginasOk++;
+      if (!pagina.length || (total != null && offset + rs.length >= total)) break;
+      await new Promise(rp => setTimeout(rp, 250));
+    }
+
+    const sumas = {};
+    let hits = 0;
+    for (const d of rs) {
+      const ci = d.charge_info || {};
+      const esCargo = ci.detail_type === 'CHARGE';
+      const esCredito = ci.detail_type === 'CREDIT';
+      if (!esCargo && !esCredito) continue;
+      const concepto = String(ci.transaction_detail || '');
+      // creditos: bonificaciones/devoluciones de cargos (si reclamaste y ML te lo devolvio)
+      if (!/env|devoluci|bonific/i.test(concepto) && !(esCredito && ci.charge_bonified_id)) continue;
+      const sales = Array.isArray(d.sales_info) ? d.sales_info : [];
+      let destino = null;
+      for (const si of sales) {
+        const oid = si && String(si.order_id);
+        if (oid && devolSet.has(oid)) { destino = oid; break; }
+        const pid = si && si.pack_id && String(si.pack_id);
+        if (pid && devolPacks[pid]) { destino = devolPacks[pid]; break; }
+      }
+      if (!destino && d.shipping_info && d.shipping_info.pack_id && devolPacks[String(d.shipping_info.pack_id)]) {
+        destino = devolPacks[String(d.shipping_info.pack_id)];
+      }
+      if (destino) {
+        const monto = Math.abs(Number(ci.detail_amount) || 0);
+        sumas[destino] = (sumas[destino] || 0) + (esCredito ? -monto : monto);
+        hits++;
+      }
+    }
+    const cambios = [];
+    for (const oid of Object.keys(sumas)) {
+      const { data: cur } = await supabase.from('ventas').select('dev_cargo,sku').eq('user_id', String(user_id)).eq('nro_venta', oid).limit(1);
+      const prev = (cur && cur[0] && cur[0].dev_cargo != null) ? Number(cur[0].dev_cargo) : null;
+      const nuevo = (prev || 0) + sumas[oid];
+      await supabase.from('ventas').update({ dev_cargo: nuevo }).eq('user_id', String(user_id)).eq('nro_venta', oid);
+      cambios.push({ nro: oid, sku: (cur && cur[0] && cur[0].sku) || '', antes: prev, ahora: nuevo });
+    }
+    const nextOffset = offset + rs.length;
+    const done = !rs.length || (total != null && nextOffset >= total);
+    await supabase.from('margen_billing_cursor').update({ next_offset: nextOffset, updated_at: new Date().toISOString() }).eq('user_id', String(user_id)).eq('period', period);
+    res.json({ period, escaneados: rs.length, total, nextOffset, done, hits, ordenesActualizadas: Object.keys(sumas).length, cambios });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── PROBE7 (TEMPORAL): variantes de filtro por orden en facturacion ──
+// GET /api/devol/probe7?user_id=67619515&order=2000017191703550
+app.get('/api/devol/probe7', async (req, res) => {
+  try {
+    const user_id = req.query.user_id;
+    if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
+    const orderId = String(req.query.order || '2000017191703550').trim();
+    const token = await getValidToken(user_id);
+    const H = { Authorization: 'Bearer ' + token };
+    const out = { order: orderId, variantes: {} };
+    const urls = [
+      ['v1_order_details', 'https://api.mercadolibre.com/billing/integration/group/ML/order/' + orderId + '/details?document_type=BILL'],
+      ['v1_order_details_noDoc', 'https://api.mercadolibre.com/billing/integration/group/ML/order/' + orderId + '/details'],
+      ['v2_order', 'https://api.mercadolibre.com/billing/integration/order/' + orderId + '/details?group=ML'],
+      ['periods_orderparam', 'https://api.mercadolibre.com/billing/integration/periods/key/2026-07-01/group/ML/details?document_type=BILL&limit=10&offset=0&sales_info.order_id=' + orderId]
+    ];
+    for (const [k, url] of urls) {
+      try {
+        let r = null;
+        for (let i = 0; i < 3; i++) {
+          r = await fetch(url, { headers: H });
+          if (r.status !== 429) break;
+          await new Promise(rp => setTimeout(rp, 8000));
+        }
+        let j = null; try { j = await r.json(); } catch (e2) {}
+        let resumen = null;
+        if (j) {
+          const txt = JSON.stringify(j);
+          if (txt.length <= 2500) resumen = j;
+          else {
+            const rs = j.results || [];
+            resumen = { keys: Object.keys(j), total: j.total, resultados: rs.length, lineas: rs.slice(0, 8).map(d => ({ concepto: d.charge_info && d.charge_info.transaction_detail, monto: d.charge_info && d.charge_info.detail_amount, tipo: d.charge_info && d.charge_info.detail_type, orden: d.sales_info && d.sales_info[0] && d.sales_info[0].order_id })) };
+          }
+        }
+        out.variantes[k] = { http: r.status, body: resumen };
+      } catch (e) { out.variantes[k] = { error: e.message }; }
+      await new Promise(rp => setTimeout(rp, 400));
+    }
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── SYNC DIARIO: cron job, trae ventas de ayer completas ──────────
+app.get('/api/sync/diario', async (req, res) => {
+  const secret = req.headers['x-cron-secret'];
+  if (process.env.CRON_SECRET && secret !== process.env.CRON_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+
+  res.json({ message: 'Sync diario iniciado' });
+
+  try {
+    const { data: tokens } = await supabase.from('ml_tokens').select('*');
+    if (!tokens || tokens.length === 0) return;
+
+    for (const tokenRow of tokens) {
+      const userId = tokenRow.user_id;
+      const token  = await getValidToken(userId);
+      if (!token) continue;
+
+      // Ayer completo en hora Argentina (UTC-3)
+      const ayer = new Date();
+      ayer.setDate(ayer.getDate() - 1);
+      const desdeISO = ayer.toISOString().substring(0,10) + 'T00:00:00.000-03:00';
+      const hastaISO = ayer.toISOString().substring(0,10) + 'T23:59:59.000-03:00';
+
+      let offset = 0, total = 999, guardadas = 0;
+
+      while (offset < Math.min(total, 9950)) {
+        const url = `https://api.mercadolibre.com/orders/search?seller=${userId}`
+          + `&order.date_created.from=${encodeURIComponent(desdeISO)}`
+          + `&order.date_created.to=${encodeURIComponent(hastaISO)}`
+          + `&sort=date_asc&offset=${offset}&limit=50&access_token=${token}`;
+
+        const resp = await fetch(url);
+        const data = await resp.json();
+        if (data.error) { console.error('Sync diario error ML:', data.error); break; }
+
+        total = data.paging.total;
+
+        for (const order of data.results || []) {
+          const row = await buildVentaRow(order, userId, token, true);
+          await supabase.from('ventas').upsert(row, { onConflict: 'nro_venta' });
+          guardadas++;
+          await new Promise(r => setTimeout(r, 150)); // pausa entre ventas
+        }
+
+        offset += 50;
+        await new Promise(r => setTimeout(r, 400));
+      }
+
+      console.log(`Sync diario user ${userId}: ${guardadas} ventas procesadas`);
+    }
+  } catch (e) {
+    console.error('Sync diario error:', e.message);
+  }
+});
+
+// ── SYNC (manual) ─────────────────────────────────────────────────
+// Recorre las ventas desde hoy hacia atrás `dias` días y las guarda.
+// incluirEnvio = true trae tipo de envío (Flex/Full/Colecta/M1) — más lento.
+async function runSync(userId, dias, incluirEnvio, desdeStr, hastaStr) {
+  let guardadas = 0;
+  let errores = 0;
+  try {
+    let desde;
+    if (desdeStr) { desde = new Date(desdeStr + 'T00:00:00.000-03:00'); }
+    else { desde = new Date(); desde.setDate(desde.getDate() - (dias || 90)); }
+
+    let chunkDesde = new Date(desde);
+    const hoy = hastaStr ? new Date(hastaStr + 'T23:59:59.000-03:00') : new Date();
+
+    console.log(`========================================`);
+    console.log(`[SYNC] ARRANCA user=${userId} dias=${dias} envio=${incluirEnvio}`);
+    console.log(`[SYNC] rango: ${desde.toISOString().substring(0,10)} -> ${hoy.toISOString().substring(0,10)}`);
+    console.log(`========================================`);
+
+    while (chunkDesde < hoy) {
+      // Token renovado por chunk (los syncs largos pueden superar la vida del token)
+      const token = await getValidToken(userId);
+      if (!token) { console.error('[SYNC] CORTE: sin token para', userId); break; }
+
+      const chunkHasta = new Date(chunkDesde);
+      chunkHasta.setDate(chunkDesde.getDate() + 7);
+      if (chunkHasta > hoy) chunkHasta.setTime(hoy.getTime());
+
+      const desdeISO = chunkDesde.toISOString().substring(0,10)+'T00:00:00.000-03:00';
+      const hastaISO = chunkHasta.toISOString().substring(0,10)+'T23:59:59.000-03:00';
+
+      console.log(`[SYNC] CHUNK ${desdeISO.substring(0,10)} -> ${hastaISO.substring(0,10)} | guardadas hasta ahora=${guardadas}`);
+
+      let offset = 0, total = 999;
+      while (offset < Math.min(total, 9950)) {
+        const url = `https://api.mercadolibre.com/orders/search?seller=${userId}`
+          + `&order.date_created.from=${encodeURIComponent(desdeISO)}`
+          + `&order.date_created.to=${encodeURIComponent(hastaISO)}`
+          + `&sort=date_asc&offset=${offset}&limit=50&access_token=${token}`;
+        const resp = await fetch(url);
+        const data = await resp.json();
+        if (data.error) { console.error('[SYNC] ERROR ML orders/search:', JSON.stringify(data)); break; }
+        total = (data.paging && data.paging.total) || 0;
+        const cantidad = (data.results || []).length;
+        console.log(`[SYNC]   pagina offset=${offset} total_ML=${total} trajo=${cantidad}`);
+
+        for (const order of data.results || []) {
+          try {
+            // /orders/search NO trae el seller_sku completo -> traemos la orden
+            // completa igual que el webhook, asi el SKU matchea con Contabilium
+            let orderFull = order;
+            try {
+              const oResp = await fetch(`https://api.mercadolibre.com/orders/${order.id}?access_token=${token}`);
+              const oData = await oResp.json();
+              if (oData && oData.id) orderFull = oData;
+            } catch (_) {}
+            const row = await buildVentaRow(orderFull, userId, token, incluirEnvio);
+            const { error: upErr } = await supabase.from('ventas').upsert(row, { onConflict: 'nro_venta' });
+            if (upErr) { errores++; console.error('[SYNC] ERROR upsert venta', order.id, ':', upErr.message); }
+            else guardadas++;
+          } catch (orderErr) {
+            errores++;
+            console.error('[SYNC] ERROR procesando venta', order && order.id, ':', orderErr.message);
+          }
+          if (incluirEnvio) await new Promise(r => setTimeout(r, 120));
+        }
+
+        offset += 50;
+        await new Promise(r => setTimeout(r, incluirEnvio ? 300 : 200));
+      }
+
+      chunkDesde.setDate(chunkDesde.getDate() + 8);
+      await new Promise(r => setTimeout(r, 500));
+    }
+    console.log(`========================================`);
+    console.log(`[SYNC] COMPLETO user ${userId}: ${guardadas} guardadas, ${errores} errores (dias=${dias}, envio=${incluirEnvio})`);
+    console.log(`========================================`);
+  } catch (e) {
+    console.error('[SYNC] ERROR FATAL:', e.message, '|', e.stack);
+  }
+  return guardadas;
 }
+
+// POST /api/sync  { user_id, dias, envio }
+app.post('/api/sync', (req, res) => {
+  const { user_id, dias, envio } = req.body || {};
+  const incluirEnvio = envio !== false && envio !== 'no';
+  res.json({ message: 'Sincronización iniciada', user_id, dias, envio: incluirEnvio });
+  runSync(String(user_id), Number(dias) || 90, incluirEnvio);
+});
+
+// GET /api/sync?user_id=...&dias=...&envio=si|no  (para disparar desde el navegador)
+app.get('/api/sync', (req, res) => {
+  const user_id = req.query.user_id;
+  const dias    = Number(req.query.dias) || 7;
+  const incluirEnvio = req.query.envio !== 'no';
+  const desde = req.query.desde || null;
+  const hasta = req.query.hasta || null;
+  if (!user_id) return res.status(400).json({ error: 'Falta user_id. Ej: /api/sync?user_id=67619515&dias=7' });
+  res.json({
+    message: 'Sincronización iniciada. Corre en segundo plano; mirá los logs de Railway para ver el avance.',
+    user_id, dias, desde, hasta, envio: incluirEnvio
+  });
+  runSync(String(user_id), dias, incluirEnvio, desde, hasta);
+});
+
+// ── CONTABILIUM: obtener token ────────────────────────────────────
+async function getContabiliumToken() {
+  const resp = await fetch('https://rest.contabilium.com/token', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Connection': 'close',
+      'Accept-Encoding': 'identity'
+    },
+    compress: false,
+    body: new URLSearchParams({
+      grant_type:    'client_credentials',
+      client_id:     process.env.CONTABILIUM_CLIENT_ID,
+      client_secret: process.env.CONTABILIUM_CLIENT_SECRET
+    })
+  });
+  const data = await resp.json();
+  if (!data.access_token) throw new Error('Contabilium auth falló: ' + JSON.stringify(data));
+  return data.access_token;
+}
+
+// ── ML: thumbnails por item_id (proxy, evita CORS en el navegador) ──
+// GET /api/thumbs?ids=MLA1,MLA2&user_id=...  -> { id: url }
+app.get('/api/thumbs', async (req, res) => {
+  try {
+    const ids = String(req.query.ids||'').split(',').map(s=>s.trim()).filter(Boolean);
+    if (!ids.length) return res.json({});
+    const userId = req.query.user_id || '67619515';
+    let token = null; try { token = await getValidToken(userId); } catch(e) {}
+    const out = {};
+    for (let i=0;i<ids.length;i+=20){
+      const chunk = ids.slice(i,i+20);
+      const url = 'https://api.mercadolibre.com/items?ids='+chunk.join(',')+'&attributes=id,secure_thumbnail,thumbnail';
+      try {
+        const r = await fetch(url, { headers: token ? { Authorization: 'Bearer '+token } : {} });
+        const arr = await r.json();
+        (Array.isArray(arr)?arr:[]).forEach(row=>{
+          const b = row && row.body;
+          if (b && b.id) { let u = b.secure_thumbnail || b.thumbnail || ''; if (u) out[b.id] = u.replace(/^http:/,'https:'); }
+        });
+      } catch(e) {}
+    }
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── CONTABILIUM: PROBE de compras (diagnostico TEMPORAL, solo lectura) ──
+// GET /api/compras/probe -> prueba rutas candidatas y devuelve cual responde + muestra.
+// Si seteas PROBE_SECRET en Railway, hay que pasar ?secret=...; si no, queda abierto.
+// Borrar este endpoint cuando armemos la feature real de compras.
+app.get('/api/compras/probe', async (req, res) => {
+  try {
+    if (process.env.PROBE_SECRET && req.query.secret !== process.env.PROBE_SECRET) {
+      return res.status(401).json({ error: 'secret requerido' });
+    }
+    const token = await getContabiliumToken();
+    const base  = 'https://rest.contabilium.com';
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    const candidatos = [
+      '/api/comprobantescompra/search?pageSize=3&pageNumber=1',
+      '/api/comprobantesdecompra/search?pageSize=3&pageNumber=1',
+      '/api/compras/search?pageSize=3&pageNumber=1',
+      '/api/comprobantes/search?pageSize=3&pageNumber=1',
+      '/api/ordenescompra/search?pageSize=3&pageNumber=1',
+      '/api/comprobantescompra/get?pageSize=3'
+    ];
+    const resultados = [];
+    for (const path of candidatos) {
+      try {
+        const r   = await fetch(base + path, { headers: { Authorization: `Bearer ${token}` } });
+        const txt = await r.text();
+        let j = null; try { j = JSON.parse(txt); } catch (e) {}
+        let cuenta = null, keys = null, muestra = null;
+        if (j) {
+          const items = j.Items || j.items || (Array.isArray(j) ? j : null);
+          if (Array.isArray(items)) { cuenta = items.length; muestra = items[0] || null; keys = items[0] ? Object.keys(items[0]) : []; }
+          else { keys = Object.keys(j); }
+        }
+        resultados.push({ path, status: r.status, ok: r.ok, cuenta, keys, muestra, body: (j ? undefined : txt.slice(0, 200)) });
+      } catch (e) {
+        resultados.push({ path, error: e.message });
+      }
+      await sleep(500); // rate limit 25/10s
+    }
+    res.json({ probe: 'compras', resultados });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── CONTABILIUM: traer todos los productos con costo ──────────────
+// GET /api/costos/contabilium
+// Devuelve array de { codigo, nombre, costoInterno, iva, precio }
+// v13: SOLO admin y encargado. El operador recibe 403 aunque pruebe la URL a mano.
+app.get('/api/costos/contabilium', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
+  try {
+    const token = await getContabiliumToken();
+    const pageSize = 50;
+    const base = 'https://rest.contabilium.com/api/conceptos/search';
+    const PAUSA = 500; // Contabilium limita a 25 pedidos/10s -> ~2/seg es seguro
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+    const getPage = async (pageParam, n) => {
+      const url = `${base}?pageSize=${pageSize}&${pageParam}=${n}`;
+      const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+      return r.json();
+    };
+    const primerCod = (d) => {
+      const it = (d && (d.Items || d.items)) || [];
+      return it.length ? String(it[0].Codigo || it[0].codigo || '').toUpperCase().trim() : '';
+    };
+    const _seen = new Map();
+    const addItems = (d) => {
+      const it = (d && (d.Items || d.items)) || [];
+      let n = 0;
+      for (const x of it) {
+        const c = String(x.Codigo || x.codigo || '').toUpperCase().trim();
+        if (c && !_seen.has(c)) { _seen.set(c, x); n++; }
+      }
+      return { nuevos: n, len: it.length };
+    };
+
+    // Página 1 (cualquier nombre da la primera página si el parámetro se ignora)
+    const d1 = await getPage('pageNumber', 1);
+    const cod1 = primerCod(d1);
+    const totalItems = (d1 && d1.TotalItems != null) ? d1.TotalItems : null;
+    console.log(`[CONTA] pagina 1: primerCod=${cod1} TotalItems=${totalItems}`);
+    addItems(d1);
+
+    // Detectar cuál parámetro pagina DE VERDAD (que la página 2 traiga otros códigos)
+    const candidatos = ['pageNumber', 'page', 'nroPagina', 'pagina', 'nroPag', 'pageIndex'];
+    let pageParam = null;
+    for (const cand of candidatos) {
+      await sleep(PAUSA);
+      const d2 = await getPage(cand, 2);
+      const cod2 = primerCod(d2);
+      console.log(`[CONTA] probando "${cand}=2" -> primerCod=${cod2}`);
+      if (cod2 && cod2 !== cod1) { pageParam = cand; addItems(d2); break; }
+    }
+
+    if (pageParam) {
+      console.log(`[CONTA] paginación OK con parámetro "${pageParam}"`);
+      let page = 3; // ya tenemos página 1 y 2
+      while (true) {
+        await sleep(PAUSA);
+        const d = await getPage(pageParam, page);
+        const { nuevos, len } = addItems(d);
+        console.log(`[CONTA] pagina ${page} (${pageParam}) nuevos=${nuevos} | unicos=${_seen.size}`);
+        if (len === 0 || nuevos === 0 || len < pageSize) break;
+        page++;
+        if (page > 500) break;
+      }
+    } else {
+      console.error('[CONTA] NINGUN parametro de paginacion cambio la pagina -> solo ' + _seen.size + ' productos. Revisar el nombre del parametro en la doc de Contabilium.');
+    }
+
+    const costos = [..._seen.values()].map(p => ({
+      codigo:       String(p.Codigo || p.codigo || '').toUpperCase().trim(),
+      nombre:       p.Nombre || p.nombre || '',
+      costoInterno: p.CostoInterno || p.costoInterno || 0,
+      iva:          p.Iva || p.iva || 0,
+      precio:       p.Precio || p.precio || 0,
+      estado:       p.Estado || p.estado || '',
+      stock:        (p.Stock!=null?Number(p.Stock):(p.StockActual!=null?Number(p.StockActual):(p.StockDisponible!=null?Number(p.StockDisponible):(p.Inventario!=null?Number(p.Inventario):(p.Cantidad!=null?Number(p.Cantidad):null)))))
+    })).filter(p => p.codigo);
+    try { const _s0=[..._seen.values()][0]; if(_s0) console.log('[CONTA] claves del concepto:', Object.keys(_s0).join(', ')); } catch(e){}
+
+    console.log(`[CONTA] TOTAL: ${costos.length} productos unicos (parametro=${pageParam || 'NINGUNO'}, esperado ~${totalItems})`);
+    res.json({ costos, total: costos.length, pageParam: pageParam || null });
+  } catch (e) {
+    console.error('Contabilium error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── CONTABILIUM: buscar producto por SKU ──────────────────────────
+// v13: SOLO admin y encargado (devuelve costo interno = dato sensible)
+app.get('/api/costos/contabilium/:sku', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
+  try {
+    const token = await getContabiliumToken();
+    const sku = encodeURIComponent(req.params.sku);
+    const r = await fetch(`https://rest.contabilium.com/api/conceptos/getByCodigo?codigo=${sku}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    const data = await r.json();
+    if (data.error || !data.Codigo) return res.status(404).json({ error: 'SKU no encontrado' });
+    res.json({
+      codigo:       data.Codigo,
+      nombre:       data.Nombre,
+      costoInterno: data.CostoInterno || 0,
+      iva:          data.Iva || 0,
+      precio:       data.Precio || 0
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── BACKFILL HISTÓRICO (TEMPORAL): carga costo_congelado desde el CMV ──
+// Matchea cada venta con el CMV por SKU exacto + precio (c/IVA) + día (±2),
+// y si no, por el precio más cercano del mismo SKU en el mes. Sobreescribe.
+// v13: SOLO admin (modifica costos de toda la base)
+app.post('/api/costos/backfill', requireAuth, soloRoles('admin'), async (req, res) => {
+  try {
+    const userId = req.body.user_id;
+    const filas  = req.body.rows || [];
+    if (!userId || !filas.length) return res.status(400).json({ error: 'Faltan datos' });
+
+    const DAY = 864e5;
+    const cmv = [];
+    let minD = null, maxD = null;
+    for (const f of filas) {
+      const sku   = String(f.sku || '').trim();
+      const cant  = (parseFloat(f.cantidad) || 1) || 1;
+      const pu    = parseFloat(f.precioUnit);
+      const iva   = parseFloat(f.iva) || 0;
+      const costo = parseFloat(f.costo);
+      const dia   = f.fecha ? new Date(f.fecha) : null;
+      if (!sku || isNaN(pu) || isNaN(costo) || !dia || isNaN(dia.getTime())) continue;
+      const t = dia.getTime();
+      // El "Costo" del CMV YA viene por unidad → NO dividir por cantidad.
+      // costo_congelado se calcula despues como costo_u * unidades (total).
+      cmv.push({ sku, bruto_u: pu * (1 + iva / 100), costo_u: costo, t });
+      if (minD === null || t < minD) minD = t;
+      if (maxD === null || t > maxD) maxD = t;
+    }
+    if (!cmv.length) return res.status(400).json({ error: 'CMV vacio o invalido' });
+
+    const bySku = {};
+    for (const r of cmv) { (bySku[r.sku] = bySku[r.sku] || []).push(r); }
+
+    // Traer ventas del rango (±2 dias) paginando (tope 1000 del plan free)
+    const desde = new Date(minD - 2 * DAY).toISOString();
+    const hasta = new Date(maxD + 2 * DAY).toISOString();
+    let ventas = [], from = 0;
+    while (true) {
+      const { data, error } = await supabase.from('ventas')
+        .select('nro_venta,sku,precio,unidades,fecha_cierre,fecha')
+        .eq('user_id', userId)
+        .gte('fecha_cierre', desde).lte('fecha_cierre', hasta)
+        .range(from, from + 999);
+      if (error) return res.status(500).json({ error: error.message });
+      if (!data || !data.length) break;
+      ventas = ventas.concat(data);
+      if (data.length < 1000) break;
+      from += 1000;
+    }
+
+    const updates = [];
+    let exacto = 0, aprox = 0, sin = 0;
+    for (const v of ventas) {
+      const sku = String(v.sku || '').trim();
+      const cands = bySku[sku];
+      const unidades = parseFloat(v.unidades) || 1;
+      const precio = parseFloat(v.precio) || 0;
+      const dt = new Date(v.fecha_cierre || v.fecha);
+      if (!cands || !precio || isNaN(dt.getTime())) { sin++; continue; }
+      const bruto_u = unidades > 0 ? precio / unidades : precio;
+      const t = dt.getTime();
+      let best = null;
+      for (const c of cands) {
+        if (Math.abs(c.t - t) / DAY <= 2.5) {
+          const pdif = Math.abs(c.bruto_u - bruto_u);
+          if (best === null || pdif < best.pdif) best = { pdif, costo_u: c.costo_u };
+        }
+      }
+      let costo_u = null, esExacto = false;
+      if (best) {
+        costo_u = best.costo_u;
+        esExacto = bruto_u > 0 && (best.pdif / bruto_u) <= 0.005;
+      } else {
+        let b2 = null;
+        for (const c of cands) {
+          const pdif = Math.abs(c.bruto_u - bruto_u);
+          if (b2 === null || pdif < b2.pdif) b2 = { pdif, costo_u: c.costo_u };
+        }
+        if (b2) costo_u = b2.costo_u;
+      }
+      if (costo_u === null) { sin++; continue; }
+      if (esExacto) exacto++; else aprox++;
+      updates.push({ nro_venta: v.nro_venta, costo_congelado: Math.round(costo_u * unidades * 100) / 100 });
+    }
+
+    let actualizadas = 0;
+    for (let i = 0; i < updates.length; i += 50) {
+      const lote = updates.slice(i, i + 50);
+      const resultados = await Promise.all(lote.map(u =>
+        supabase.from('ventas')
+          .update({ costo_congelado: u.costo_congelado })
+          .eq('user_id', userId)
+          .eq('nro_venta', u.nro_venta)
+      ));
+      for (const r of resultados) { if (!r.error) actualizadas++; }
+    }
+
+    res.json({ ventas: ventas.length, exacto, aprox, sin, actualizadas });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── DIAGNÓSTICO BONIFICACIONES (TEMPORAL, abierto): respuesta cruda de facturación ──
+// Uso: /api/bonif/diag?user_id=67619515&nro_venta=2000016718538322
+app.get('/api/bonif/diag', async (req, res) => {
+  try {
+    const { user_id, nro_venta } = req.query;
+    if (!user_id || !nro_venta) return res.status(400).json({ error: 'Falta user_id o nro_venta' });
+    const token = await getValidToken(user_id);
+    if (!token) return res.status(400).json({ error: 'Sin token ML para ese user_id' });
+    const auth = { headers: { Authorization: `Bearer ${token}` } };
+
+    const probe = async (url) => {
+      try {
+        const r = await fetch(url, auth);
+        let b; try { b = await r.json(); } catch { b = await r.text(); }
+        return { url, status: r.status, body: b };
+      } catch (e) { return { url, error: e.message }; }
+    };
+
+    const out = { nro_venta, order_payments: [], mediations: null, probes: [] };
+
+    // 1) Orden → payment_ids, estado de pagos, reembolsos y mediaciones
+    const order = await (await fetch(`https://api.mercadolibre.com/orders/${nro_venta}`, auth)).json();
+    const pays = Array.isArray(order.payments) ? order.payments : [];
+    out.order_payments = pays.map(p => ({
+      id: p.id, status: p.status, status_detail: p.status_detail,
+      transaction_amount: p.transaction_amount, total_paid_amount: p.total_paid_amount,
+      transaction_amount_refunded: p.transaction_amount_refunded
+    }));
+    out.mediations = order.mediations || null;
+    out.pack_id = order.pack_id || null;
+
+    // 2) Probar endpoints de facturación (devuelvo crudo el que ande)
+    for (const p of pays) {
+      out.probes.push(await probe(`https://api.mercadolibre.com/billing/integration/payment/${p.id}/charges`));
+    }
+    out.probes.push(await probe(`https://api.mercadolibre.com/billing/integration/monthly/periods?group=ML&limit=6`));
+    out.probes.push(await probe(`https://api.mercadolibre.com/billing/monthly/periods?group=ML&limit=6`));
+
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── DIAGNÓSTICO FLEX (TEMPORAL): vuelca el desglose del envío para ubicar la bonificación ──
+// Uso: /api/bonif/diagflex?user_id=67619515&nro_venta=2000016891494744
+app.get('/api/bonif/diagflex', async (req, res) => {
+  try {
+    const { user_id, nro_venta } = req.query;
+    if (!user_id || !nro_venta) return res.status(400).json({ error: 'Falta user_id o nro_venta' });
+    const token = await getValidToken(user_id);
+    if (!token) return res.status(400).json({ error: 'Sin token ML para ese user_id' });
+    const auth = { headers: { Authorization: `Bearer ${token}` } };
+
+    const order = await (await fetch(`https://api.mercadolibre.com/orders/${nro_venta}`, auth)).json();
+    const out = {
+      nro_venta,
+      shipping_id: (order.shipping && order.shipping.id) || null,
+      order_coupon: order.coupon || null,
+      order_taxes: order.taxes || null,
+      order_payments: (Array.isArray(order.payments) ? order.payments : []).map(p => ({
+        id: p.id, transaction_amount: p.transaction_amount, total_paid_amount: p.total_paid_amount,
+        shipping_cost: p.shipping_cost, coupon_amount: p.coupon_amount, taxes_amount: p.taxes_amount
+      }))
+    };
+    const shipId = out.shipping_id;
+    if (shipId) {
+      const ship = await (await fetch(`https://api.mercadolibre.com/shipments/${shipId}`, auth)).json();
+      out.shipment = { logistic_type: ship.logistic_type, base_cost: ship.base_cost, shipping_option: ship.shipping_option, status: ship.status };
+      out.shipment_costs = await (await fetch(`https://api.mercadolibre.com/shipments/${shipId}/costs`, auth)).json();
+    }
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── STATUS ────────────────────────────────────────────────────────
+app.get('/api/status', (req, res) => {
+  res.json({ status: 'ok', version: '4.4.0', timestamp: new Date().toISOString() });
+});
+
+const PORT = process.env.PORT || 3000;
+// ── MEDIDAS: planilla de pesos/medidas publicada en Google Sheets ────
+const MEDIDAS_CSV_URL = process.env.MEDIDAS_CSV_URL
+  || 'https://docs.google.com/spreadsheets/d/e/2PACX-1vTpXeWJBa0W6P4uZuEl8VrR2HN75pHr5oDXlD3BraTnSsVpjDh950v6O6k3y_q-lIA2S-feSRlh6tdu/pub?gid=1181343863&single=true&output=csv';
+let _medidasCache = null, _medidasTs = 0;
+
+function _parseCSV(text){
+  const rows=[]; let row=[]; let field=''; let inQ=false;
+  for(let i=0;i<text.length;i++){
+    const c=text[i];
+    if(inQ){
+      if(c==='"'){ if(text[i+1]==='"'){ field+='"'; i++; } else inQ=false; }
+      else field+=c;
+    } else {
+      if(c==='"') inQ=true;
+      else if(c===','){ row.push(field); field=''; }
+      else if(c==='\n'){ row.push(field); rows.push(row); row=[]; field=''; }
+      else if(c==='\r'){ /* ignorar */ }
+      else field+=c;
+    }
+  }
+  if(field!==''||row.length){ row.push(field); rows.push(row); }
+  return rows;
+}
+function _numAR(s){
+  if(s==null) return 0;
+  s=String(s).replace(/[$\s\u00a0]/g,'');
+  if(!s) return 0;
+  if(s.indexOf('.')>-1 && s.indexOf(',')>-1) s=s.replace(/\./g,'').replace(',','.');
+  else if(s.indexOf(',')>-1) s=s.replace(',','.');
+  const n=parseFloat(s);
+  return isNaN(n)?0:n;
+}
+// Normaliza encabezados: saca acentos, colapsa espacios, minúsculas.
+// (Antes NO sacaba acentos, así que "KG de envío" y "Costo envío Mercado Libre"
+//  no matcheaban y envioML quedaba en 0 para todos.)
+function _normH(c){
+  return (c||'')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g,'') // saca tildes/acentos
+    .replace(/\s+/g,' ').trim().toLowerCase();
+}
+function buildMedidas(text){
+  const rows=_parseCSV(text);
+  let hi=-1;
+  for(let i=0;i<rows.length;i++){ if(rows[i].some(c=>_normH(c)==='sku producto')){ hi=i; break; } }
+  if(hi<0) return {};
+  const hdr=rows[hi].map(_normH);
+  // Busca por coincidencia exacta y, si no, por "contiene" (tolera prefijos como "Costo ...").
+  const findCol=(...needles)=>{
+    for(const n of needles){ const i=hdr.indexOf(n); if(i>-1) return i; }
+    for(const n of needles){ const i=hdr.findIndex(h=>h.indexOf(n)>-1); if(i>-1) return i; }
+    return -1;
+  };
+  const cSku=findCol('sku producto');
+  const cLargo=findCol('largo'), cAncho=findCol('ancho'), cAlto=findCol('alto');
+  const cPeso=findCol('peso'), cKg=findCol('kg de envio');
+  // En la planilla la columna se llama "Costo envío Mercado Libre": la tomamos por "contiene".
+  const cEnvioML=findCol('envio mercado libre','costo envio mercado libre');
+  console.log(`[MEDIDAS] cols -> sku=${cSku} largo=${cLargo} ancho=${cAncho} alto=${cAlto} peso=${cPeso} kg=${cKg} envioML=${cEnvioML}`);
+  const map={};
+  for(let i=hi+1;i<rows.length;i++){
+    const r=rows[i]; const sku=(cSku>-1?(r[cSku]||''):'').trim();
+    if(!sku) continue;
+    map[sku.toUpperCase()]={
+      sku, largo:_numAR(r[cLargo]), ancho:_numAR(r[cAncho]), alto:_numAR(r[cAlto]),
+      peso:_numAR(r[cPeso]), kgEnvio:_numAR(r[cKg]), envioML:_numAR(r[cEnvioML])
+    };
+  }
+  return map;
+}
+
+// GET /api/medidas -> mapa SKU -> medidas (cacheado 5 min). Lee la planilla publicada.
+app.get('/api/medidas', requireAuth, async (req, res) => {
+  try {
+    const ahora = Date.now();
+    if (_medidasCache && (ahora - _medidasTs) < 5*60*1000) {
+      return res.json({ medidas: _medidasCache, skus: Object.keys(_medidasCache).length, cache: true });
+    }
+    const r = await fetch(MEDIDAS_CSV_URL);
+    const text = await r.text();
+    const map = buildMedidas(text);
+    if (Object.keys(map).length > 0) { _medidasCache = map; _medidasTs = ahora; }
+    console.log('[MEDIDAS] cargadas', Object.keys(map).length, 'SKUs desde Google Sheets');
+    res.json({ medidas: map, skus: Object.keys(map).length, cache: false });
+  } catch (e) {
+    console.error('[MEDIDAS] error:', e.message);
+    res.status(500).json({ error: e.message, medidas: {} });
+  }
+});
+
+// ── DIAGNÓSTICO BONIFICACIONES 2 (TEMPORAL): periodos + detalles de facturacion ──
+// Uso: /api/bonif/diag2?user_id=67619515&nro_venta=2000016718538322
+app.get('/api/bonif/diag2', async (req, res) => {
+  try {
+    const { user_id, nro_venta } = req.query;
+    if (!user_id) return res.status(400).json({ error: 'Falta user_id' });
+    const token = await getValidToken(user_id);
+    if (!token) return res.status(400).json({ error: 'Sin token ML' });
+    const auth = { headers: { Authorization: `Bearer ${token}` } };
+    const get = async (url) => {
+      try { const r = await fetch(url, auth); let b; try { b = await r.json(); } catch { b = await r.text(); }
+            return { status: r.status, body: b }; } catch (e) { return { error: e.message }; }
+    };
+    const out = { nro_venta: nro_venta || null, periods: {}, sample: {}, matches: {} };
+
+    for (const dt of ['BILL', 'CREDIT_NOTE']) {
+      const per = await get(`https://api.mercadolibre.com/billing/integration/monthly/periods?group=ML&document_type=${dt}&limit=6`);
+      out.periods[dt] = per;
+      let arr = per.body && (per.body.results || per.body.periods || per.body.data || per.body.last_periods);
+      let key = (Array.isArray(arr) && arr.length) ? (arr[0].key || arr[0].period_key || arr[0].period || arr[0].id) : null;
+      if (!key) continue;
+      out.periods[dt + '_used_key'] = key;
+      out.sample[dt] = await get(`https://api.mercadolibre.com/billing/integration/periods/key/${key}/group/ML/details?document_type=${dt}&limit=2`);
+      if (nro_venta) {
+        const found = [];
+        for (let off = 0; off < 20 * 150; off += 150) {
+          const pg = await get(`https://api.mercadolibre.com/billing/integration/periods/key/${key}/group/ML/details?document_type=${dt}&limit=150&offset=${off}`);
+          const rs = pg.body && pg.body.results;
+          if (!Array.isArray(rs) || rs.length === 0) break;
+          for (const row of rs) { if (JSON.stringify(row).includes(String(nro_venta))) found.push(row); }
+          if (found.length) break;
+        }
+        out.matches[dt] = found;
+      }
+    }
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── DIAGNÓSTICO BONIFICACIONES 3 (TEMPORAL): detalle del pago (Mercado Pago) ──
+// Uso: /api/bonif/diag3?user_id=67619515&nro_venta=2000016718538322
+app.get('/api/bonif/diag3', async (req, res) => {
+  try {
+    const { user_id, nro_venta, payment_id } = req.query;
+    if (!user_id) return res.status(400).json({ error: 'Falta user_id' });
+    const token = await getValidToken(user_id);
+    if (!token) return res.status(400).json({ error: 'Sin token ML' });
+    const auth = { headers: { Authorization: `Bearer ${token}` } };
+    const get = async (url) => {
+      try { const r = await fetch(url, auth); let b; try { b = await r.json(); } catch { b = await r.text(); }
+            return { url, status: r.status, body: b }; } catch (e) { return { url, error: e.message }; }
+    };
+    const out = { payment_id: payment_id || null, probes: [] };
+    let pid = payment_id;
+    if (!pid && nro_venta) {
+      const order = await get(`https://api.mercadolibre.com/orders/${nro_venta}`);
+      const pays = (order.body && order.body.payments) || [];
+      pid = pays[0] && pays[0].id;
+      out.payment_id = pid;
+    }
+    if (pid) {
+      out.probes.push(await get(`https://api.mercadolibre.com/v1/payments/${pid}`));
+      out.probes.push(await get(`https://api.mercadolibre.com/payments/${pid}`));
+      out.probes.push(await get(`https://api.mercadolibre.com/v1/payments/${pid}/refunds`));
+    }
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── DIAGNÓSTICO PUBLICIDAD v3 (TEMPORAL): anuncios ACTIVOS (gasto>0) por publicación ──
+// Uso: /api/ads/diag?user_id=67619515
+app.get('/api/ads/diag', async (req, res) => {
+  try {
+    const { user_id } = req.query;
+    if (!user_id) return res.status(400).json({ error: 'Falta user_id. Ej: /api/ads/diag?user_id=67619515' });
+    const token = await getValidToken(user_id);
+    if (!token) return res.status(400).json({ error: 'Sin token ML para ese user_id' });
+
+    const V2 = { 'Api-Version': '2' };
+    const probe = async (url) => {
+      try {
+        const r = await fetch(url, { headers: { Authorization: `Bearer ${token}`, 'Api-Version': '2' } });
+        let b; try { b = await r.json(); } catch (_) { b = await r.text(); }
+        return { status: r.status, body: b };
+      } catch (e) { return { error: e.message }; }
+    };
+
+    const a = 10904;
+    const hoy = new Date(); const desde = new Date(hoy); desde.setDate(hoy.getDate() - 30);
+    const f = d => d.toISOString().substring(0, 10);
+    const M = 'clicks,prints,cost,cpc,acos,units_quantity,direct_amount,indirect_amount,total_amount,organic_units_quantity';
+    const base = `https://api.mercadolibre.com/advertising/advertisers/${a}/product_ads/items?date_from=${f(desde)}&date_to=${f(hoy)}&metrics=${M}`;
+
+    const out = { rango: `${f(desde)} a ${f(hoy)}`, sort_probes: [], total_items: null, paginas_escaneadas: 0, activos_encontrados: 0, top_anuncios: [] };
+
+    // 1) probar si soporta ordenar por gasto (así una sola página trae los que más gastan)
+    for (const s of ['sort=cost_desc', 'sort_field=cost&sort_order=desc', 'order=cost_desc']) {
+      const r = await probe(`${base}&${s}&limit=5`);
+      const first = (r.body && r.body.results) ? r.body.results.slice(0, 3).map(x => ({ item: x.item_id, cost: x.metrics && x.metrics.cost })) : null;
+      out.sort_probes.push({ probe: s, status: r.status, primeros: first });
+    }
+
+    // 2) escanear páginas y juntar los anuncios con gasto > 0
+    const activos = [];
+    for (let off = 0; off < 500; off += 50) {
+      const r = await probe(`${base}&limit=50&offset=${off}`);
+      out.paginas_escaneadas++;
+      const arr = (r.body && r.body.results) || [];
+      if (out.total_items === null && r.body && r.body.paging) out.total_items = r.body.paging.total;
+      for (const it of arr) {
+        const m = it.metrics || {};
+        if ((m.cost || 0) > 0) activos.push({
+          item_id: it.item_id, campaign_id: it.campaign_id, title: it.title,
+          status: it.status, cost: m.cost, acos: m.acos, units_quantity: m.units_quantity,
+          total_amount: m.total_amount, organic_units: m.organic_units_quantity
+        });
+      }
+      if (!arr.length) break;
+    }
+    activos.sort((x, y) => (y.cost || 0) - (x.cost || 0));
+    out.activos_encontrados = activos.length;
+    out.top_anuncios = activos.slice(0, 25);
+
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── PUBLICIDAD: gasto real por anuncio (item) en un rango, con caché ──
+// Uso: /api/ads/items?user_id=67619515&desde=2026-06-01&hasta=2026-06-19
+const _adsCache = {}; // key: user|desde|hasta -> { ts, data }
+const ADS_TTL_MS = 6 * 60 * 60 * 1000; // 6 horas
+
+app.get('/api/ads/items', async (req, res) => {
+  try {
+    const { user_id, desde, hasta } = req.query;
+    if (!user_id || !desde || !hasta) return res.status(400).json({ error: 'Faltan user_id, desde, hasta (YYYY-MM-DD)' });
+
+    const key = `${user_id}|${desde}|${hasta}`;
+    const hit = _adsCache[key];
+    if (hit && Date.now() - hit.ts < ADS_TTL_MS) return res.json(Object.assign({ cached: true }, hit.data));
+
+    const token = await getValidToken(user_id);
+    if (!token) return res.status(400).json({ error: 'Sin token ML para ese user_id' });
+
+    // API NUEVA de Product Ads (ML desactivó la vieja el 27-may-2026, daba 404).
+    // Modelo: campañas → ad groups → anuncios. Las métricas por anuncio (item_id +
+    // cost) viven en /advertising/MLA/product_ads/ad_groups/{id}/ads.
+    const a = 10904; // advertiser PONTEC SA
+    const SITE = 'MLA';
+    const M = 'cost,acos,units_quantity,total_amount';
+    const headers = { Authorization: `Bearer ${token}`, 'api-version': '2' };
+
+    const fetchAds = async (url) => {
+      let ultimo = null;
+      for (let intento = 1; intento <= 3; intento++) {
+        try {
+          const r = await fetch(url, { headers });
+          const txt = await r.text();
+          if (!txt || !txt.trim()) { ultimo = { status: r.status, motivo: 'respuesta vacia' }; }
+          else {
+            try { return { status: r.status, json: JSON.parse(txt) }; }
+            catch (e) { ultimo = { status: r.status, motivo: 'JSON cortado' }; }
+          }
+        } catch (e) { ultimo = { status: 0, motivo: e.message }; }
+        await new Promise(rs => setTimeout(rs, 800 * intento));
+      }
+      return { error: ultimo };
+    };
+    // Pagina un listado /search completo y devuelve todos los results
+    const paginar = async (baseUrl, porPagina) => {
+      const first = await fetchAds(`${baseUrl}&limit=${porPagina}&offset=0`);
+      if (first.error || first.status !== 200) return { error: first.error || first.json, status: first.status };
+      const total = (first.json.paging && first.json.paging.total) || 0;
+      let resultados = (first.json.results || []).slice();
+      const offsets = [];
+      for (let o = porPagina; o < total; o += porPagina) offsets.push(o);
+      let caidas = 0;
+      const LOTE = 5;
+      for (let i = 0; i < offsets.length; i += LOTE) {
+        const batch = offsets.slice(i, i + LOTE).map(o =>
+          fetchAds(`${baseUrl}&limit=${porPagina}&offset=${o}`).then(r => {
+            if (r.error || r.status !== 200) { caidas++; return []; }
+            return r.json.results || [];
+          })
+        );
+        const rs2 = await Promise.all(batch);
+        rs2.forEach(arr => { resultados = resultados.concat(arr); });
+      }
+      return { resultados, total, caidas };
+    };
+
+    const map = {};
+    let gastoTotal = 0;
+    const acc = (arr) => {
+      for (const it of arr || []) {
+        const c = (it.metrics && it.metrics.cost) || 0;
+        if (c > 0 && it.item_id) {
+          map[it.item_id] = { cost: c, acos: (it.metrics.acos || 0), units: (it.metrics.units_quantity || 0) };
+          gastoTotal += c;
+        }
+      }
+    };
+    const rango = `date_from=${desde}&date_to=${hasta}`;
+    let paginasCaidas = 0;
+    let via = '';
+
+    // Plan A: listado global de anuncios del advertiser (una sola paginación)
+    const planA = await paginar(`https://api.mercadolibre.com/marketplace/advertising/${SITE}/advertisers/${a}/product_ads/ads/search?${rango}&metrics=${M}`, 50);
+    if (!planA.error && Array.isArray(planA.resultados) && planA.resultados.length) {
+      acc(planA.resultados);
+      paginasCaidas = planA.caidas || 0;
+      via = 'ads_search';
+    } else {
+      // Plan B: ad groups del advertiser (con métricas) → anuncios SOLO de los
+      // grupos con gasto (minimiza llamadas: los grupos sin cost no gastan).
+      via = 'ad_groups';
+      const grupos = await paginar(`https://api.mercadolibre.com/marketplace/advertising/${SITE}/advertisers/${a}/product_ads/ad_groups/search?${rango}&metrics=cost`, 50);
+      if (grupos.error) return res.status(502).json({ error: 'Error API ads (ad_groups)', detalle: grupos.error });
+      paginasCaidas += grupos.caidas || 0;
+      const conGasto = (grupos.resultados || []).filter(g => g && g.id && g.metrics && Number(g.metrics.cost) > 0);
+      const LOTE_G = 5;
+      for (let i = 0; i < conGasto.length; i += LOTE_G) {
+        const batch = conGasto.slice(i, i + LOTE_G).map(async (g) => {
+          const r = await paginar(`https://api.mercadolibre.com/advertising/${SITE}/product_ads/ad_groups/${g.id}/ads?${rango}&metrics=${M}`, 50);
+          if (r.error) { paginasCaidas++; return []; }
+          paginasCaidas += r.caidas || 0;
+          return r.resultados || [];
+        });
+        const rs3 = await Promise.all(batch);
+        rs3.forEach(arr => acc(arr));
+      }
+    }
+
+    const data = {
+      advertiser_id: a,
+      via,
+      rango: `${desde} a ${hasta}`,
+      total_items: Object.keys(map).length,
+      anuncios_con_gasto: Object.keys(map).length,
+      gasto_total: Math.round(gastoTotal),
+      paginas_caidas: paginasCaidas,
+      gastos: map
+    };
+    // No cachear si hubo paginas caidas: mejor reintentar completo la proxima
+    if (!paginasCaidas) _adsCache[key] = { ts: Date.now(), data };
+    res.json(Object.assign({ cached: false }, data));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── DIAGNÓSTICO ENVÍO (TEMPORAL) ──
+// 1 venta:  /api/envio/diag?user_id=67619515&order=2000017022730948
+// muestra varias: /api/envio/diag?user_id=67619515&sample=1
+app.get('/api/envio/diag', async (req, res) => {
+  try {
+    const { user_id, order, shipment, sample } = req.query;
+    if (!user_id) return res.status(400).json({ error: 'Falta user_id' });
+    const token = await getValidToken(user_id);
+    if (!token) return res.status(400).json({ error: 'Sin token ML' });
+    const H = { headers: { Authorization: `Bearer ${token}` } };
+
+    // helper: trae el desglose real de un shipment
+    const desglose = async (shipId) => {
+      const rs = await fetch(`https://api.mercadolibre.com/shipments/${shipId}`, H);
+      const ship = await rs.json();
+      const rc = await fetch(`https://api.mercadolibre.com/shipments/${shipId}/costs`, H);
+      const costs = await rc.json();
+      const sender = (Array.isArray(costs.senders) && costs.senders[0]) || {};
+      return {
+        logistic_type: ship.logistic_type,
+        list_cost: ship.shipping_option && ship.shipping_option.list_cost,
+        base_cost: ship.base_cost,
+        gross_amount: costs.gross_amount,
+        comprador_cost: costs.receiver && costs.receiver.cost,
+        vendedor_cost: sender.cost
+      };
+    };
+
+    // MODO SAMPLE: ventas más caras con envío guardado > 0
+    if (sample) {
+      const { data, error } = await supabase.from('ventas')
+        .select('nro_venta,sku,titulo,precio,costo_envio')
+        .eq('user_id', String(user_id))
+        .gt('costo_envio', 0)
+        .order('precio', { ascending: false })
+        .limit(10);
+      if (error) return res.status(500).json({ error: error.message });
+      const out = [];
+      for (const v of (data || [])) {
+        try {
+          const ro = await fetch(`https://api.mercadolibre.com/orders/${v.nro_venta}`, H);
+          const o = await ro.json();
+          const shipId = o.shipping && o.shipping.id;
+          let dg = {};
+          if (shipId) dg = await desglose(shipId);
+          out.push({
+            nro: v.nro_venta, sku: v.sku, precio: v.precio,
+            logistic: dg.logistic_type,
+            GUARDADO_costo_envio: v.costo_envio,          // lo que usa MargenML hoy (bruto)
+            REAL_vendedor_cost: dg.vendedor_cost,         // lo que pagás de verdad (senders.cost)
+            comprador_cost: dg.comprador_cost,
+            gross: dg.gross_amount
+          });
+        } catch (e) { out.push({ nro: v.nro_venta, error: e.message }); }
+      }
+      return res.json({ modo: 'sample', n: out.length, ventas: out });
+    }
+
+    // MODO 1 VENTA
+    if (!order && !shipment) return res.status(400).json({ error: 'Pasá order=... o sample=1' });
+    let shipId = shipment, ord = null;
+    if (order) {
+      const ro = await fetch(`https://api.mercadolibre.com/orders/${order}`, H);
+      ord = await ro.json();
+      shipId = ord.shipping && ord.shipping.id;
+    }
+    if (!shipId) return res.json({ error: 'No encontré shipment', order });
+    const dg = await desglose(shipId);
+    res.json(Object.assign({ order: order || null, shipment_id: shipId, precio_item: ord && ord.order_items && ord.order_items[0] && ord.order_items[0].unit_price }, dg));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── DIAGNÓSTICO RAW COMPLETO (TEMPORAL) ──
+// Uso: /api/envio/rawfull?user_id=67619515&order=2000017591069580
+// Devuelve el JSON crudo completo de la orden y del shipment, sin recortar nada.
+// Sirve para ubicar el campo de origen/deposito (Flex Baires vs Flex Rosario).
+app.get('/api/envio/rawfull', async (req, res) => {
+  try {
+    const { user_id, order } = req.query;
+    if (!user_id || !order) return res.status(400).json({ error: 'Pasá user_id y order' });
+    const token = await getValidToken(user_id);
+    if (!token) return res.status(400).json({ error: 'Sin token ML' });
+    const H = { headers: { Authorization: `Bearer ${token}` } };
+
+    const ro = await fetch(`https://api.mercadolibre.com/orders/${order}`, H);
+    const ord = await ro.json();
+    const shipId = ord.shipping && ord.shipping.id;
+
+    let ship = null, costs = null;
+    if (shipId) {
+      const rs = await fetch(`https://api.mercadolibre.com/shipments/${shipId}`, H);
+      ship = await rs.json();
+      const rc = await fetch(`https://api.mercadolibre.com/shipments/${shipId}/costs`, H);
+      costs = await rc.json();
+    }
+
+    res.json({ orden_raw: ord, shipment_raw: ship, costs_raw: costs });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── FLEX BAIRES: configuración (CBM, unificado, zonas, umbral) ──────
+// GET: trae el valor vigente de cada uno + el historial completo, y de
+// yapa una lista de ciudades vistas en ventas de Buenos Aires (para que
+// el desplegable de zonas se pueda armar solo, aunque todavía no tengan costo cargado).
+app.get('/api/fb/config', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
+  try {
+    const cfg = await _fbCargarConfig();
+    const ahora = new Date().toISOString();
+    const vigenteCbm    = _vigenteA(cfg.cbm, ahora);
+    const vigenteUni    = _vigenteA(cfg.unificado, ahora);
+    const vigenteUmbral = _vigenteA(cfg.umbral, ahora);
+    // Zonas ya cargadas + costo vigente de cada una
+    const zonasSet = [...new Set(cfg.zonas.map(z => z.zona))];
+    const zonasVigentes = zonasSet.map(z => {
+      const row = _vigenteA(cfg.zonas, ahora, f => f.zona === z);
+      return { zona: z, costo: row ? Number(row.costo) : null };
+    });
+    // Ciudades vistas en ventas Flex Baires que todavía no tienen costo de zona cargado
+    const { data: ciudadesVentas } = await supabase
+      .from('ventas').select('ciudad').eq('deposito_flex_baires', true).not('ciudad', 'is', null).limit(2000);
+    const ciudadesSinCosto = [...new Set((ciudadesVentas || []).map(v => v.ciudad).filter(Boolean))]
+      .filter(c => !zonasSet.includes(c));
+    res.json({
+      cbm:      { vigente: vigenteCbm ? Number(vigenteCbm.costo_cbm) : null, historial: cfg.cbm },
+      unificado:{ vigente: vigenteUni ? Number(vigenteUni.costo) : null, historial: cfg.unificado },
+      zonas:    { cargadas: zonasVigentes, sin_costo: ciudadesSinCosto, historial: cfg.zonas },
+      umbral:   { vigente: vigenteUmbral ? { monto_umbral: Number(vigenteUmbral.monto_umbral), bonif_ml: Number(vigenteUmbral.bonif_ml) } : null, historial: cfg.umbral }
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST: cada uno agrega una fila NUEVA (nunca pisa la vieja) para no romper
+// el costo congelado de ventas ya sincronizadas.
+app.post('/api/fb/config/cbm', requireAuth, soloRoles('admin'), async (req, res) => {
+  try {
+    const costo_cbm = Number(req.body.costo_cbm);
+    if (!(costo_cbm >= 0)) return res.status(400).json({ error: 'costo_cbm inválido' });
+    const { error } = await supabase.from('fb_config_cbm').insert({ costo_cbm });
+    if (error) return res.status(500).json({ error: error.message });
+    _fbCache.ts = 0; // invalida cache
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/fb/config/unificado', requireAuth, soloRoles('admin'), async (req, res) => {
+  try {
+    const costo = Number(req.body.costo);
+    if (!(costo >= 0)) return res.status(400).json({ error: 'costo inválido' });
+    const { error } = await supabase.from('fb_config_unificado').insert({ costo });
+    if (error) return res.status(500).json({ error: error.message });
+    _fbCache.ts = 0;
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/fb/config/zona', requireAuth, soloRoles('admin'), async (req, res) => {
+  try {
+    const zona = String(req.body.zona || '').trim();
+    const costo = Number(req.body.costo);
+    if (!zona) return res.status(400).json({ error: 'zona requerida' });
+    if (!(costo >= 0)) return res.status(400).json({ error: 'costo inválido' });
+    const { error } = await supabase.from('fb_config_zonas').insert({ zona, costo });
+    if (error) return res.status(500).json({ error: error.message });
+    _fbCache.ts = 0;
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/fb/config/umbral', requireAuth, soloRoles('admin'), async (req, res) => {
+  try {
+    const monto_umbral = Number(req.body.monto_umbral);
+    const bonif_ml = Number(req.body.bonif_ml || 0);
+    if (!(monto_umbral >= 0)) return res.status(400).json({ error: 'monto_umbral inválido' });
+    const { error } = await supabase.from('fb_config_umbral').insert({ monto_umbral, bonif_ml });
+    if (error) return res.status(500).json({ error: error.message });
+    _fbCache.ts = 0;
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── DIAGNÓSTICO ROL (TEMPORAL, con clave en URL) ──
+// Uso: /api/diag/rol?clave=pontec2026&email=marina@pontecsa.com
+// Muestra qué rol y pestañas tiene guardado ese email en mml_roles,
+// tal cual lo devolvería /api/mi-rol (sin depender del token del navegador).
+app.get('/api/diag/rol', async (req, res) => {
+  try {
+    if ((req.query.clave || '') !== 'pontec2026') return res.status(403).json({ error: 'clave incorrecta' });
+    const email = String(req.query.email || '').toLowerCase().trim();
+    if (!email) return res.status(400).json({ error: 'pasá email' });
+    const { data, error } = await supabase.from('mml_roles')
+      .select('email,rol,pestanas,apps,acciones,pestanas_logistica').eq('email', email).single();
+    if (error) return res.status(404).json({ error: 'no encontrado o error', detalle: error.message });
+    res.json({
+      encontrado: true,
+      email: data.email,
+      rol: data.rol,
+      apps: data.apps,
+      pestanas_logistica: data.pestanas_logistica,
+      tiene_pagos: Array.isArray(data.pestanas_logistica) && data.pestanas_logistica.includes('pagos')
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── DIAGNÓSTICO ADS v2 (TEMPORAL) ──
+// Uso: /api/ads/diag2?user_id=67619515
+// Prueba las rutas de la API de Publicidad de ML para encontrar la vigente:
+// 1) lista los advertisers de la cuenta, 2) prueba variantes del endpoint de items.
+app.get('/api/ads/diag2', async (req, res) => {
+  try {
+    const { user_id } = req.query;
+    if (!user_id) return res.status(400).json({ error: 'Pasá user_id' });
+    const token = await getValidToken(user_id);
+    if (!token) return res.status(400).json({ error: 'Sin token ML' });
+    const out = {};
+    const probar = async (nombre, url, headers) => {
+      try {
+        const r = await fetch(url, { headers: Object.assign({ Authorization: `Bearer ${token}` }, headers || {}) });
+        const txt = await r.text();
+        let body; try { body = JSON.parse(txt); } catch (e) { body = (txt || '').slice(0, 300) || '(vacio)'; }
+        // resumir para no inundar
+        if (body && body.results && Array.isArray(body.results)) {
+          body = { total: (body.paging && body.paging.total), primeros: body.results.slice(0, 2) };
+        }
+        out[nombre] = { status: r.status, body };
+      } catch (e) { out[nombre] = { error: e.message }; }
+    };
+
+    const hoy = new Date().toISOString().slice(0, 10);
+    const hace7 = new Date(Date.now() - 7 * 864e5).toISOString().slice(0, 10);
+
+    // 1) ¿Qué advertisers tiene la cuenta hoy? (con las dos versiones de header)
+    await probar('advertisers_v1', 'https://api.mercadolibre.com/advertising/advertisers?product_id=PADS', { 'Api-Version': '1' });
+    await probar('advertisers_v2', 'https://api.mercadolibre.com/advertising/advertisers?product_id=PADS', { 'Api-Version': '2' });
+
+    // 2) El endpoint actual (el que da 404) tal cual lo usamos
+    await probar('items_actual_v2', `https://api.mercadolibre.com/advertising/advertisers/10904/product_ads/items?date_from=${hace7}&date_to=${hoy}&metrics=cost,acos&limit=2&offset=0`, { 'Api-Version': '2' });
+
+    // 3) Variantes posibles de la ruta nueva
+    await probar('items_pads_v2', `https://api.mercadolibre.com/advertising/product_ads/items?date_from=${hace7}&date_to=${hoy}&metrics=cost,acos&limit=2&offset=0`, { 'Api-Version': '2' });
+    await probar('campaigns_v2', `https://api.mercadolibre.com/advertising/advertisers/10904/product_ads/campaigns?limit=2`, { 'Api-Version': '2' });
+
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── DIAGNÓSTICO ADS v3 (TEMPORAL): cadena nueva post-mayo-2026 ──
+// Uso: /api/ads/diag3?user_id=67619515
+// ML desactivó los endpoints viejos (27-may-2026). El modelo nuevo es
+// campañas → ad groups → anuncios. Este diag recorre la cadena con las rutas
+// nuevas y devuelve las estructuras reales para reescribir /api/ads/items.
+app.get('/api/ads/diag3', async (req, res) => {
+  try {
+    const { user_id } = req.query;
+    if (!user_id) return res.status(400).json({ error: 'Pasá user_id' });
+    const token = await getValidToken(user_id);
+    if (!token) return res.status(400).json({ error: 'Sin token ML' });
+    const H = { headers: { Authorization: `Bearer ${token}`, 'api-version': '2' } };
+    const out = {};
+    const hoy = new Date().toISOString().slice(0, 10);
+    const hace7 = new Date(Date.now() - 7 * 864e5).toISOString().slice(0, 10);
+    const get = async (url) => {
+      const r = await fetch(url, H);
+      const txt = await r.text();
+      let body; try { body = JSON.parse(txt); } catch (e) { body = (txt || '').slice(0, 200) || '(vacio)'; }
+      return { status: r.status, body };
+    };
+
+    // 1) Campañas (ruta nueva con /search)
+    const camp = await get(`https://api.mercadolibre.com/marketplace/advertising/MLA/advertisers/10904/product_ads/campaigns/search?limit=3&offset=0&date_from=${hace7}&date_to=${hoy}&metrics=cost`);
+    out.campanas = { status: camp.status, body: camp.body && camp.body.results ? { total: camp.body.paging && camp.body.paging.total, primeras: camp.body.results.slice(0, 2) } : camp.body };
+
+    // 2) Ad groups de la primera campaña (probamos las dos formas de ruta)
+    let campId = null;
+    try { campId = camp.body.results[0].id || camp.body.results[0].campaign_id; } catch (e) {}
+    out.primera_campana_id = campId;
+    let agId = null;
+    if (campId) {
+      const v1 = await get(`https://api.mercadolibre.com/advertising/MLA/product_ads/campaigns/${campId}/ad_groups?date_from=${hace7}&date_to=${hoy}&metrics=cost&limit=3`);
+      out.ad_groups_rutaA = { status: v1.status, body: v1.body && v1.body.results ? { total: v1.body.paging && v1.body.paging.total, primeros: v1.body.results.slice(0, 2) } : v1.body };
+      try { agId = v1.body.results[0].id || v1.body.results[0].ad_group_id; } catch (e) {}
+      if (!agId) {
+        const v2 = await get(`https://api.mercadolibre.com/marketplace/advertising/MLA/advertisers/10904/product_ads/ad_groups/search?limit=3&offset=0&date_from=${hace7}&date_to=${hoy}&filters[campaign_id]=${campId}`);
+        out.ad_groups_rutaB = { status: v2.status, body: v2.body && v2.body.results ? { total: v2.body.paging && v2.body.paging.total, primeros: v2.body.results.slice(0, 2) } : v2.body };
+        try { agId = v2.body.results[0].id || v2.body.results[0].ad_group_id; } catch (e) {}
+      }
+    }
+    out.primer_ad_group_id = agId;
+
+    // 3) Anuncios (con métricas) del primer ad group
+    if (agId) {
+      const ads = await get(`https://api.mercadolibre.com/advertising/MLA/product_ads/ad_groups/${agId}/ads?date_from=${hace7}&date_to=${hoy}&metrics=cost,acos,units_quantity,total_amount&limit=5&offset=0`);
+      out.anuncios = { status: ads.status, body: ads.body && ads.body.results ? { total: ads.body.paging && ads.body.paging.total, primeros: ads.body.results.slice(0, 3) } : ads.body };
+    }
+
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.listen(PORT, () => console.log(`MargenML backend v35 (pack-envio) corriendo en puerto ${PORT}`));
+
+module.exports = app;
+
+// ── CARGOS DE DEVOLUCIONES: sincronizacion automatica cada 5 dias (ultimos 60 dias / 3 periodos) ──
+async function _cargosAutoSync() {
+  try {
+    const user_id = '67619515';
+    const base = 'https://margenml-backend-production.up.railway.app';
+    const h = new Date();
+    const per = [];
+    for (let k = 2; k >= 0; k--) { const d = new Date(h.getFullYear(), h.getMonth() - k, 1); per.push(d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-01'); }
+    console.log('[CARGOS-AUTO] arrancando, periodos:', per.join(','));
+    await fetch(base + '/api/devol/cargos-prep?user_id=' + user_id + '&periods=' + per.join(','));
+    for (const p of per) {
+      for (let i = 0; i < 500; i++) {
+        const r = await fetch(base + '/api/devol/cargos-sync?user_id=' + user_id + '&period=' + p);
+        const d = await r.json();
+        if (d.reintentar) { await new Promise(rs => setTimeout(rs, 20000)); continue; }
+        if (d.error || d.done) break;
+        await new Promise(rs => setTimeout(rs, 500));
+      }
+    }
+    console.log('[CARGOS-AUTO] completado');
+  } catch (e) { console.log('[CARGOS-AUTO] error:', e.message); }
+}
+setTimeout(_cargosAutoSync, 5 * 60 * 1000);          // 5 min despues de arrancar
+setInterval(_cargosAutoSync, 5 * 24 * 60 * 60 * 1000); // y cada 5 dias
