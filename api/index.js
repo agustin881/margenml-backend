@@ -306,10 +306,13 @@ app.post('/api/promos/aplicar', requireAuth, soloRoles('admin'), async (req, res
     if (!token) return res.status(400).json({ error: 'Sin token ML' });
 
     const body = {};
-    if (req.body.deal_price != null)     body.deal_price = Number(req.body.deal_price);
-    if (req.body.top_deal_price != null) body.top_deal_price = Number(req.body.top_deal_price);
+    if (req.body.deal_price != null)     body.deal_price = Number(String(req.body.deal_price).replace(',', '.'));
+    if (req.body.top_deal_price != null) body.top_deal_price = Number(String(req.body.top_deal_price).replace(',', '.'));
     if (req.body.promotion_id)           body.promotion_id = String(req.body.promotion_id);
     if (req.body.promotion_type)         body.promotion_type = String(req.body.promotion_type);
+    // SMART / co-fundadas / price matching: se aceptan con el offer_id que propone ML, SIN precio propio
+    if (req.body.offer_id) { body.offer_id = String(req.body.offer_id); delete body.deal_price; delete body.top_deal_price; }
+    if (body.deal_price != null && !isFinite(body.deal_price)) return res.status(400).json({ error: 'Precio invalido: ' + req.body.deal_price });
 
     const url = `https://api.mercadolibre.com/seller-promotions/items/${encodeURIComponent(itemId)}?app_version=v2`;
     const hdr = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
