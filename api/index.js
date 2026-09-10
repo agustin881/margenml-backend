@@ -2022,29 +2022,41 @@ async function cbGuardarPrecio(sku, precioNuevo) {
   if (!obj) return { ok: false, error: 'no encontre ' + sku + ' en Contabilium' };
   const token = await getContabiliumToken();
   const cuerpo = Object.assign({}, obj, { Precio: Number(precioNuevo) });
-  // Contabilium devuelve 405 si se hace PUT a /api/conceptos pelado. El patron
-  // que si funciona en su API es con el id en la URL (igual que /api/clientes/{id}).
-  // Probamos las variantes y nos quedamos con la primera que responda ok.
+  // La ruta buena es PUT /api/conceptos/{id}. El problema es que la LECTURA
+  // devuelve campos que la ESCRITURA rechaza (arranco por 'Tipo'), asi que
+  // probamos variantes del cuerpo y, si ninguna entra, informamos que vino.
   const idC = obj.Id || obj.id || null;
-  const variantes = [];
-  if (idC) variantes.push({ m: 'PUT',  u: 'https://rest.contabilium.com/api/conceptos/' + encodeURIComponent(idC) });
-  variantes.push({ m: 'POST', u: 'https://rest.contabilium.com/api/conceptos' });
-  if (idC) variantes.push({ m: 'POST', u: 'https://rest.contabilium.com/api/conceptos/' + encodeURIComponent(idC) });
+  const url = idC
+    ? 'https://rest.contabilium.com/api/conceptos/' + encodeURIComponent(idC)
+    : 'https://rest.contabilium.com/api/conceptos';
+  const sinTipo = Object.assign({}, cuerpo); delete sinTipo.Tipo;
+  const cuerpos = [{ q: 'tal cual', b: cuerpo }, { q: 'sin Tipo', b: sinTipo }];
+  if (cuerpo.Tipo != null) {
+    const nT = Number(cuerpo.Tipo);
+    if (!isNaN(nT)) cuerpos.push({ q: 'Tipo numero', b: Object.assign({}, cuerpo, { Tipo: nT }) });
+    cuerpos.push({ q: 'Tipo texto', b: Object.assign({}, cuerpo, { Tipo: String(cuerpo.Tipo) }) });
+    cuerpos.push({ q: 'Tipo=0', b: Object.assign({}, cuerpo, { Tipo: 0 }) });
+    cuerpos.push({ q: 'Tipo=1', b: Object.assign({}, cuerpo, { Tipo: 1 }) });
+    cuerpos.push({ q: 'Tipo=P', b: Object.assign({}, cuerpo, { Tipo: 'P' }) });
+  }
   const intentos = [];
   let guardo = false;
-  for (const v of variantes) {
+  for (const c of cuerpos) {
     try {
-      const rv = await fetch(v.u, {
-        method: v.m,
+      const rv = await fetch(url, {
+        method: 'PUT',
         headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
-        body: JSON.stringify(cuerpo)
+        body: JSON.stringify(c.b)
       });
       if (rv.ok) { guardo = true; break; }
       const tv = await rv.text().catch(() => '');
-      intentos.push(v.m + ' ' + v.u.replace('https://rest.contabilium.com', '') + ' -> ' + rv.status + ' ' + String(tv).slice(0, 90));
-    } catch (e) { intentos.push(v.m + ' -> ' + e.message); }
+      intentos.push(c.q + ' -> ' + rv.status + ' ' + String(tv).slice(0, 70));
+    } catch (e) { intentos.push(c.q + ' -> ' + e.message); }
   }
-  if (!guardo) return { ok: false, error: 'Contabilium no acepto el cambio. ' + intentos.join(' | ') };
+  if (!guardo) {
+    const campos = Object.keys(obj).slice(0, 30).join(',');
+    return { ok: false, error: 'Contabilium rechazo el cuerpo. Tipo=' + JSON.stringify(obj.Tipo) + ' (' + (typeof obj.Tipo) + '). Intentos: ' + intentos.join(' | ') + ' || campos: ' + campos };
+  }
   const rele = await cbConceptoPorCodigo(sku);
   const quedo = rele ? Number(rele.Precio) : null;
   if (quedo == null || Math.abs(quedo - Number(precioNuevo)) > 0.5) {
