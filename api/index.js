@@ -156,7 +156,7 @@ app.put('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) => {
     }
     if (req.body && ('pestanas_logistica' in req.body)) {
       const pl = req.body.pestanas_logistica;
-      const plOk = ['imprimir','despachar','seguimiento','full','pagos','config'];
+      const plOk = ['imprimir','despachar','seguimiento','full','pagos','config','wms'];
       if (pl === null) upd.pestanas_logistica = null;
       else if (Array.isArray(pl)) upd.pestanas_logistica = pl.filter(x => plOk.indexOf(String(x)) > -1);
       else return res.status(400).json({ error: 'pestanas_logistica debe ser lista o null' });
