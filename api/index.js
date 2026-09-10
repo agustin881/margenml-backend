@@ -2029,16 +2029,25 @@ async function cbGuardarPrecio(sku, precioNuevo) {
   const url = idC
     ? 'https://rest.contabilium.com/api/conceptos/' + encodeURIComponent(idC)
     : 'https://rest.contabilium.com/api/conceptos';
-  const sinTipo = Object.assign({}, cuerpo); delete sinTipo.Tipo;
-  const cuerpos = [{ q: 'tal cual', b: cuerpo }, { q: 'sin Tipo', b: sinTipo }];
-  if (cuerpo.Tipo != null) {
-    const nT = Number(cuerpo.Tipo);
-    if (!isNaN(nT)) cuerpos.push({ q: 'Tipo numero', b: Object.assign({}, cuerpo, { Tipo: nT }) });
-    cuerpos.push({ q: 'Tipo texto', b: Object.assign({}, cuerpo, { Tipo: String(cuerpo.Tipo) }) });
-    cuerpos.push({ q: 'Tipo=0', b: Object.assign({}, cuerpo, { Tipo: 0 }) });
-    cuerpos.push({ q: 'Tipo=1', b: Object.assign({}, cuerpo, { Tipo: 1 }) });
-    cuerpos.push({ q: 'Tipo=P', b: Object.assign({}, cuerpo, { Tipo: 'P' }) });
-  }
+  // La LECTURA devuelve palabras ('Producto', 'Activo') pero la ESCRITURA espera
+  // codigos de una letra: probandolo, con Tipo='P' la validacion avanzo a Estado.
+  const _cod = (v, mapa) => {
+    const s = String(v == null ? '' : v).trim().toUpperCase();
+    if (mapa[s] != null) return mapa[s];
+    return s ? s.charAt(0) : s;
+  };
+  cuerpo.Tipo   = _cod(obj.Tipo,   { PRODUCTO: 'P', SERVICIO: 'S' });
+  cuerpo.Estado = _cod(obj.Estado, { ACTIVO: 'A', ACTIVOS: 'A', INACTIVO: 'I', INACTIVOS: 'I' });
+  // 'Precio' es el neto y 'PrecioFinal' el que lleva IVA: hay que mover los dos
+  // juntos o el producto queda con valores que no cierran entre si.
+  cuerpo.PrecioFinal = cbFinal(Number(precioNuevo), obj.Iva);
+  const sinItems = Object.assign({}, cuerpo); delete sinItems.Items;
+  const cuerpos = [
+    { q: 'codigos', b: cuerpo },
+    { q: 'codigos sin Items', b: sinItems },
+    { q: 'Estado=1', b: Object.assign({}, cuerpo, { Estado: 1 }) },
+    { q: 'Estado=0', b: Object.assign({}, cuerpo, { Estado: 0 }) }
+  ];
   const intentos = [];
   let guardo = false;
   for (const c of cuerpos) {
