@@ -77,7 +77,22 @@ app.get('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) => {
     const { data, error } = await supabase.from('mml_roles')
       .select('email,rol,pestanas,apps,acciones,pestanas_logistica,user_id,creado').order('creado', { ascending: true });
     if (error) return res.status(500).json({ error: error.message });
-    res.json({ usuarios: data || [] });
+    const usuarios = data || [];
+    // Logins que YA existen en Supabase Auth pero todavia no tienen fila de permisos.
+    // Antes eran invisibles: la persona podia entrar pero el admin no la veia ni podia
+    // habilitarle nada. Ahora se listan marcados con sin_rol para poder adoptarlos.
+    let huerfanos = [];
+    try {
+      const conRol = new Set(usuarios.map(u => String(u.email || '').toLowerCase()));
+      const { data: lu } = await supabase.auth.admin.listUsers({ page: 1, perPage: 1000 });
+      huerfanos = ((lu && lu.users) || [])
+        .filter(u => u.email && !conRol.has(String(u.email).toLowerCase()))
+        .map(u => ({
+          email: String(u.email).toLowerCase(), rol: null, pestanas: null, apps: null,
+          acciones: null, pestanas_logistica: null, user_id: u.id, creado: u.created_at, sin_rol: true
+        }));
+    } catch (e) { /* si no se pueden listar, al menos devolvemos los que tienen rol */ }
+    res.json({ usuarios: usuarios.concat(huerfanos) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
