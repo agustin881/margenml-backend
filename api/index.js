@@ -538,6 +538,7 @@ Acciones disponibles:
 - "buscar": parametros {"sku":"..."} -> lista las publicaciones de un SKU con precio
 - "ventas": parametros {"sku": opcional, "dias": numero opcional (default 30)} -> resumen de MIS ventas: cantidad, unidades, facturacion y ganancia aprox. "cuanto vendi del X este mes" -> {"sku":"X","dias":30}
 - "medidas": parametros {"sku":"..."} -> declara en ML las medidas de embalaje (largo/ancho/alto/peso) que figuran en la planilla de medidas de Pontec
+- Los montos y precios exactos de "precio_cb" son sobre el PRECIO FINAL con IVA (lo que paga el comprador); el sistema los convierte solo a neto.
 - "precio_cb": cambia el PRECIO DE VENTA en CONTABILIUM (el sistema contable), NO en MercadoLibre. parametros {"skus":["OFI100","BAN005-NE"]} (o {"sku":"..."} si es uno solo) mas UNO de: {"porcentaje": numero} (subir 10% -> 10 ; bajar 5% -> -5), {"monto": numero} (subir $5000 -> 5000 ; bajar $2000 -> -2000) o {"precio": numero} (precio final exacto). Si el usuario pega una lista de SKUs, van TODOS en "skus".
 - "clonar_fotos": parametros {"origen":"MLA... (publicacion de la que copiar)"} y destino {"sku":"..."} (o {"item_id":"MLA..."}) -> copia las fotos de una publicacion a las demas del SKU
 - "smart": parametros {"max_mi_parte": numero} -> busca en las campanas co-participadas (SMART y similares) las propuestas donde TU parte del descuento es hasta ese % y MercadoLibre aporta el resto. "mandame los que me piden hasta 13% de mi parte" -> {"max_mi_parte":13}
@@ -955,7 +956,7 @@ app.post('/api/asistente', requireAuth, soloRoles('admin', 'encargado', 'operado
         for (const it of conf.items) {
           try {
             const rp = await cbGuardarPrecio(it.sku, it.nuevo);
-            lineasC.push((rp.ok ? 'OK - ' : 'ERROR - ') + it.sku + (rp.ok ? ' ' + pesosC(it.viejo) + ' -> ' + pesosC(rp.precio) : ' (' + rp.error + ')'));
+            lineasC.push((rp.ok ? 'OK - ' : 'ERROR - ') + it.sku + (rp.ok ? ' ' + pesosC(it.finalViejo || it.viejo) + ' -> ' + pesosC(cbFinal(rp.precio, it.iva)) + ' final c/IVA' : ' (' + rp.error + ')'));
           } catch (e) { lineasC.push('ERROR - ' + it.sku + ': ' + e.message); }
           await new Promise(rs => setTimeout(rs, 200));
         }
@@ -1061,17 +1062,18 @@ app.post('/api/asistente', requireAuth, soloRoles('admin', 'encargado', 'operado
         const cp = await cbConceptoPorCodigo(c);
         if (!cp) { noEstan.push(c); continue; }
         const viejo = Number(cp.Precio) || 0;
-        const nuevo = cbPrecioNuevo(viejo, p);
+        const ivaP  = Number(cp.Iva) || 0;
+        const nuevo = cbPrecioNuevo(viejo, ivaP, p);
         if (!(nuevo > 0)) { noEstan.push(c + ' (precio invalido)'); continue; }
         const pctReal = viejo > 0 ? ((nuevo - viejo) / viejo) * 100 : 0;
         if (Math.abs(pctReal) > CB_PRECIO_TOPE_PCT) { pasados.push(c + ': ' + Math.round(pctReal) + '%'); continue; }
-        items.push({ sku: c, nombre: cp.Nombre || c, viejo, nuevo });
+        items.push({ sku: c, nombre: cp.Nombre || c, viejo, nuevo, iva: ivaP, finalViejo: cbFinal(viejo, ivaP), finalNuevo: cbFinal(nuevo, ivaP) });
       }
       const pesos = n => '$' + Math.round(n).toLocaleString('es-AR');
       const avisos = (pasados.length ? '\n\nSalteados por pasar el tope de ' + CB_PRECIO_TOPE_PCT + '%: ' + pasados.join(', ') : '')
                    + (noEstan.length ? '\n\nNo estan en Contabilium: ' + noEstan.join(', ') : '');
       if (!items.length) return res.json({ respuesta: 'No quedo nada para cambiar.' + avisos });
-      const detalle = items.map(x => x.sku + ': ' + pesos(x.viejo) + ' -> ' + pesos(x.nuevo)).join('\n');
+      const detalle = items.map(x => x.sku + ': ' + pesos(x.finalViejo) + ' -> ' + pesos(x.finalNuevo) + '  (final c/IVA · neto ' + pesos(x.viejo) + ' -> ' + pesos(x.nuevo) + ')').join('\n');
       return res.json({
         respuesta: 'En CONTABILIUM (esto es lo que despues se factura), ' + items.length + ' producto(s):\n\n' + detalle + avisos + '\n\nDale a Confirmar si va.',
         pendiente: { accion: 'precio_cb', items }
@@ -2001,12 +2003,17 @@ async function cbCodigosDeFamilia(base) {
   return fam.length ? fam : [b];
 }
 
-function cbPrecioNuevo(actual, p) {
-  const a = Number(actual) || 0;
-  if (p.precio != null && p.precio !== '') return Math.round(Number(p.precio) * 100) / 100;
-  if (p.monto  != null && p.monto  !== '') return Math.round((a + Number(p.monto)) * 100) / 100;
+// Contabilium guarda el NETO en 'Precio' y el IVA aparte. El usuario piensa
+// en el PRECIO FINAL (lo que paga el comprador): los montos fijos y los
+// precios exactos se interpretan sobre el final y se convierten a neto.
+function cbFinal(neto, iva) { return Math.round(Number(neto || 0) * (1 + (Number(iva) || 0) / 100) * 100) / 100; }
+function cbNeto(final, iva) { return Math.round((Number(final || 0) / (1 + (Number(iva) || 0) / 100)) * 100) / 100; }
+function cbPrecioNuevo(actual, iva, p) {
+  const neto = Number(actual) || 0;
+  if (p.precio != null && p.precio !== '') return cbNeto(Number(p.precio), iva);
+  if (p.monto  != null && p.monto  !== '') return cbNeto(cbFinal(neto, iva) + Number(p.monto), iva);
   const pct = Number(p.porcentaje) || 0;
-  return Math.round(a * (1 + pct / 100) * 100) / 100;
+  return Math.round(neto * (1 + pct / 100) * 100) / 100;
 }
 
 // Escribe el precio y RELEE para confirmar que Contabilium lo guardo.
