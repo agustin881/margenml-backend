@@ -164,7 +164,7 @@ app.put('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) => {
     }
     if (req.body && ('acciones' in req.body)) {
       const ac = req.body.acciones;
-      const accOk = ['consultar','ventas','desc_poner','desc_sacar','desc_todos','smart','fotos','medidas'];
+      const accOk = ['consultar','ventas','desc_poner','desc_sacar','desc_todos','smart','fotos','medidas','precios'];
       if (ac === null) upd.acciones = null;
       else if (Array.isArray(ac)) upd.acciones = ac.filter(x => accOk.indexOf(String(x)) > -1);
       else return res.status(400).json({ error: 'acciones debe ser lista o null' });
@@ -518,6 +518,7 @@ Acciones disponibles:
 - "buscar": parametros {"sku":"..."} -> lista las publicaciones de un SKU con precio
 - "ventas": parametros {"sku": opcional, "dias": numero opcional (default 30)} -> resumen de MIS ventas: cantidad, unidades, facturacion y ganancia aprox. "cuanto vendi del X este mes" -> {"sku":"X","dias":30}
 - "medidas": parametros {"sku":"..."} -> declara en ML las medidas de embalaje (largo/ancho/alto/peso) que figuran en la planilla de medidas de Pontec
+- "precio_cb": cambia el PRECIO DE VENTA en CONTABILIUM (el sistema contable), NO en MercadoLibre. parametros {"skus":["OFI100","BAN005-NE"]} (o {"sku":"..."} si es uno solo) mas UNO de: {"porcentaje": numero} (subir 10% -> 10 ; bajar 5% -> -5), {"monto": numero} (subir $5000 -> 5000 ; bajar $2000 -> -2000) o {"precio": numero} (precio final exacto). Si el usuario pega una lista de SKUs, van TODOS en "skus".
 - "clonar_fotos": parametros {"origen":"MLA... (publicacion de la que copiar)"} y destino {"sku":"..."} (o {"item_id":"MLA..."}) -> copia las fotos de una publicacion a las demas del SKU
 - "smart": parametros {"max_mi_parte": numero} -> busca en las campanas co-participadas (SMART y similares) las propuestas donde TU parte del descuento es hasta ese % y MercadoLibre aporta el resto. "mandame los que me piden hasta 13% de mi parte" -> {"max_mi_parte":13}
 - "quitar_todo": sin parametros -> SOLO cuando el usuario pide explicitamente sacar TODOS los descuentos de TODOS los productos del catalogo
@@ -531,6 +532,7 @@ Reglas:
 - Si el usuario dice un porcentaje de descuento, mandalo como "porcentaje"; NO le pidas el precio final.\n- Para clonar_fotos hace falta saber DE QUE publicacion copiar (un codigo MLA...). Si el usuario no lo dijo, pedilo con "charla".
 - Duracion del descuento: por defecto 30 dias (no hace falta que el usuario lo diga). Si el usuario pide otra duracion (ej: "por 7 dias", "por 2 meses"), pasa ese valor en "dias" (hasta 365). Si ML no aceptara la duracion, el sistema reintenta solo con 14 dias y lo avisa en el resultado.
 - Si para aplicar_descuento no hay ni precio ni porcentaje, usa "charla" y pedi uno de los dos.
+- "precio_cb" toca CONTABILIUM (lo que despues se factura), NO MercadoLibre. Usalo solo si el usuario nombra Contabilium, o dice "precio de lista", "precio interno" o "precio de venta" del sistema. Si dice solo "subile 10% al X" sin aclarar donde, usa "charla" y preguntale si es en Contabilium o un descuento en ML.
 - Nunca inventes precios ni SKUs que el usuario no dijo.
 - "respuesta" siempre en espanol rioplatense informal y corta.`;
 
@@ -891,7 +893,7 @@ async function asistenteVerPromos(p, userId, token) {
 // Si el usuario tiene 'acciones' personalizadas en mml_roles, mandan esas.
 function asisPermisosDe(req) {
   if (Array.isArray(req.acciones) && req.acciones.length) return req.acciones;
-  if (req.rol === 'admin') return ['consultar','ventas','desc_poner','desc_sacar','desc_todos','smart','fotos','medidas'];
+  if (req.rol === 'admin') return ['consultar','ventas','desc_poner','desc_sacar','desc_todos','smart','fotos','medidas','precios'];
   if (req.rol === 'encargado') return ['consultar','ventas'];
   return ['consultar'];
 }
@@ -905,6 +907,7 @@ function asisPermisoRequerido(accion) {
     smart: 'smart', smart_aplicar: 'smart',
     clonar_fotos: 'fotos',
     medidas: 'medidas',
+    precio_cb: 'precios',
   };
   return mapa[accion] || 'consultar';
 }
@@ -926,6 +929,18 @@ app.post('/api/asistente', requireAuth, soloRoles('admin', 'encargado', 'operado
       const permConf = asisPermisoRequerido(conf.accion === 'multi' ? 'aplicar_descuento' : conf.accion);
       const confAutorizado = esAdmin || (Array.isArray(req.acciones) && req.acciones.indexOf(permConf) > -1);
       if (!confAutorizado) return res.json({ respuesta: 'Tu usuario no tiene permiso para confirmar este cambio. Pedile a un admin que te habilite "' + permConf + '" en Usuarios.' });
+      if (conf.accion === 'precio_cb' && Array.isArray(conf.items)) {
+        const pesosC = n => '$' + Math.round(n).toLocaleString('es-AR');
+        const lineasC = [];
+        for (const it of conf.items) {
+          try {
+            const rp = await cbGuardarPrecio(it.sku, it.nuevo);
+            lineasC.push((rp.ok ? 'OK - ' : 'ERROR - ') + it.sku + (rp.ok ? ' ' + pesosC(it.viejo) + ' -> ' + pesosC(rp.precio) : ' (' + rp.error + ')'));
+          } catch (e) { lineasC.push('ERROR - ' + it.sku + ': ' + e.message); }
+          await new Promise(rs => setTimeout(rs, 200));
+        }
+        return res.json({ respuesta: lineasC.join('\n') });
+      }
       if (conf.accion === 'smart_aplicar' && Array.isArray(conf.objetivos)) {
         let okS = 0, errS = 0;
         const erroresS = [];
@@ -993,7 +1008,7 @@ app.post('/api/asistente', requireAuth, soloRoles('admin', 'encargado', 'operado
     const j = llm.json || {};
     const p = j.parametros || {};
 
-    const ESCRITURA = ['quitar_descuento','aplicar_descuento','multi','quitar_todo','clonar_fotos','medidas'];
+    const ESCRITURA = ['quitar_descuento','aplicar_descuento','multi','quitar_todo','clonar_fotos','medidas','precio_cb'];
     if (ESCRITURA.indexOf(j.accion) > -1) {
       const permNec = asisPermisoRequerido(j.accion === 'multi' ? 'aplicar_descuento' : j.accion);
       const autorizado = esAdmin || (Array.isArray(req.acciones) && req.acciones.indexOf(permNec) > -1);
@@ -1007,6 +1022,40 @@ app.post('/api/asistente', requireAuth, soloRoles('admin', 'encargado', 'operado
 
     if (j.accion === 'ventas') {
       return res.json({ respuesta: await asistenteVentas(p, userId) });
+    }
+
+    if (j.accion === 'precio_cb') {
+      const entrada = (Array.isArray(p.skus) && p.skus.length) ? p.skus : (p.sku ? [p.sku] : []);
+      if (!entrada.length) return res.json({ respuesta: 'De que SKU cambio el precio en Contabilium?' });
+      const hayCuanto = (p.porcentaje != null && p.porcentaje !== '') || (p.monto != null && p.monto !== '') || (p.precio != null && p.precio !== '');
+      if (!hayCuanto) return res.json({ respuesta: 'Decime cuanto: un porcentaje (subile 10%), un monto (subile $5000) o el precio final.' });
+      let codigos = [];
+      for (const base of entrada) {
+        const fam = await cbCodigosDeFamilia(base);
+        for (const c of fam) if (codigos.indexOf(c) === -1) codigos.push(c);
+      }
+      if (!codigos.length) return res.json({ respuesta: 'No encontre esos SKU en Contabilium.' });
+      if (codigos.length > CB_PRECIO_MAX_ITEMS) return res.json({ respuesta: 'Eso toca ' + codigos.length + ' productos y el tope por seguridad es ' + CB_PRECIO_MAX_ITEMS + '. Mandamelo en tandas mas chicas.' });
+      const items = [], noEstan = [], pasados = [];
+      for (const c of codigos) {
+        const cp = await cbConceptoPorCodigo(c);
+        if (!cp) { noEstan.push(c); continue; }
+        const viejo = Number(cp.Precio) || 0;
+        const nuevo = cbPrecioNuevo(viejo, p);
+        if (!(nuevo > 0)) { noEstan.push(c + ' (precio invalido)'); continue; }
+        const pctReal = viejo > 0 ? ((nuevo - viejo) / viejo) * 100 : 0;
+        if (Math.abs(pctReal) > CB_PRECIO_TOPE_PCT) { pasados.push(c + ': ' + Math.round(pctReal) + '%'); continue; }
+        items.push({ sku: c, nombre: cp.Nombre || c, viejo, nuevo });
+      }
+      const pesos = n => '$' + Math.round(n).toLocaleString('es-AR');
+      const avisos = (pasados.length ? '\n\nSalteados por pasar el tope de ' + CB_PRECIO_TOPE_PCT + '%: ' + pasados.join(', ') : '')
+                   + (noEstan.length ? '\n\nNo estan en Contabilium: ' + noEstan.join(', ') : '');
+      if (!items.length) return res.json({ respuesta: 'No quedo nada para cambiar.' + avisos });
+      const detalle = items.map(x => x.sku + ': ' + pesos(x.viejo) + ' -> ' + pesos(x.nuevo)).join('\n');
+      return res.json({
+        respuesta: 'En CONTABILIUM (esto es lo que despues se factura), ' + items.length + ' producto(s):\n\n' + detalle + avisos + '\n\nDale a Confirmar si va.',
+        pendiente: { accion: 'precio_cb', items }
+      });
     }
 
     if (j.accion === 'medidas') {
@@ -1903,6 +1952,62 @@ async function getCostoInterno(sku) {
   } catch (e) {
     return null;
   }
+}
+
+// ── CONTABILIUM: precio de venta de un producto ───────────────────
+// getByCodigo trae el concepto COMPLETO. Para guardar hay que devolver el
+// objeto entero: si mandas solo el precio, Contabilium te vacia el resto.
+const CB_PRECIO_TOPE_PCT  = Number(process.env.CB_PRECIO_TOPE_PCT  || 30);
+const CB_PRECIO_MAX_ITEMS = Number(process.env.CB_PRECIO_MAX_ITEMS || 40);
+
+async function cbConceptoPorCodigo(sku) {
+  const token = await getContabiliumToken();
+  const r = await fetch('https://rest.contabilium.com/api/conceptos/getByCodigo?codigo=' + encodeURIComponent(sku), {
+    headers: { Authorization: 'Bearer ' + token }
+  });
+  const data = await r.json().catch(() => null);
+  if (!r.ok || !data || !data.Codigo) return null;
+  return data;
+}
+
+// SKU madre -> toda la familia. Si ya trae sufijo de color o es un combo,
+// es un SKU concreto y no hace falta recorrer el catalogo.
+async function cbCodigosDeFamilia(base) {
+  const b = String(base || '').toUpperCase().trim();
+  if (!b) return [];
+  if (b.indexOf('-') > -1) return [b];
+  const mapa = await contabiliumMapaCostos();
+  const fam = Object.keys(mapa).filter(c => _skuEsFamilia(c, b));
+  return fam.length ? fam : [b];
+}
+
+function cbPrecioNuevo(actual, p) {
+  const a = Number(actual) || 0;
+  if (p.precio != null && p.precio !== '') return Math.round(Number(p.precio) * 100) / 100;
+  if (p.monto  != null && p.monto  !== '') return Math.round((a + Number(p.monto)) * 100) / 100;
+  const pct = Number(p.porcentaje) || 0;
+  return Math.round(a * (1 + pct / 100) * 100) / 100;
+}
+
+// Escribe el precio y RELEE para confirmar que Contabilium lo guardo.
+async function cbGuardarPrecio(sku, precioNuevo) {
+  const obj = await cbConceptoPorCodigo(sku);
+  if (!obj) return { ok: false, error: 'no encontre ' + sku + ' en Contabilium' };
+  const token = await getContabiliumToken();
+  const cuerpo = Object.assign({}, obj, { Precio: Number(precioNuevo) });
+  const r = await fetch('https://rest.contabilium.com/api/conceptos', {
+    method: 'PUT',
+    headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+    body: JSON.stringify(cuerpo)
+  });
+  const txt = await r.text().catch(() => '');
+  if (!r.ok) return { ok: false, error: 'Contabilium PUT -> ' + r.status + ' ' + String(txt).slice(0, 160) };
+  const rele = await cbConceptoPorCodigo(sku);
+  const quedo = rele ? Number(rele.Precio) : null;
+  if (quedo == null || Math.abs(quedo - Number(precioNuevo)) > 0.5) {
+    return { ok: false, error: 'acepto el PUT pero al releer quedo en ' + quedo + ' (esperaba ' + precioNuevo + ')' };
+  }
+  return { ok: true, precio: quedo };
 }
 
 // ── Reenvío de webhooks al backend del Depósito ───────────────────
