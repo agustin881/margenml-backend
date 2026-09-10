@@ -2022,13 +2022,29 @@ async function cbGuardarPrecio(sku, precioNuevo) {
   if (!obj) return { ok: false, error: 'no encontre ' + sku + ' en Contabilium' };
   const token = await getContabiliumToken();
   const cuerpo = Object.assign({}, obj, { Precio: Number(precioNuevo) });
-  const r = await fetch('https://rest.contabilium.com/api/conceptos', {
-    method: 'PUT',
-    headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
-    body: JSON.stringify(cuerpo)
-  });
-  const txt = await r.text().catch(() => '');
-  if (!r.ok) return { ok: false, error: 'Contabilium PUT -> ' + r.status + ' ' + String(txt).slice(0, 160) };
+  // Contabilium devuelve 405 si se hace PUT a /api/conceptos pelado. El patron
+  // que si funciona en su API es con el id en la URL (igual que /api/clientes/{id}).
+  // Probamos las variantes y nos quedamos con la primera que responda ok.
+  const idC = obj.Id || obj.id || null;
+  const variantes = [];
+  if (idC) variantes.push({ m: 'PUT',  u: 'https://rest.contabilium.com/api/conceptos/' + encodeURIComponent(idC) });
+  variantes.push({ m: 'POST', u: 'https://rest.contabilium.com/api/conceptos' });
+  if (idC) variantes.push({ m: 'POST', u: 'https://rest.contabilium.com/api/conceptos/' + encodeURIComponent(idC) });
+  const intentos = [];
+  let guardo = false;
+  for (const v of variantes) {
+    try {
+      const rv = await fetch(v.u, {
+        method: v.m,
+        headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+        body: JSON.stringify(cuerpo)
+      });
+      if (rv.ok) { guardo = true; break; }
+      const tv = await rv.text().catch(() => '');
+      intentos.push(v.m + ' ' + v.u.replace('https://rest.contabilium.com', '') + ' -> ' + rv.status + ' ' + String(tv).slice(0, 90));
+    } catch (e) { intentos.push(v.m + ' -> ' + e.message); }
+  }
+  if (!guardo) return { ok: false, error: 'Contabilium no acepto el cambio. ' + intentos.join(' | ') };
   const rele = await cbConceptoPorCodigo(sku);
   const quedo = rele ? Number(rele.Precio) : null;
   if (quedo == null || Math.abs(quedo - Number(precioNuevo)) > 0.5) {
