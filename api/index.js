@@ -57,6 +57,26 @@ function soloRoles(...roles) {
   };
 }
 
+// ── Central de promociones: quien puede operarla ──────────────────
+// Antes aplicar/quitar promos era SOLO rol admin, asi que habilitar
+// "Promociones" a alguien en Pontec OS -> Usuarios no servia de nada.
+// Ahora se respeta ese permiso.
+function puedePromos(req) {
+  if (req.rol === 'admin') return true;
+  if (Array.isArray(req.apps) && req.apps.indexOf('promos') > -1) return true;
+  if (Array.isArray(req.pestanas) && req.pestanas.indexOf('promos') > -1) return true;
+  return false;
+}
+const _errPromos = { error: 'No tenes habilitada la central de promociones. Un admin te la habilita en Pontec OS -> Usuarios (Promociones).' };
+function soloPromos(req, res, next) {
+  if (puedePromos(req)) return next();
+  return res.status(403).json(Object.assign({ rol: req.rol }, _errPromos));
+}
+function soloVerPromos(req, res, next) {
+  if (req.rol === 'admin' || req.rol === 'encargado' || puedePromos(req)) return next();
+  return res.status(403).json(Object.assign({ rol: req.rol }, _errPromos));
+}
+
 // ── Quien soy: el frontend pregunta el rol para armar el menu ──────
 // Sin cache: es un endpoint de permisos, tiene que responder siempre fresco.
 // Si se cachea (304 Not Modified), el hub arma el menu con permisos viejos.
@@ -234,7 +254,7 @@ app.post('/api/usuarios/password', requireAuth, soloRoles('admin'), async (req, 
 // Lectura: admin y encargado. Aplicar/quitar: SOLO admin.
 
 // Campañas y promos disponibles del vendedor
-app.get('/api/promos', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
+app.get('/api/promos', requireAuth, soloVerPromos, async (req, res) => {
   try {
     const userId = req.query.user_id || '67619515';
     const token = await getValidToken(userId);
@@ -248,7 +268,7 @@ app.get('/api/promos', requireAuth, soloRoles('admin', 'encargado'), async (req,
 });
 
 // Items de una promo (candidatos + activos)
-app.get('/api/promos/items', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
+app.get('/api/promos/items', requireAuth, soloVerPromos, async (req, res) => {
   try {
     const userId = req.query.user_id || '67619515';
     const { promotion_id, promotion_type } = req.query;
@@ -267,7 +287,7 @@ app.get('/api/promos/items', requireAuth, soloRoles('admin', 'encargado'), async
 });
 
 // Titulos + SKU + precio de items (para mostrar lindo y cruzar con costos)
-app.get('/api/promos/titulos', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
+app.get('/api/promos/titulos', requireAuth, soloVerPromos, async (req, res) => {
   try {
     const userId = req.query.user_id || '67619515';
     const ids = String(req.query.ids || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -298,7 +318,7 @@ app.get('/api/promos/titulos', requireAuth, soloRoles('admin', 'encargado'), asy
 });
 
 // Promos activas de UN item
-app.get('/api/promos/item/:item_id', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
+app.get('/api/promos/item/:item_id', requireAuth, soloVerPromos, async (req, res) => {
   try {
     const userId = req.query.user_id || '67619515';
     const token = await getValidToken(userId);
@@ -312,7 +332,7 @@ app.get('/api/promos/item/:item_id', requireAuth, soloRoles('admin', 'encargado'
 });
 
 // Aplicar oferta a un item (campaña o descuento individual PRICE_DISCOUNT)
-app.post('/api/promos/aplicar', requireAuth, soloRoles('admin'), async (req, res) => {
+app.post('/api/promos/aplicar', requireAuth, soloPromos, async (req, res) => {
   try {
     const userId = (req.body && req.body.user_id) || '67619515';
     const itemId = req.body && req.body.item_id;
@@ -347,7 +367,7 @@ app.post('/api/promos/aplicar', requireAuth, soloRoles('admin'), async (req, res
 
 // Quitar oferta(s) de un item. Con promotion_type+promotion_id saca ESA;
 // sin parametros saca TODAS las que se puedan (delete masivo de ML).
-app.delete('/api/promos/quitar', requireAuth, soloRoles('admin'), async (req, res) => {
+app.delete('/api/promos/quitar', requireAuth, soloPromos, async (req, res) => {
   try {
     const userId = req.query.user_id || '67619515';
     const itemId = req.query.item_id;
@@ -445,7 +465,7 @@ async function itemsMini(ids, token) {
 
 // GET /api/promos/analisis -> recorre TODAS las campañas y devuelve
 // cada item con precio actual, sugerido de ML y costo de Contabilium.
-app.get('/api/promos/analisis', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
+app.get('/api/promos/analisis', requireAuth, soloVerPromos, async (req, res) => {
   try {
     const userId = req.query.user_id || '67619515';
     const maxPag = Math.min(parseInt(req.query.max_paginas) || 4, 10);
@@ -1304,7 +1324,7 @@ app.post('/api/asistente', requireAuth, soloRoles('admin', 'encargado', 'operado
 
 // Numeros reales por SKU: comision % y envio neto promedio de ventas recientes
 // (para calcular el "limpio" en la app Promociones con datos propios)
-app.get('/api/promos/reales', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
+app.get('/api/promos/reales', requireAuth, soloVerPromos, async (req, res) => {
   try {
     const userId = req.query.user_id || '67619515';
     const skus = String(req.query.skus || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean).slice(0, 120);
