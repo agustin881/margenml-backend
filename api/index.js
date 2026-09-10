@@ -2021,7 +2021,11 @@ async function cbGuardarPrecio(sku, precioNuevo) {
   const obj = await cbConceptoPorCodigo(sku);
   if (!obj) return { ok: false, error: 'no encontre ' + sku + ' en Contabilium' };
   const token = await getContabiliumToken();
-  const cuerpo = Object.assign({}, obj, { Precio: Number(precioNuevo) });
+  // OJO, lo descubrimos escribiendo: al LEER, 'Precio' viene NETO, pero al
+  // ESCRIBIR Contabilium interpreta 'Precio' como el precio CON IVA y el mismo
+  // divide para guardar el neto. Por eso le mandamos el bruto.
+  const brutoNuevo = cbFinal(Number(precioNuevo), obj.Iva);
+  const cuerpo = Object.assign({}, obj, { Precio: brutoNuevo });
   // La ruta buena es PUT /api/conceptos/{id}. El problema es que la LECTURA
   // devuelve campos que la ESCRITURA rechaza (arranco por 'Tipo'), asi que
   // probamos variantes del cuerpo y, si ninguna entra, informamos que vino.
@@ -2040,7 +2044,7 @@ async function cbGuardarPrecio(sku, precioNuevo) {
   cuerpo.Estado = _cod(obj.Estado, { ACTIVO: 'A', ACTIVOS: 'A', INACTIVO: 'I', INACTIVOS: 'I' });
   // 'Precio' es el neto y 'PrecioFinal' el que lleva IVA: hay que mover los dos
   // juntos o el producto queda con valores que no cierran entre si.
-  cuerpo.PrecioFinal = cbFinal(Number(precioNuevo), obj.Iva);
+  cuerpo.PrecioFinal = brutoNuevo;
   const sinItems = Object.assign({}, cuerpo); delete sinItems.Items;
   const cuerpos = [
     { q: 'codigos', b: cuerpo },
