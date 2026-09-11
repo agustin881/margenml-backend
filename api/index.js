@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v35-pack-envio', costo_congelado: true, pack_envio: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v36-chat', costo_congelado: true, pack_envio: true, chat: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -86,6 +86,96 @@ app.get('/api/mi-rol', requireAuth, (req, res) => {
   res.set('Expires', '0');
   res.set('Surrogate-Control', 'no-store');
   res.json({ email: req.authUser.email, rol: req.rol, pestanas: req.pestanas, apps: req.apps, acciones: req.acciones, pestanas_logistica: req.pestanas_logistica });
+});
+
+// ══ CHAT INTERNO (Pontec OS) ═══════════════════════════════════════
+// Mensajes entre el equipo: canal "todos" (para = null) y directos (para = email).
+// Tabla en Supabase: os_mensajes (id, de, para, texto, creado).
+// La presencia ("quien tiene Pontec OS abierto") vive en memoria: no hace falta tabla.
+const CHAT_PRESENCIA = new Map();          // email -> ms del ultimo latido
+const CHAT_ONLINE_MS = 90 * 1000;          // sin latido por 90s = desconectado
+const CHAT_MAX_TEXTO = 2000;
+const CHAT_TABLA = 'os_mensajes';
+
+function chatEmail(req) { return String((req.authUser && req.authUser.email) || '').toLowerCase().trim(); }
+function chatOnline() {
+  const ahora = Date.now(); const out = {};
+  CHAT_PRESENCIA.forEach((visto, email) => { if (ahora - visto < CHAT_ONLINE_MS) out[email] = visto; });
+  return out;
+}
+function chatErrorTabla(error) {
+  const m = String((error && error.message) || '');
+  if (/os_mensajes|relation .* does not exist|schema cache/i.test(m)) return 'Falta crear la tabla os_mensajes en Supabase';
+  return m || 'Error de base de datos';
+}
+function chatEsMio(m, yo) { return m.para === null || m.para === yo || m.de === yo; }
+
+// Latido: "tengo Pontec OS abierto". Devuelve quien mas esta conectado y los
+// mensajes nuevos para mi desde `desde` (ISO). El hub lo llama cada 8-20 segundos.
+app.post('/api/chat/latido', requireAuth, async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const yo = chatEmail(req);
+  CHAT_PRESENCIA.set(yo, Date.now());
+  const desde = String((req.body && req.body.desde) || '').trim();
+  const out = { ok: true, ahora: new Date().toISOString(), online: chatOnline(), mensajes: [] };
+  if (!desde) return res.json(out);           // primer latido: solo fija el cursor
+  try {
+    const { data, error } = await supabase.from(CHAT_TABLA)
+      .select('id,de,para,texto,creado').gt('creado', desde)
+      .order('creado', { ascending: true }).limit(200);
+    if (error) { out.error = chatErrorTabla(error); return res.json(out); }
+    out.mensajes = (data || []).filter(m => chatEsMio(m, yo));
+  } catch (e) { out.error = e.message; }
+  res.json(out);
+});
+
+// Equipo: todos los usuarios de Pontec OS (para elegir a quien escribirle).
+app.get('/api/chat/equipo', requireAuth, async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try {
+    const { data, error } = await supabase.from('mml_roles').select('email,rol').order('email');
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ equipo: (data || []).map(u => ({ email: String(u.email || '').toLowerCase(), rol: u.rol || 'operador' })), online: chatOnline() });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Historial de una conversacion: con=todos | con=<email>
+app.get('/api/chat/mensajes', requireAuth, async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const yo = chatEmail(req);
+  const con = String(req.query.con || 'todos').toLowerCase().trim();
+  const limite = Math.min(Math.max(parseInt(req.query.limite, 10) || 80, 1), 300);
+  try {
+    let q = supabase.from(CHAT_TABLA).select('id,de,para,texto,creado').order('creado', { ascending: false }).limit(limite);
+    if (con === 'todos') q = q.is('para', null);
+    else q = q.in('de', [yo, con]).in('para', [yo, con]);
+    const { data, error } = await q;
+    if (error) return res.status(500).json({ error: chatErrorTabla(error) });
+    let lista = data || [];
+    if (con !== 'todos') lista = lista.filter(m => (m.de === yo && m.para === con) || (m.de === con && m.para === yo));
+    res.json({ mensajes: lista.reverse() });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Mandar un mensaje: { para: null (todos) | email, texto }
+app.post('/api/chat/mensajes', requireAuth, async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const yo = chatEmail(req);
+  const b = req.body || {};
+  const texto = String(b.texto || '').trim();
+  let para = b.para === null || b.para === undefined || b.para === '' || b.para === 'todos' ? null : String(b.para).toLowerCase().trim();
+  if (!texto) return res.status(400).json({ error: 'El mensaje esta vacio' });
+  if (texto.length > CHAT_MAX_TEXTO) return res.status(400).json({ error: 'Mensaje demasiado largo (max ' + CHAT_MAX_TEXTO + ' caracteres)' });
+  try {
+    if (para) {
+      const { data: dest } = await supabase.from('mml_roles').select('email').eq('email', para).maybeSingle();
+      if (!dest) return res.status(400).json({ error: 'Ese usuario no existe en Pontec OS' });
+    }
+    const { data, error } = await supabase.from(CHAT_TABLA).insert({ de: yo, para, texto }).select('id,de,para,texto,creado').single();
+    if (error) return res.status(500).json({ error: chatErrorTabla(error) });
+    CHAT_PRESENCIA.set(yo, Date.now());
+    res.json({ ok: true, mensaje: data });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ══ USUARIOS v14 (solo admin): gestion del equipo desde el panel ══
