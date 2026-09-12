@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v38-abast', costo_congelado: true, pack_envio: true, chat: true, abastecimiento: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v39-abast', costo_congelado: true, pack_envio: true, chat: true, abastecimiento: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -179,33 +179,53 @@ app.post('/api/chat/mensajes', requireAuth, async (req, res) => {
 });
 
 // ══ ABASTECIMIENTO Y PRECIO DINAMICO (Pontec OS) ═══════════════════
-// Por cada SKU: stock disponible (Contabilium), unidades vendidas en ML
-// (tabla ventas), dias de cobertura, proxima fecha de llegada (ab_ingresos)
-// y la accion sugerida: sacar descuento / mantener / poner descuento.
-// Tablas: ab_proveedores, ab_productos, ab_ingresos, ab_stock_dia,
-//         ab_ventas_dia, ab_sugerencias.
+// Por cada SKU: stock disponible (Contabilium, solo depositos vendibles),
+// unidades vendidas en ML (tabla ventas), dias de cobertura, proxima fecha
+// de llegada (ab_ingresos) y la accion sugerida: sacar / mantener / poner
+// descuento. Tablas: ab_proveedores, ab_productos, ab_ingresos,
+// ab_stock_dia, ab_ventas_dia, ab_sugerencias.
 const AB_VENTANA_ML   = 15;      // dias de ventas de ML para la velocidad
 const AB_BANDA_BAJA   = 0.8;     // ratio < 0.8  -> falta stock, sacar descuento
 const AB_BANDA_ALTA   = 1.2;     // ratio > 1.2  -> sobra stock, poner descuento
 const AB_PLAZO_DEF    = 30;      // dias de reposicion si nadie cargo nada
-const AB_MAX_SKU_RUN  = 150;     // tope de consultas individuales a Contabilium por corrida
+const AB_COLCHON_DIAS = 7;       // dias extra de seguridad al calcular cuanto pedir
+const AB_MAX_SKU_RUN  = 400;     // tope de consultas individuales (solo en el plan B)
 const AB_PAUSA_MS     = 250;
 const AB_CADA_MS      = 6 * 60 * 60 * 1000;
+const AB_TZ           = 'America/Argentina/Buenos_Aires';
+// Depositos que cuentan como stock vendible (definido por Agustin). Se comparan
+// por nombre sin acentos ni mayusculas; si getDepositos falla se usan los ids.
+const AB_DEP_VENDIBLES = { 'GENERAL': 20515, 'ML FULL': 22044, 'Z FLEX BAIRES': 128222 };
+// Mercaderia que ya se compro pero todavia no entro: cuenta como "en transito".
+const AB_DEP_TRANSITO  = { 'MERCADERIA PENDIENTE DE RECEPCION': 28803 };
 let   _abUltimaSync   = null, _abCorriendo = false, _abUltimoResumen = null;
 
 function abSku(s) { return String(s || '').trim().toUpperCase(); }
-function abHoy() { return new Date().toISOString().slice(0, 10); }
+function abNorm(s) { return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim().toUpperCase(); }
+// Fecha de hoy en Argentina (no UTC): de noche la foto quedaba con fecha del dia siguiente.
+function abHoy() {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: AB_TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+}
 function abDiasEntre(desdeISO, hastaISO) {
   const a = new Date(desdeISO + 'T00:00:00Z'), b = new Date(hastaISO + 'T00:00:00Z');
   return Math.round((b - a) / 86400000);
 }
+// Ver: admin siempre; usuario con lista de apps -> tiene que estar tildada;
+// usuario sin lista (usa el rol por defecto) -> encargado si, operador no.
 function puedeAbast(req) {
   if (req.rol === 'admin') return true;
-  return Array.isArray(req.apps) && req.apps.includes('abastecimiento');
+  if (Array.isArray(req.apps)) return req.apps.includes('abastecimiento');
+  return req.rol === 'encargado';
 }
+// Editar (reglas, proveedores, ordenes en camino): admin y encargado. Operador solo mira.
+function puedeAbastEditar(req) { return puedeAbast(req) && (req.rol === 'admin' || req.rol === 'encargado'); }
 function soloAbast(req, res, next) {
   if (puedeAbast(req)) return next();
   return res.status(403).json({ error: 'Sin permiso para Abastecimiento', rol: req.rol });
+}
+function soloAbastEditar(req, res, next) {
+  if (puedeAbastEditar(req)) return next();
+  return res.status(403).json({ error: 'Solo admin o encargado pueden editar Abastecimiento', rol: req.rol });
 }
 const abSleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -217,7 +237,8 @@ async function cbGet(token, path) {
   if (!r.ok) throw new Error('Contabilium ' + r.status + ' en ' + path.split('?')[0] + ': ' + (j && (j.Message || j.message || j._raw) || ''));
   return j;
 }
-// Normaliza un item de stock venga de donde venga (getStockBySKU, Novedades, getStockByDeposito)
+function cbItems(j) { return Array.isArray(j) ? j : ((j && (j.Items || j.items || j.Data || j.data)) || []); }
+// Normaliza un item de stock venga de donde venga (getStockBySKU, getStockByDeposito)
 function cbNormStock(x) {
   if (!x) return null;
   const num = v => (v === null || v === undefined || v === '') ? null : Number(v);
@@ -225,32 +246,54 @@ function cbNormStock(x) {
   const reserva = num(x.StockReservado != null ? x.StockReservado : x.Reserva);
   let disp = num(x.StockConReservas != null ? x.StockConReservas : x.Disponible);
   if (disp === null && stock !== null) disp = stock - (reserva || 0);
-  return { sku: abSku(x.Codigo || x.codigo), stock: stock || 0, reservado: reserva || 0, disponible: disp || 0 };
+  return { sku: abSku(x.Codigo || x.codigo || x.SKU || x.Sku), stock: stock || 0, reservado: reserva || 0, disponible: disp || 0 };
 }
-async function cbStockSku(token, sku) {
-  const j = await cbGet(token, '/api/inventarios/getStockBySKU?codigo=' + encodeURIComponent(sku));
-  // Si viene desglosado por deposito en "stock", sumamos; el total tambien viene arriba.
-  const top = cbNormStock(Object.assign({ Codigo: sku }, j));
-  if (Array.isArray(j.stock) && j.stock.length && !(top.stock || top.disponible)) {
-    const s = { sku: abSku(sku), stock: 0, reservado: 0, disponible: 0 };
-    j.stock.forEach(d => { const n = cbNormStock(Object.assign({ Codigo: sku }, d)); s.stock += n.stock; s.reservado += n.reservado; s.disponible += n.disponible; });
-    return s;
-  }
-  return top;
+// Depositos: { vendibles: {id->nombre}, transito: {id->nombre}, todos: [...] }
+async function cbDepositos(token) {
+  let lista = [];
+  try { lista = cbItems(await cbGet(token, '/api/inventarios/getDepositos')); } catch (e) { lista = []; }
+  const vend = {}, tran = {};
+  lista.forEach(d => {
+    const n = abNorm(d.Nombre || d.nombre || d.Codigo);
+    if (AB_DEP_VENDIBLES[n] != null) vend[String(d.Id)] = n;
+    else if (AB_DEP_TRANSITO[n] != null) tran[String(d.Id)] = n;
+  });
+  if (!Object.keys(vend).length) Object.keys(AB_DEP_VENDIBLES).forEach(n => { vend[String(AB_DEP_VENDIBLES[n])] = n; });
+  if (!Object.keys(tran).length) Object.keys(AB_DEP_TRANSITO).forEach(n => { tran[String(AB_DEP_TRANSITO[n])] = n; });
+  return { vendibles: vend, transito: tran, todos: lista.map(d => ({ id: d.Id, nombre: d.Nombre })) };
 }
-// Movimientos de los ultimos 7 dias, paginado: { sku -> {stock,reservado,disponible} }
-async function cbNovedades(token) {
-  const desde = new Date(Date.now() - 7 * 86400000).toISOString();
-  const mapa = {};
-  for (let skip = 0; skip < 200; skip++) {
-    const j = await cbGet(token, '/api/stock/Novedades?skip=' + skip + '&timestamp=' + encodeURIComponent(desde));
-    const items = (j && (j.Items || j.items)) || [];
-    items.forEach(x => { const n = cbNormStock(x); if (n && n.sku) mapa[n.sku] = n; });
-    const total = Number(j && (j.TotalPage || j.totalPage) || 0);
-    if (!items.length || skip + 1 >= total) break;
+// Todo el stock de un deposito, paginado. Devuelve [{sku,stock,reservado,disponible}].
+async function cbStockDeposito(token, depId) {
+  const out = []; const pageSize = 500; let anterior = null;
+  for (let page = 1; page <= 200; page++) {
+    const j = await cbGet(token, '/api/inventarios/getStockByDeposito?id=' + depId + '&page=' + page + '&pageSize=' + pageSize);
+    const items = cbItems(j);
+    if (!items.length) break;
+    const primero = items[0] && (items[0].Codigo || items[0].codigo);
+    if (anterior !== null && primero === anterior) break;   // la API ignoro "page": no repetir
+    anterior = primero;
+    items.forEach(x => { const n = cbNormStock(x); if (n && n.sku) out.push(n); });
+    const total = Number(j && (j.TotalItems || j.totalItems) || 0);
+    if (total && out.length >= total) break;
+    if (items.length < pageSize && !total) break;
     await abSleep(AB_PAUSA_MS);
   }
-  return mapa;
+  return out;
+}
+// Un SKU puntual (plan B): suma solo los depositos vendibles del desglose "stock".
+async function cbStockSku(token, sku, deps) {
+  const j = await cbGet(token, '/api/inventarios/getStockBySKU?codigo=' + encodeURIComponent(sku));
+  const s = { sku: abSku(sku), stock: 0, reservado: 0, disponible: 0, en_transito: 0, detalle: {} };
+  if (Array.isArray(j.stock) && j.stock.length) {
+    j.stock.forEach(d => {
+      const id = String(d.Id), n = cbNormStock(Object.assign({ Codigo: sku }, d));
+      if (deps.vendibles[id]) { s.stock += n.stock; s.reservado += n.reservado; s.disponible += n.disponible; s.detalle[deps.vendibles[id]] = { stock: n.stock, reservado: n.reservado, disponible: n.disponible }; }
+      else if (deps.transito[id]) { s.en_transito += n.stock; s.detalle[deps.transito[id]] = { stock: n.stock, reservado: 0, disponible: n.stock }; }
+    });
+    return s;
+  }
+  const top = cbNormStock(Object.assign({ Codigo: sku }, j));   // sin desglose: total tal cual
+  return Object.assign(s, { stock: top.stock, reservado: top.reservado, disponible: top.disponible });
 }
 
 // ── Ventas de ML por SKU (tabla ventas, ya sincronizada) ─────────
@@ -274,40 +317,80 @@ async function abVentasML(dias) {
   return { porSku, titulo };
 }
 
+// Guarda la foto del dia. Si la tabla todavia no tiene las columnas nuevas
+// (en_transito, detalle), reintenta sin ellas para no perder la corrida.
+async function abGuardarStock(filas, res) {
+  for (let i = 0; i < filas.length; i += 500) {
+    let lote = filas.slice(i, i + 500);
+    let { error } = await supabase.from('ab_stock_dia').upsert(lote, { onConflict: 'fecha,sku' });
+    if (error && /column|columna/i.test(error.message)) {
+      lote = lote.map(f => ({ fecha: f.fecha, sku: f.sku, stock: f.stock, reservado: f.reservado, disponible: f.disponible }));
+      ({ error } = await supabase.from('ab_stock_dia').upsert(lote, { onConflict: 'fecha,sku' }));
+      if (!error && !res.avisos.includes('sin columnas nuevas')) res.avisos.push('sin columnas nuevas');
+    }
+    if (error) { res.errores.push('ab_stock_dia: ' + error.message); break; }
+  }
+}
+
 // ── Sincronizacion (corre cada 6 h y a pedido) ────────────────────
+// Plan A: getStockByDeposito para cada deposito vendible (+ pendiente de
+// recepcion) -> todo el catalogo en ~25 llamadas. "detalle" guarda cada
+// deposito por separado (para reabastecer Full) y stock/disponible es el total.
+// Plan B (si A no devuelve nada): getStockBySKU uno por uno, con tope.
 async function abSincronizar(motivo) {
   if (_abCorriendo) return { ok: false, error: 'Ya hay una sincronizacion corriendo' };
   _abCorriendo = true;
   const inicio = Date.now(), hoy = abHoy();
-  const res = { motivo: motivo || 'auto', hoy, novedades: 0, individuales: 0, faltantes: 0, ventas_sku: 0, errores: [] };
+  const res = { motivo: motivo || 'auto', hoy, plan: 'A', depositos: [], skus: 0, con_stock: 0, en_transito: 0, individuales: 0, faltantes: 0, ventas_sku: 0, avisos: [], errores: [] };
   try {
     const token = await getContabiliumToken();
-    const mapaCostos = await contabiliumMapaCostos();
-    const universo = Object.keys(mapaCostos || {});
-    // 1) Lo que se movio en los ultimos 7 dias, en pocas llamadas
-    let nov = {};
-    try { nov = await cbNovedades(token); res.novedades = Object.keys(nov).length; }
-    catch (e) { res.errores.push('Novedades: ' + e.message); }
-    // 2) Lo que no se movio: si ya tenemos foto de otro dia la arrastramos; si nunca lo vimos, lo pedimos (con tope)
-    const { data: previas } = await supabase.from('ab_stock_dia').select('sku,stock,reservado,disponible,fecha')
-      .order('fecha', { ascending: false }).limit(20000);
-    const ultima = {};
-    (previas || []).forEach(r => { if (!ultima[r.sku]) ultima[r.sku] = r; });
-    const filas = [];
-    let pedidos = 0;
-    for (const sku of universo) {
-      if (nov[sku]) { filas.push(Object.assign({ fecha: hoy }, nov[sku])); continue; }
-      if (ultima[sku]) { filas.push({ fecha: hoy, sku, stock: ultima[sku].stock, reservado: ultima[sku].reservado, disponible: ultima[sku].disponible }); continue; }
-      if (pedidos >= AB_MAX_SKU_RUN) { res.faltantes++; continue; }
-      try { const s = await cbStockSku(token, sku); filas.push(Object.assign({ fecha: hoy }, s)); pedidos++; await abSleep(AB_PAUSA_MS); }
-      catch (e) { res.errores.push(sku + ': ' + e.message); if (res.errores.length > 30) break; }
+    const deps = await cbDepositos(token);
+    res.depositos = Object.values(deps.vendibles).concat(Object.values(deps.transito).map(n => n + ' (transito)'));
+    const porSku = {};
+    const fila = sku => (porSku[sku] = porSku[sku] || { fecha: hoy, sku, stock: 0, reservado: 0, disponible: 0, en_transito: 0, detalle: {} });
+    // 1) Plan A: por deposito
+    let leidos = 0;
+    for (const id of Object.keys(deps.vendibles)) {
+      try {
+        const lista = await cbStockDeposito(token, id); leidos += lista.length;
+        lista.forEach(n => { if (!n.stock && !n.reservado) return; const f = fila(n.sku); f.stock += n.stock; f.reservado += n.reservado; f.disponible += n.disponible; f.detalle[deps.vendibles[id]] = { stock: n.stock, reservado: n.reservado, disponible: n.disponible }; });
+      } catch (e) { res.errores.push(deps.vendibles[id] + ': ' + e.message); }
+      await abSleep(AB_PAUSA_MS);
     }
-    res.individuales = pedidos;
-    for (let i = 0; i < filas.length; i += 500) {
-      const { error } = await supabase.from('ab_stock_dia').upsert(filas.slice(i, i + 500), { onConflict: 'fecha,sku' });
-      if (error) res.errores.push('ab_stock_dia: ' + error.message);
+    for (const id of Object.keys(deps.transito)) {
+      try {
+        const lista = await cbStockDeposito(token, id); leidos += lista.length;
+        lista.forEach(n => { if (!n.stock) return; const f = fila(n.sku); f.en_transito += n.stock; f.detalle[deps.transito[id]] = { stock: n.stock, reservado: 0, disponible: n.stock }; });
+      } catch (e) { res.errores.push(deps.transito[id] + ': ' + e.message); }
     }
-    // 3) Ventas de ML de hoy y ayer por SKU (historial por dia y canal)
+    // 2) Plan B: si por deposito no vino nada, SKU por SKU (universo = costos + ventas + reglas)
+    if (!leidos) {
+      res.plan = 'B';
+      const mapaCostos = await contabiliumMapaCostos().catch(() => ({}));
+      const ventas = await abVentasML(AB_VENTANA_ML);
+      const { data: prods } = await supabase.from('ab_productos').select('sku');
+      const universo = new Set([...Object.keys(mapaCostos || {}), ...Object.keys(ventas.porSku), ...(prods || []).map(p => abSku(p.sku))]);
+      let pedidos = 0;
+      for (const sku of universo) {
+        if (pedidos >= AB_MAX_SKU_RUN) { res.faltantes++; continue; }
+        try { const s = await cbStockSku(token, sku, deps); Object.assign(fila(sku), s); pedidos++; await abSleep(AB_PAUSA_MS); }
+        catch (e) { res.errores.push(sku + ': ' + e.message); if (res.errores.length > 30) break; }
+      }
+      res.individuales = pedidos;
+    }
+    // 3) SKUs que se venden o tienen reglas pero no aparecen con stock: fila en cero (asi se ve el quiebre)
+    try {
+      const ventas = await abVentasML(AB_VENTANA_ML);
+      const { data: prods } = await supabase.from('ab_productos').select('sku');
+      Object.keys(ventas.porSku).forEach(s => fila(s));
+      (prods || []).forEach(p => fila(abSku(p.sku)));
+    } catch (e) { res.avisos.push('universo: ' + e.message); }
+    const filas = Object.values(porSku).filter(f => f.sku);
+    res.skus = filas.length;
+    res.con_stock = filas.filter(f => f.stock > 0).length;
+    res.en_transito = filas.filter(f => f.en_transito > 0).length;
+    if (filas.length) await abGuardarStock(filas, res);
+    // 4) Ventas de ML de hoy y ayer por SKU (historial por dia y canal)
     try {
       const desde2 = new Date(Date.now() - 2 * 86400000).toISOString().slice(0, 10);
       const { data: vs } = await supabase.from('ventas').select('sku,unidades,estado,fecha').gte('fecha', desde2).limit(20000);
@@ -321,7 +404,7 @@ async function abSincronizar(motivo) {
       if (vf.length) { const { error } = await supabase.from('ab_ventas_dia').upsert(vf, { onConflict: 'fecha,sku,canal' }); if (error) res.errores.push('ab_ventas_dia: ' + error.message); }
       res.ventas_sku = vf.length;
     } catch (e) { res.errores.push('ventas: ' + e.message); }
-    res.ok = true;
+    res.ok = !res.errores.length || res.skus > 0;
   } catch (e) {
     res.ok = false; res.errores.push(e.message);
   } finally {
@@ -329,7 +412,7 @@ async function abSincronizar(motivo) {
     res.segundos = Math.round((Date.now() - inicio) / 1000);
     _abUltimaSync = Object.assign({ cuando: new Date().toISOString() }, res);
     _abUltimoResumen = null;
-    console.log('[ABAST] sync', JSON.stringify(_abUltimaSync).slice(0, 400));
+    console.log('[ABAST] sync', JSON.stringify(_abUltimaSync).slice(0, 500));
   }
   return _abUltimaSync;
 }
@@ -340,7 +423,7 @@ setInterval(() => { abSincronizar('auto').catch(() => {}); }, AB_CADA_MS);
 async function abResumen() {
   const hoy = abHoy();
   const [{ data: stockRows }, { data: prods }, { data: provs }, { data: ings }, ventas, costos] = await Promise.all([
-    supabase.from('ab_stock_dia').select('sku,stock,reservado,disponible,fecha').order('fecha', { ascending: false }).limit(20000),
+    supabase.from('ab_stock_dia').select('*').order('fecha', { ascending: false }).limit(20000),
     supabase.from('ab_productos').select('*'),
     supabase.from('ab_proveedores').select('*'),
     supabase.from('ab_ingresos').select('sku,orden,cantidad,fecha_eta,fecha_etd,estado').gte('fecha_eta', hoy).order('fecha_eta', { ascending: true }),
@@ -350,21 +433,23 @@ async function abResumen() {
   const stock = {}; (stockRows || []).forEach(r => { if (!stock[r.sku]) stock[r.sku] = r; });
   const prod = {}; (prods || []).forEach(p => { prod[abSku(p.sku)] = p; });
   const prov = {}; (provs || []).forEach(p => { prov[p.id] = p; });
-  const eta = {};
+  const eta = {}, enCamino = {};
   (ings || []).forEach(i => {
     if (/recib|cancel|anul/i.test(String(i.estado || ''))) return;
     const s = abSku(i.sku); if (!eta[s]) eta[s] = i;
+    enCamino[s] = (enCamino[s] || 0) + (Number(i.cantidad) || 0);
   });
   const universo = new Set([...Object.keys(stock), ...Object.keys(ventas.porSku), ...Object.keys(prod)]);
   const filas = [];
   universo.forEach(sku => {
-    const st = stock[sku] || { stock: 0, reservado: 0, disponible: 0, fecha: null };
+    const st = stock[sku] || { stock: 0, reservado: 0, disponible: 0, en_transito: 0, fecha: null };
     const p = prod[sku] || {};
     const pv = p.proveedor_id ? prov[p.proveedor_id] : null;
     const plazo = Number(p.dias_reposicion || (pv && pv.dias_reposicion) || AB_PLAZO_DEF);
     const vend = Number(ventas.porSku[sku] || 0);
     const velocidad = vend / AB_VENTANA_ML;
     const disponible = Number(st.disponible || 0);
+    const transito = Number(st.en_transito || 0) + Number(enCamino[sku] || 0);
     const cobertura = velocidad > 0 ? disponible / velocidad : null;      // null = no se vende, cobertura infinita
     const e = eta[sku];
     const faltan = e ? Math.max(0, abDiasEntre(hoy, e.fecha_eta)) : plazo;
@@ -375,16 +460,19 @@ async function abResumen() {
     else if (ratio > AB_BANDA_ALTA) accion = 'poner';
     if (p.activo === false) accion = 'inactivo';
     const objetivo = faltan > 0 ? disponible / faltan : null;
+    // Cuanto pedir para cubrir plazo + colchon (por ahora con la velocidad de ML)
+    const pedir = velocidad > 0 ? Math.max(0, Math.ceil((plazo + AB_COLCHON_DIAS) * velocidad - disponible - transito)) : 0;
     filas.push({
       sku, nombre: ventas.titulo[sku] || '', proveedor: pv ? pv.nombre : null, proveedor_id: p.proveedor_id || null,
       stock: Number(st.stock || 0), reservado: Number(st.reservado || 0), disponible,
+      en_transito: transito, detalle: st.detalle || null,
       stock_fecha: st.fecha || null, vendidas: vend, velocidad: Math.round(velocidad * 100) / 100,
       cobertura: cobertura === null ? null : Math.round(cobertura),
       eta: e ? e.fecha_eta : null, eta_orden: e ? e.orden : null, eta_cantidad: e ? Number(e.cantidad || 0) : 0,
       faltan, horizonte: e ? 'orden' : 'plazo', plazo,
       ratio: ratio === null ? null : Math.round(ratio * 100) / 100,
       objetivo_dia: objetivo === null ? null : Math.round(objetivo * 100) / 100,
-      accion, costo: Number(costos[sku] || 0) || null,
+      pedir, accion, costo: Number(costos[sku] || 0) || null,
       margen_minimo_pct: p.margen_minimo_pct != null ? Number(p.margen_minimo_pct) : null,
       descuento_max_pct: p.descuento_max_pct != null ? Number(p.descuento_max_pct) : null,
       activo: p.activo !== false, notas: p.notas || null
@@ -394,7 +482,7 @@ async function abResumen() {
     const ra = a.ratio === null ? 999 : a.ratio, rb = b.ratio === null ? 999 : b.ratio;
     return ra - rb;
   });
-  return { hoy, ventana_dias: AB_VENTANA_ML, bandas: { baja: AB_BANDA_BAJA, alta: AB_BANDA_ALTA }, ultima_sync: _abUltimaSync, filas };
+  return { hoy, ventana_dias: AB_VENTANA_ML, bandas: { baja: AB_BANDA_BAJA, alta: AB_BANDA_ALTA }, colchon_dias: AB_COLCHON_DIAS, ultima_sync: _abUltimaSync, filas };
 }
 
 app.get('/api/abast/resumen', requireAuth, soloAbast, async (req, res) => {
@@ -408,12 +496,12 @@ app.get('/api/abast/resumen', requireAuth, soloAbast, async (req, res) => {
     res.json(d);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-app.post('/api/abast/sincronizar', requireAuth, soloRoles('admin', 'encargado'), async (req, res) => {
+app.post('/api/abast/sincronizar', requireAuth, soloAbastEditar, async (req, res) => {
   try { res.json(await abSincronizar('manual')); } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.get('/api/abast/estado', requireAuth, soloAbast, (req, res) => {
   res.set('Cache-Control', 'no-store');
-  res.json({ ultima_sync: _abUltimaSync, corriendo: _abCorriendo });
+  res.json({ ultima_sync: _abUltimaSync, corriendo: _abCorriendo, puede_editar: puedeAbastEditar(req) });
 });
 
 // Proveedores
@@ -422,7 +510,7 @@ app.get('/api/abast/proveedores', requireAuth, soloAbast, async (req, res) => {
   if (error) return res.status(500).json({ error: error.message });
   res.json({ proveedores: data || [] });
 });
-app.post('/api/abast/proveedores', requireAuth, soloAbast, async (req, res) => {
+app.post('/api/abast/proveedores', requireAuth, soloAbastEditar, async (req, res) => {
   const b = req.body || {};
   const fila = { nombre: String(b.nombre || '').trim(), dias_reposicion: Math.max(1, parseInt(b.dias_reposicion, 10) || AB_PLAZO_DEF), importado: !!b.importado };
   if (!fila.nombre) return res.status(400).json({ error: 'Falta el nombre' });
@@ -441,7 +529,7 @@ app.delete('/api/abast/proveedores/:id', requireAuth, soloRoles('admin'), async 
 });
 
 // Producto (overrides por SKU)
-app.put('/api/abast/productos/:sku', requireAuth, soloAbast, async (req, res) => {
+app.put('/api/abast/productos/:sku', requireAuth, soloAbastEditar, async (req, res) => {
   const sku = abSku(req.params.sku); if (!sku) return res.status(400).json({ error: 'SKU invalido' });
   const b = req.body || {};
   const fila = { sku };
@@ -465,7 +553,7 @@ app.get('/api/abast/ingresos', requireAuth, soloAbast, async (req, res) => {
   if (error) return res.status(500).json({ error: error.message });
   res.json({ ingresos: data || [] });
 });
-app.post('/api/abast/ingresos', requireAuth, soloAbast, async (req, res) => {
+app.post('/api/abast/ingresos', requireAuth, soloAbastEditar, async (req, res) => {
   const b = req.body || {};
   const sku = abSku(b.sku); if (!sku) return res.status(400).json({ error: 'Falta el SKU' });
   if (!b.fecha_eta) return res.status(400).json({ error: 'Falta la fecha de llegada' });
@@ -475,7 +563,7 @@ app.post('/api/abast/ingresos', requireAuth, soloAbast, async (req, res) => {
   _abUltimoResumen = null;
   res.json({ ok: true, ingreso: data });
 });
-app.delete('/api/abast/ingresos/:id', requireAuth, soloAbast, async (req, res) => {
+app.delete('/api/abast/ingresos/:id', requireAuth, soloAbastEditar, async (req, res) => {
   const { error } = await supabase.from('ab_ingresos').delete().eq('id', req.params.id);
   if (error) return res.status(500).json({ error: error.message });
   _abUltimoResumen = null;
@@ -489,12 +577,12 @@ app.get('/api/abast/diag', requireAuth, soloRoles('admin'), async (req, res) => 
     const out = {};
     const sku = abSku(req.query.sku || 'BACK007-NE');
     try { out.stockBySku = await cbGet(token, '/api/inventarios/getStockBySKU?codigo=' + encodeURIComponent(sku)); } catch (e) { out.stockBySku = { error: e.message }; }
-    try { out.depositos = await cbGet(token, '/api/inventarios/getDepositos'); } catch (e) { out.depositos = { error: e.message }; }
+    try { out.depositos = await cbDepositos(token); } catch (e) { out.depositos = { error: e.message }; }
     try {
-      const desde = new Date(Date.now() - 7 * 86400000).toISOString();
-      const n = await cbGet(token, '/api/stock/Novedades?skip=0&timestamp=' + encodeURIComponent(desde));
-      out.novedades = { TotalPage: n.TotalPage, TotalItems: n.TotalItems, primeros: ((n.Items || n.items) || []).slice(0, 3) };
-    } catch (e) { out.novedades = { error: e.message }; }
+      const dep = req.query.dep || 20515;
+      const j = await cbGet(token, '/api/inventarios/getStockByDeposito?id=' + dep + '&page=1&pageSize=5');
+      out.porDeposito = { claves: Object.keys(j || {}), TotalItems: j.TotalItems, TotalPage: j.TotalPage, primeros: cbItems(j).slice(0, 3) };
+    } catch (e) { out.porDeposito = { error: e.message }; }
     res.json(out);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
