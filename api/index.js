@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v37-abast', costo_congelado: true, pack_envio: true, chat: true, abastecimiento: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v38-abast', costo_congelado: true, pack_envio: true, chat: true, abastecimiento: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -588,7 +588,7 @@ app.put('/api/usuarios', requireAuth, soloRoles('admin'), async (req, res) => {
     }
     if (req.body && ('apps' in req.body)) {
       const a = req.body.apps;
-      const appsOk = ['rentabilidad','logistica','promos','respondia','posventa','asistente'];
+      const appsOk = ['rentabilidad','logistica','promos','respondia','posventa','asistente','abastecimiento'];
       if (a === null) upd.apps = null;
       else if (Array.isArray(a)) upd.apps = a.filter(x => appsOk.indexOf(String(x)) > -1);
       else return res.status(400).json({ error: 'apps debe ser lista o null' });
