@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v42-abast', costo_congelado: true, pack_envio: true, chat: true, abastecimiento: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v43-comida', costo_congelado: true, pack_envio: true, chat: true, abastecimiento: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -667,6 +667,170 @@ app.get('/api/abast/diag', requireAuth, soloRoles('admin'), async (req, res) => 
     } catch (e) { out.conceptos = { error: e.message }; }
     try { const j = await cbGet(token, '/api/proveedores/search?pageSize=3&pageNumber=1&page=1'); out.proveedores = { claves: Object.keys(j || {}), TotalItems: j.TotalItems, primeros: cbItems(j).slice(0, 2) }; } catch (e) { out.proveedores = { error: e.message }; }
     res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══ COMIDA SEMANAL (Pontec OS · dentro de Mensajes) ═══════════════
+// Los viernes se publica el menu de la semana siguiente. Cada persona elige
+// que come cada dia y despues sale el cuadro (nombre x dia) para hacer el pedido.
+// Tablas: os_comidas (menu de la semana), os_comidas_elecciones (lo que eligio cada uno).
+const COMIDA_DIAS = ['Lunes', 'Martes', 'Miercoles', 'Jueves', 'Viernes', 'Sabado', 'Domingo'];
+function comidaPuedeCrear(req) { return req.rol === 'admin' || req.rol === 'encargado'; }
+function comidaLimpiarLista(v, max) {
+  const arr = Array.isArray(v) ? v : String(v || '').split('\n');
+  const out = []; const vistos = new Set();
+  arr.forEach(x => { const t = String(x || '').trim().slice(0, 120); if (t && !vistos.has(t.toLowerCase())) { vistos.add(t.toLowerCase()); out.push(t); } });
+  return out.slice(0, max || 40);
+}
+function comidaErrorTabla(error) {
+  const m = String((error && error.message) || '');
+  if (/os_comidas|relation .* does not exist|schema cache/i.test(m)) return 'Falta crear las tablas os_comidas en Supabase';
+  return m || 'Error de base de datos';
+}
+function comidaFechaCorta(iso) { const p = String(iso || '').slice(0, 10).split('-'); return p.length === 3 ? p[2] + '/' + p[1] : ''; }
+async function comidaEquipo() {
+  const { data } = await supabase.from('mml_roles').select('email,rol').order('email');
+  return (data || []).map(u => String(u.email || '').toLowerCase()).filter(Boolean);
+}
+async function comidaTraer(id) {
+  const { data, error } = await supabase.from('os_comidas').select('*').eq('id', id).maybeSingle();
+  if (error) throw new Error(comidaErrorTabla(error));
+  return data || null;
+}
+async function comidaEleccionesDe(id) {
+  const { data, error } = await supabase.from('os_comidas_elecciones').select('email,dia,eleccion,nota,actualizado').eq('comida_id', id);
+  if (error) throw new Error(comidaErrorTabla(error));
+  return data || [];
+}
+function comidaMias(elecciones, yo) { const m = {}; elecciones.forEach(e => { if (e.email === yo) m[e.dia] = e.eleccion; }); return m; }
+function comidaResumen(comida, elecciones, equipo) {
+  const dias = (comida.dias || []).map(d => d.dia);
+  const porPersona = {};
+  elecciones.forEach(e => { porPersona[e.email] = porPersona[e.email] || {}; porPersona[e.email][e.dia] = e.eleccion; });
+  const personas = Array.from(new Set(equipo.concat(Object.keys(porPersona)))).sort();
+  const filas = personas.map(email => ({ email, elecciones: dias.map(d => (porPersona[email] && porPersona[email][d]) || '') }));
+  const totales = dias.map(d => {
+    const cnt = {};
+    elecciones.forEach(e => { if (e.dia === d && e.eleccion && !/^no pido/i.test(e.eleccion)) cnt[e.eleccion] = (cnt[e.eleccion] || 0) + 1; });
+    return { dia: d, items: Object.keys(cnt).sort().map(k => ({ eleccion: k, cantidad: cnt[k] })), total: Object.values(cnt).reduce((a, b) => a + b, 0) };
+  });
+  const faltan = personas.filter(p => !porPersona[p] || !dias.some(d => porPersona[p][d]));
+  return { dias, filas, totales, faltan, respondieron: personas.length - faltan.length, total_personas: personas.length };
+}
+
+// Crear el menu de la semana (admin/encargado). Cierra los anteriores que sigan abiertos
+// y avisa a todo el equipo por Mensajes (canal Todos) con una tarjeta para elegir.
+app.post('/api/comida', requireAuth, async (req, res) => {
+  if (!comidaPuedeCrear(req)) return res.status(403).json({ error: 'Solo admin o encargado pueden publicar el menu' });
+  const yo = chatEmail(req); const b = req.body || {};
+  const semana = String(b.semana || '').slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(semana)) return res.status(400).json({ error: 'Falta la semana (fecha del lunes)' });
+  const dias = (Array.isArray(b.dias) ? b.dias : []).map(d => ({
+    dia: COMIDA_DIAS.includes(String(d.dia)) ? String(d.dia) : String(d.dia || '').slice(0, 20),
+    fecha: String(d.fecha || '').slice(0, 10) || null,
+    opciones: comidaLimpiarLista(d.opciones, 30)
+  })).filter(d => d.dia && d.opciones.length);
+  if (!dias.length) return res.status(400).json({ error: 'Carga al menos un dia con opciones' });
+  const extras = comidaLimpiarLista(b.extras, 20);
+  const titulo = String(b.titulo || ('Comida de la semana del ' + comidaFechaCorta(semana))).slice(0, 120);
+  const nota = String(b.nota || '').slice(0, 500) || null;
+  try {
+    await supabase.from('os_comidas').update({ estado: 'cerrada', cerrada: new Date().toISOString() }).eq('estado', 'abierta');
+    const { data, error } = await supabase.from('os_comidas').insert({ semana, titulo, dias, extras, nota, estado: 'abierta', creado_por: yo }).select('*').single();
+    if (error) return res.status(500).json({ error: comidaErrorTabla(error) });
+    let aviso = null;
+    if (b.avisar !== false) {
+      const texto = '[comida:' + data.id + '] 🍽️ ' + titulo + ': elegi que queres comer cada dia. Toca "Elegir mi comida".';
+      const { data: m } = await supabase.from(CHAT_TABLA).insert({ de: yo, para: null, texto }).select('id,de,para,texto,creado').single();
+      aviso = m || null;
+    }
+    res.json({ ok: true, comida: data, aviso });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// El menu vigente (el ultimo abierto; si no hay abierto, el ultimo) + lo mio + resumen
+app.get('/api/comida/actual', requireAuth, async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const yo = chatEmail(req);
+  try {
+    let { data: abiertas, error } = await supabase.from('os_comidas').select('*').eq('estado', 'abierta').order('creado', { ascending: false }).limit(1);
+    if (error) return res.status(500).json({ error: comidaErrorTabla(error) });
+    let comida = (abiertas || [])[0] || null;
+    if (!comida) { const { data: ult } = await supabase.from('os_comidas').select('*').order('creado', { ascending: false }).limit(1); comida = (ult || [])[0] || null; }
+    if (!comida) return res.json({ comida: null, puede_crear: comidaPuedeCrear(req) });
+    const [elecciones, equipo] = await Promise.all([comidaEleccionesDe(comida.id), comidaEquipo()]);
+    res.json({ comida, mias: comidaMias(elecciones, yo), resumen: comidaResumen(comida, elecciones, equipo), puede_crear: comidaPuedeCrear(req), yo });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/api/comida/:id', requireAuth, async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const yo = chatEmail(req);
+  try {
+    const comida = await comidaTraer(req.params.id);
+    if (!comida) return res.status(404).json({ error: 'No existe ese menu' });
+    const [elecciones, equipo] = await Promise.all([comidaEleccionesDe(comida.id), comidaEquipo()]);
+    res.json({ comida, mias: comidaMias(elecciones, yo), resumen: comidaResumen(comida, elecciones, equipo), puede_crear: comidaPuedeCrear(req), yo });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Elegir (cada uno lo suyo): { dia, eleccion } ; eleccion vacia = borrar
+app.put('/api/comida/:id/eleccion', requireAuth, async (req, res) => {
+  const yo = chatEmail(req); const b = req.body || {};
+  const dia = String(b.dia || '').trim(); const eleccion = String(b.eleccion || '').trim().slice(0, 160);
+  const nota = String(b.nota || '').trim().slice(0, 200) || null;
+  try {
+    const comida = await comidaTraer(req.params.id);
+    if (!comida) return res.status(404).json({ error: 'No existe ese menu' });
+    if (comida.estado !== 'abierta') return res.status(400).json({ error: 'El pedido ya se cerro' });
+    if (!(comida.dias || []).some(d => d.dia === dia)) return res.status(400).json({ error: 'Ese dia no esta en el menu' });
+    if (!eleccion) {
+      const { error } = await supabase.from('os_comidas_elecciones').delete().eq('comida_id', comida.id).eq('email', yo).eq('dia', dia);
+      if (error) return res.status(500).json({ error: comidaErrorTabla(error) });
+    } else {
+      const { error } = await supabase.from('os_comidas_elecciones').upsert({ comida_id: comida.id, email: yo, dia, eleccion, nota, actualizado: new Date().toISOString() }, { onConflict: 'comida_id,email,dia' });
+      if (error) return res.status(500).json({ error: comidaErrorTabla(error) });
+    }
+    const elecciones = await comidaEleccionesDe(comida.id);
+    res.json({ ok: true, mias: comidaMias(elecciones, yo) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Cerrar / reabrir (admin, encargado o quien lo creo)
+app.post('/api/comida/:id/estado', requireAuth, async (req, res) => {
+  const yo = chatEmail(req); const estado = String((req.body || {}).estado || '') === 'abierta' ? 'abierta' : 'cerrada';
+  try {
+    const comida = await comidaTraer(req.params.id);
+    if (!comida) return res.status(404).json({ error: 'No existe ese menu' });
+    if (!comidaPuedeCrear(req) && comida.creado_por !== yo) return res.status(403).json({ error: 'Sin permiso' });
+    const { error } = await supabase.from('os_comidas').update({ estado, cerrada: estado === 'cerrada' ? new Date().toISOString() : null }).eq('id', comida.id);
+    if (error) return res.status(500).json({ error: comidaErrorTabla(error) });
+    res.json({ ok: true, estado });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Cuadro para Excel: nombre x dia + totales por plato (CSV con BOM, lo abre Excel directo)
+app.get('/api/comida/:id/csv', requireAuth, async (req, res) => {
+  try {
+    const comida = await comidaTraer(req.params.id);
+    if (!comida) return res.status(404).json({ error: 'No existe ese menu' });
+    const [elecciones, equipo] = await Promise.all([comidaEleccionesDe(comida.id), comidaEquipo()]);
+    const r = comidaResumen(comida, elecciones, equipo);
+    const esc = v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+    const fechas = (comida.dias || []).map(d => d.fecha ? ' ' + comidaFechaCorta(d.fecha) : '');
+    const lineas = [];
+    lineas.push([esc(comida.titulo || 'Comida semanal')].join(';'));
+    lineas.push(['Nombre'].concat(r.dias.map((d, i) => d + fechas[i])).map(esc).join(';'));
+    r.filas.forEach(f => { lineas.push([f.email.split('@')[0]].concat(f.elecciones).map(esc).join(';')); });
+    lineas.push('');
+    lineas.push(['Totales por plato'].map(esc).join(';'));
+    r.totales.forEach(t => {
+      lineas.push([t.dia + ' (' + t.total + ')'].map(esc).join(';'));
+      t.items.forEach(it => lineas.push(['', it.eleccion, it.cantidad].map(esc).join(';')));
+    });
+    if (r.faltan.length) { lineas.push(''); lineas.push(['Sin elegir', r.faltan.map(e => e.split('@')[0]).join(', ')].map(esc).join(';')); }
+    res.set('Content-Type', 'text/csv; charset=utf-8');
+    res.set('Content-Disposition', 'attachment; filename="comida-' + String(comida.semana || comida.id) + '.csv"');
+    res.send('\uFEFF' + lineas.join('\r\n'));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
