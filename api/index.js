@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v40-abast', costo_congelado: true, pack_envio: true, chat: true, abastecimiento: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v41-abast', costo_congelado: true, pack_envio: true, chat: true, abastecimiento: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -193,7 +193,7 @@ const AB_MAX_SKU_RUN  = 400;     // tope de consultas individuales (solo en el p
 const AB_PAUSA_MS     = 1200;    // Contabilium devuelve 429 si se lo apura
 const AB_429_ESPERA_MS = 60 * 1000; // ante un 429: esperar un minuto y reintentar (hasta 3 veces)
 const AB_MIN_ENTRE_SYNC_MS = 20 * 60 * 1000;
-const AB_CADA_MS      = 6 * 60 * 60 * 1000;
+const AB_CADA_MS      = 8 * 60 * 60 * 1000;   // se actualiza solo cada 8 h (pedido de Agustin)
 const AB_TZ           = 'America/Argentina/Buenos_Aires';
 // Depositos que cuentan como stock vendible (definido por Agustin). Se comparan
 // por nombre sin acentos ni mayusculas; si getDepositos falla se usan los ids.
@@ -214,6 +214,50 @@ function abDiasEntre(desdeISO, hastaISO) {
 }
 // Ver: admin siempre; usuario con lista de apps -> tiene que estar tildada;
 // usuario sin lista (usa el rol por defecto) -> encargado si, operador no.
+// Un concepto esta inactivo en Contabilium si su Estado no es activo ('A', 'ACTIVO', true, '').
+function abInactivo(sku) {
+  const x = _contaExtra[sku]; if (!x) return false;
+  const e = String(x.estado || '').trim().toUpperCase();
+  if (e === '' || e === 'A' || e === 'ACTIVO' || e === 'TRUE' || e === '1') return false;
+  return true;
+}
+// Proveedores de Contabilium -> ab_proveedores (nombre + contabilium_id). El plazo se edita en el hub.
+async function cbProveedores(token) {
+  const out = []; let anterior = null;
+  for (let page = 1; page <= 60; page++) {
+    const j = await cbGet(token, '/api/proveedores/search?pageSize=50&pageNumber=' + page + '&page=' + page);
+    const items = cbItems(j); if (!items.length) break;
+    const primero = String(items[0].Id || items[0].id || '');
+    if (anterior !== null && primero === anterior) break;
+    anterior = primero;
+    items.forEach(p => { const n = String(p.RazonSocial || p.razonSocial || p.NombreFantasia || p.nombreFantasia || p.Nombre || '').trim(); if (n) out.push({ id: p.Id || p.id, nombre: n }); });
+    const total = Number(j && (j.TotalItems || j.totalItems) || 0);
+    if (total && out.length >= total) break;
+    if (items.length < 50 && !total) break;
+    await abSleep(AB_PAUSA_MS);
+  }
+  return out;
+}
+async function abSyncProveedores(token, res) {
+  try {
+    const lista = await cbProveedores(token);
+    if (!lista.length) { res.avisos.push('proveedores: Contabilium no devolvio ninguno'); return; }
+    const { data: actuales } = await supabase.from('ab_proveedores').select('id,nombre,contabilium_id');
+    const porNombre = {}, porCb = {};
+    (actuales || []).forEach(p => { porNombre[abNorm(p.nombre)] = p; if (p.contabilium_id) porCb[String(p.contabilium_id)] = p; });
+    let nuevos = 0;
+    for (const p of lista) {
+      if (porCb[String(p.id)]) continue;
+      const ya = porNombre[abNorm(p.nombre)];
+      const fila = ya ? { id: ya.id, nombre: ya.nombre, contabilium_id: p.id } : { nombre: p.nombre, dias_reposicion: AB_PLAZO_DEF, importado: false, contabilium_id: p.id };
+      let { error } = await supabase.from('ab_proveedores').upsert(fila, { onConflict: ya ? 'id' : 'nombre' });
+      if (error && /column|columna/i.test(error.message)) { delete fila.contabilium_id; ({ error } = await supabase.from('ab_proveedores').upsert(fila, { onConflict: ya ? 'id' : 'nombre' })); }
+      if (error) { res.avisos.push('proveedores: ' + error.message); break; }
+      if (!ya) nuevos++;
+    }
+    res.proveedores = { contabilium: lista.length, nuevos };
+  } catch (e) { res.avisos.push('proveedores: ' + e.message); }
+}
 function puedeAbast(req) {
   if (req.rol === 'admin') return true;
   if (Array.isArray(req.apps)) return req.apps.includes('abastecimiento');
@@ -349,6 +393,8 @@ async function abSincronizar(motivo) {
     const token = await getContabiliumToken();
     const deps = await cbDepositos(token);
     res.depositos = Object.values(deps.vendibles).concat(Object.values(deps.transito).map(n => n + ' (transito)'));
+    await contabiliumMapaCostos().catch(() => ({}));   // refresca estado/nombre de los conceptos (cache 6 h)
+    await abSyncProveedores(token, res);
     const porSku = {};
     const fila = sku => (porSku[sku] = porSku[sku] || { fecha: hoy, sku, stock: 0, reservado: 0, disponible: 0, en_transito: 0, detalle: {} });
     // 1) Plan A: por deposito
@@ -455,8 +501,9 @@ async function abResumen() {
     enCamino[s] = (enCamino[s] || 0) + (Number(i.cantidad) || 0);
   });
   const universo = new Set([...Object.keys(stock), ...Object.keys(ventas.porSku), ...Object.keys(prod)]);
-  const filas = [];
+  const filas = []; let inactivos = 0;
   universo.forEach(sku => {
+    if (abInactivo(sku)) { inactivos++; return; }   // inactivo en Contabilium: no aparece
     const st = stock[sku] || { stock: 0, reservado: 0, disponible: 0, en_transito: 0, fecha: null };
     const p = prod[sku] || {};
     const pv = p.proveedor_id ? prov[p.proveedor_id] : null;
@@ -477,8 +524,12 @@ async function abResumen() {
     const objetivo = faltan > 0 ? disponible / faltan : null;
     // Cuanto pedir para cubrir plazo + colchon (por ahora con la velocidad de ML)
     const pedir = velocidad > 0 ? Math.max(0, Math.ceil((plazo + AB_COLCHON_DIAS) * velocidad - disponible - transito)) : 0;
+    // Compra: se vende y esta sin stock (o no llega al plazo de reposicion). Si ya hay algo en camino, "llegando".
+    let compra = null;
+    if (vend > 0 && (disponible <= 0 || (cobertura !== null && cobertura < plazo))) compra = transito > 0 ? 'llegando' : 'recomprar';
+    const ex = _contaExtra[sku] || {};
     filas.push({
-      sku, nombre: ventas.titulo[sku] || '', proveedor: pv ? pv.nombre : null, proveedor_id: p.proveedor_id || null,
+      sku, nombre: ventas.titulo[sku] || ex.nombre || '', proveedor: pv ? pv.nombre : null, proveedor_id: p.proveedor_id || null, compra,
       stock: Number(st.stock || 0), reservado: Number(st.reservado || 0), disponible,
       en_transito: transito, detalle: st.detalle || null,
       stock_fecha: st.fecha || null, vendidas: vend, velocidad: Math.round(velocidad * 100) / 100,
@@ -497,7 +548,7 @@ async function abResumen() {
     const ra = a.ratio === null ? 999 : a.ratio, rb = b.ratio === null ? 999 : b.ratio;
     return ra - rb;
   });
-  return { hoy, ventana_dias: AB_VENTANA_ML, bandas: { baja: AB_BANDA_BAJA, alta: AB_BANDA_ALTA }, colchon_dias: AB_COLCHON_DIAS, ultima_sync: _abUltimaSync, filas };
+  return { hoy, ventana_dias: AB_VENTANA_ML, bandas: { baja: AB_BANDA_BAJA, alta: AB_BANDA_ALTA }, colchon_dias: AB_COLCHON_DIAS, inactivos, ultima_sync: _abUltimaSync, filas };
 }
 
 app.get('/api/abast/resumen', requireAuth, soloAbast, async (req, res) => {
@@ -604,6 +655,12 @@ app.get('/api/abast/diag', requireAuth, soloRoles('admin'), async (req, res) => 
       const j = await cbGet(token, '/api/inventarios/getStockByDeposito?id=' + dep + '&page=1&pageSize=5');
       out.porDeposito = { claves: Object.keys(j || {}), TotalItems: j.TotalItems, TotalPage: j.TotalPage, primeros: cbItems(j).slice(0, 3) };
     } catch (e) { out.porDeposito = { error: e.message }; }
+    try {
+      await contabiliumMapaCostos();
+      const estados = {}; Object.keys(_contaExtra).forEach(k => { if (k.startsWith('__')) return; const e = String(_contaExtra[k].estado); estados[e] = (estados[e] || 0) + 1; });
+      out.conceptos = { total: Object.keys(_contaExtra).length - 1, estados, claves: Object.keys(_contaExtra.__muestra || {}), muestra: _contaExtra.__muestra || null };
+    } catch (e) { out.conceptos = { error: e.message }; }
+    try { const j = await cbGet(token, '/api/proveedores/search?pageSize=3&pageNumber=1&page=1'); out.proveedores = { claves: Object.keys(j || {}), TotalItems: j.TotalItems, primeros: cbItems(j).slice(0, 2) }; } catch (e) { out.proveedores = { error: e.message }; }
     res.json(out);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -907,6 +964,7 @@ app.delete('/api/promos/quitar', requireAuth, soloPromos, async (req, res) => {
 // Cache de costos en memoria (6 hs): la primera corrida tarda ~1 min
 // porque recorre todo Contabilium; las siguientes son instantaneas.
 var _contaMapaCache = { ts: 0, mapa: null };
+var _contaExtra = {};   // codigo -> { estado, nombre, prov } (se llena junto con el mapa de costos)
 async function contabiliumMapaCostos() {
   const ahora = Date.now();
   if (_contaMapaCache.mapa && (ahora - _contaMapaCache.ts) < 6 * 60 * 60 * 1000) return _contaMapaCache.mapa;
@@ -927,6 +985,8 @@ async function contabiliumMapaCostos() {
     for (const x of it) {
       const c = String(x.Codigo || x.codigo || '').toUpperCase().trim();
       if (c && !(c in mapa)) { mapa[c] = Number(x.CostoInterno || x.costoInterno || 0); n++; }
+      if (c) _contaExtra[c] = { estado: String(x.Estado != null ? x.Estado : (x.estado != null ? x.estado : (x.Activo != null ? x.Activo : ''))), nombre: x.Nombre || x.nombre || '', prov: x.IdProveedor || x.idProveedor || x.ProveedorId || null };
+      if (!_contaExtra.__muestra && it.length) { _contaExtra.__muestra = it[0]; }
     }
     return { n, len: it.length };
   };
