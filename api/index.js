@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v41-abast', costo_congelado: true, pack_envio: true, chat: true, abastecimiento: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v42-abast', costo_congelado: true, pack_envio: true, chat: true, abastecimiento: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -216,7 +216,8 @@ function abDiasEntre(desdeISO, hastaISO) {
 // usuario sin lista (usa el rol por defecto) -> encargado si, operador no.
 // Un concepto esta inactivo en Contabilium si su Estado no es activo ('A', 'ACTIVO', true, '').
 function abInactivo(sku) {
-  const x = _contaExtra[sku]; if (!x) return false;
+  const x = _contaExtra[sku];
+  if (!x) return Object.keys(_contaExtra).length >= 500;   // el listado de Contabilium trae solo activos: si no esta, es inactivo
   const e = String(x.estado || '').trim().toUpperCase();
   if (e === '' || e === 'A' || e === 'ACTIVO' || e === 'TRUE' || e === '1') return false;
   return true;
@@ -240,8 +241,10 @@ async function cbProveedores(token) {
 }
 async function abSyncProveedores(token, res) {
   try {
-    const lista = await cbProveedores(token);
+    let lista = await cbProveedores(token);
     if (!lista.length) { res.avisos.push('proveedores: Contabilium no devolvio ninguno'); return; }
+    const usados = new Set(); Object.keys(_contaExtra).forEach(k => { if (!k.startsWith('__') && _contaExtra[k].prov) usados.add(String(_contaExtra[k].prov)); });
+    if (usados.size) lista = lista.filter(p => usados.has(String(p.id)));   // solo proveedores con productos cargados
     const { data: actuales } = await supabase.from('ab_proveedores').select('id,nombre,contabilium_id');
     const porNombre = {}, porCb = {};
     (actuales || []).forEach(p => { porNombre[abNorm(p.nombre)] = p; if (p.contabilium_id) porCb[String(p.contabilium_id)] = p; });
@@ -493,7 +496,8 @@ async function abResumen() {
   ]);
   const stock = {}; (stockRows || []).forEach(r => { if (!stock[r.sku]) stock[r.sku] = r; });
   const prod = {}; (prods || []).forEach(p => { prod[abSku(p.sku)] = p; });
-  const prov = {}; (provs || []).forEach(p => { prov[p.id] = p; });
+  const prov = {}, provCb = {}; (provs || []).forEach(p => { prov[p.id] = p; if (p.contabilium_id) provCb[String(p.contabilium_id)] = p; });
+  let foto = null; (stockRows || []).forEach(r => { if (!foto || r.fecha > foto) foto = r.fecha; });
   const eta = {}, enCamino = {};
   (ings || []).forEach(i => {
     if (/recib|cancel|anul/i.test(String(i.estado || ''))) return;
@@ -506,7 +510,8 @@ async function abResumen() {
     if (abInactivo(sku)) { inactivos++; return; }   // inactivo en Contabilium: no aparece
     const st = stock[sku] || { stock: 0, reservado: 0, disponible: 0, en_transito: 0, fecha: null };
     const p = prod[sku] || {};
-    const pv = p.proveedor_id ? prov[p.proveedor_id] : null;
+    const exc = _contaExtra[sku] || {};
+    const pv = p.proveedor_id ? prov[p.proveedor_id] : (exc.prov ? (provCb[String(exc.prov)] || null) : null);
     const plazo = Number(p.dias_reposicion || (pv && pv.dias_reposicion) || AB_PLAZO_DEF);
     const vend = Number(ventas.porSku[sku] || 0);
     const velocidad = vend / AB_VENTANA_ML;
@@ -548,7 +553,7 @@ async function abResumen() {
     const ra = a.ratio === null ? 999 : a.ratio, rb = b.ratio === null ? 999 : b.ratio;
     return ra - rb;
   });
-  return { hoy, ventana_dias: AB_VENTANA_ML, bandas: { baja: AB_BANDA_BAJA, alta: AB_BANDA_ALTA }, colchon_dias: AB_COLCHON_DIAS, inactivos, ultima_sync: _abUltimaSync, filas };
+  return { hoy, ventana_dias: AB_VENTANA_ML, bandas: { baja: AB_BANDA_BAJA, alta: AB_BANDA_ALTA }, colchon_dias: AB_COLCHON_DIAS, inactivos, foto, ultima_sync: _abUltimaSync, filas };
 }
 
 app.get('/api/abast/resumen', requireAuth, soloAbast, async (req, res) => {
@@ -985,7 +990,7 @@ async function contabiliumMapaCostos() {
     for (const x of it) {
       const c = String(x.Codigo || x.codigo || '').toUpperCase().trim();
       if (c && !(c in mapa)) { mapa[c] = Number(x.CostoInterno || x.costoInterno || 0); n++; }
-      if (c) _contaExtra[c] = { estado: String(x.Estado != null ? x.Estado : (x.estado != null ? x.estado : (x.Activo != null ? x.Activo : ''))), nombre: x.Nombre || x.nombre || '', prov: x.IdProveedor || x.idProveedor || x.ProveedorId || null };
+      if (c) _contaExtra[c] = { estado: String(x.Estado != null ? x.Estado : (x.estado != null ? x.estado : (x.Activo != null ? x.Activo : ''))), nombre: x.Nombre || x.nombre || '', prov: x.IDProveedor || x.IdProveedor || x.idProveedor || null };
       if (!_contaExtra.__muestra && it.length) { _contaExtra.__muestra = it[0]; }
     }
     return { n, len: it.length };
