@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v39-abast', costo_congelado: true, pack_envio: true, chat: true, abastecimiento: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v40-abast', costo_congelado: true, pack_envio: true, chat: true, abastecimiento: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -190,7 +190,9 @@ const AB_BANDA_ALTA   = 1.2;     // ratio > 1.2  -> sobra stock, poner descuento
 const AB_PLAZO_DEF    = 30;      // dias de reposicion si nadie cargo nada
 const AB_COLCHON_DIAS = 7;       // dias extra de seguridad al calcular cuanto pedir
 const AB_MAX_SKU_RUN  = 400;     // tope de consultas individuales (solo en el plan B)
-const AB_PAUSA_MS     = 250;
+const AB_PAUSA_MS     = 1200;    // Contabilium devuelve 429 si se lo apura
+const AB_429_ESPERA_MS = 60 * 1000; // ante un 429: esperar un minuto y reintentar (hasta 3 veces)
+const AB_MIN_ENTRE_SYNC_MS = 20 * 60 * 1000;
 const AB_CADA_MS      = 6 * 60 * 60 * 1000;
 const AB_TZ           = 'America/Argentina/Buenos_Aires';
 // Depositos que cuentan como stock vendible (definido por Agustin). Se comparan
@@ -230,11 +232,12 @@ function soloAbastEditar(req, res, next) {
 const abSleep = ms => new Promise(r => setTimeout(r, ms));
 
 // ── Contabilium ──────────────────────────────────────────────────
-async function cbGet(token, path) {
+async function cbGet(token, path, intento) {
   const r = await fetch('https://rest.contabilium.com' + path, { headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' } });
   const txt = await r.text();
   let j = null; try { j = JSON.parse(txt); } catch (e) { j = { _raw: txt.slice(0, 300) }; }
-  if (!r.ok) throw new Error('Contabilium ' + r.status + ' en ' + path.split('?')[0] + ': ' + (j && (j.Message || j.message || j._raw) || ''));
+  if (r.status === 429 && (intento || 0) < 3) { await abSleep(AB_429_ESPERA_MS); return cbGet(token, path, (intento || 0) + 1); }
+  if (!r.ok) { const err = new Error('Contabilium ' + r.status + ' en ' + path.split('?')[0] + ': ' + (j && (j.Message || j.message || j._raw) || '')); err.status = r.status; throw err; }
   return j;
 }
 function cbItems(j) { return Array.isArray(j) ? j : ((j && (j.Items || j.items || j.Data || j.data)) || []); }
@@ -349,21 +352,26 @@ async function abSincronizar(motivo) {
     const porSku = {};
     const fila = sku => (porSku[sku] = porSku[sku] || { fecha: hoy, sku, stock: 0, reservado: 0, disponible: 0, en_transito: 0, detalle: {} });
     // 1) Plan A: por deposito
-    let leidos = 0;
+    let leidos = 0, limitado = false;
     for (const id of Object.keys(deps.vendibles)) {
+      if (limitado) break;
       try {
         const lista = await cbStockDeposito(token, id); leidos += lista.length;
         lista.forEach(n => { if (!n.stock && !n.reservado) return; const f = fila(n.sku); f.stock += n.stock; f.reservado += n.reservado; f.disponible += n.disponible; f.detalle[deps.vendibles[id]] = { stock: n.stock, reservado: n.reservado, disponible: n.disponible }; });
-      } catch (e) { res.errores.push(deps.vendibles[id] + ': ' + e.message); }
+      } catch (e) { res.errores.push(deps.vendibles[id] + ': ' + e.message); if (e.status === 429) limitado = true; }
       await abSleep(AB_PAUSA_MS);
     }
     for (const id of Object.keys(deps.transito)) {
+      if (limitado) break;
       try {
         const lista = await cbStockDeposito(token, id); leidos += lista.length;
         lista.forEach(n => { if (!n.stock) return; const f = fila(n.sku); f.en_transito += n.stock; f.detalle[deps.transito[id]] = { stock: n.stock, reservado: 0, disponible: n.stock }; });
-      } catch (e) { res.errores.push(deps.transito[id] + ': ' + e.message); }
+      } catch (e) { res.errores.push(deps.transito[id] + ': ' + e.message); if (e.status === 429) limitado = true; }
     }
-    // 2) Plan B: si por deposito no vino nada, SKU por SKU (universo = costos + ventas + reglas)
+    // Si Contabilium nos frena (429) o un deposito fallo, NO guardamos una foto incompleta
+    // (quedaria stock en cero para medio catalogo) y no insistimos con el plan B.
+    if (limitado || (leidos && res.errores.length)) throw new Error(limitado ? 'Contabilium limito las consultas (429): se reintenta en la proxima corrida' : 'Sincronizacion incompleta, no se guardo: ' + res.errores[0]);
+    // 2) Plan B: si por deposito no vino nada (endpoint caido), SKU por SKU (universo = costos + ventas + reglas)
     if (!leidos) {
       res.plan = 'B';
       const mapaCostos = await contabiliumMapaCostos().catch(() => ({}));
@@ -374,7 +382,7 @@ async function abSincronizar(motivo) {
       for (const sku of universo) {
         if (pedidos >= AB_MAX_SKU_RUN) { res.faltantes++; continue; }
         try { const s = await cbStockSku(token, sku, deps); Object.assign(fila(sku), s); pedidos++; await abSleep(AB_PAUSA_MS); }
-        catch (e) { res.errores.push(sku + ': ' + e.message); if (res.errores.length > 30) break; }
+        catch (e) { res.errores.push(sku + ': ' + e.message); if (e.status === 429) throw new Error('Contabilium limito las consultas (429): se reintenta en la proxima corrida'); if (res.errores.length > 30) break; }
       }
       res.individuales = pedidos;
     }
@@ -416,7 +424,14 @@ async function abSincronizar(motivo) {
   }
   return _abUltimaSync;
 }
-setTimeout(() => { abSincronizar('arranque').catch(() => {}); }, 2 * 60 * 1000);
+// Al arrancar (cada deploy reinicia el proceso) solo sincroniza si todavia no hay foto de hoy:
+// asi varios deploys seguidos no le pegan a Contabilium 300 veces cada uno.
+setTimeout(async () => {
+  try {
+    const { data } = await supabase.from('ab_stock_dia').select('fecha').eq('fecha', abHoy()).limit(1);
+    if (!data || !data.length) abSincronizar('arranque').catch(() => {});
+  } catch (e) {}
+}, 5 * 60 * 1000);
 setInterval(() => { abSincronizar('auto').catch(() => {}); }, AB_CADA_MS);
 
 // ── Resumen: la tabla maestra con el calculo ──────────────────────
@@ -497,7 +512,13 @@ app.get('/api/abast/resumen', requireAuth, soloAbast, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.post('/api/abast/sincronizar', requireAuth, soloAbastEditar, async (req, res) => {
-  try { res.json(await abSincronizar('manual')); } catch (e) { res.status(500).json({ error: e.message }); }
+  try {
+    const hace = _abUltimaSync && _abUltimaSync.ok ? Date.now() - new Date(_abUltimaSync.cuando).getTime() : Infinity;
+    if (hace < AB_MIN_ENTRE_SYNC_MS && !(req.rol === 'admin' && req.query.forzar === '1')) {
+      return res.json({ ok: false, error: 'Ya se sincronizo hace ' + Math.round(hace / 60000) + ' min. Para no saturar Contabilium, espera ' + Math.ceil((AB_MIN_ENTRE_SYNC_MS - hace) / 60000) + ' min.', ultima_sync: _abUltimaSync });
+    }
+    res.json(await abSincronizar('manual'));
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.get('/api/abast/estado', requireAuth, soloAbast, (req, res) => {
   res.set('Cache-Control', 'no-store');
