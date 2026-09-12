@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v43-comida', costo_congelado: true, pack_envio: true, chat: true, abastecimiento: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v44-historial', costo_congelado: true, pack_envio: true, chat: true, abastecimiento: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -487,7 +487,7 @@ setInterval(() => { abSincronizar('auto').catch(() => {}); }, AB_CADA_MS);
 async function abResumen() {
   const hoy = abHoy();
   const [{ data: stockRows }, { data: prods }, { data: provs }, { data: ings }, ventas, costos] = await Promise.all([
-    supabase.from('ab_stock_dia').select('*').order('fecha', { ascending: false }).limit(20000),
+    abStockUltimaFoto(),   // v44: solo la ultima foto, paginada (Supabase corta en 1000 filas)
     supabase.from('ab_productos').select('*'),
     supabase.from('ab_proveedores').select('*'),
     supabase.from('ab_ingresos').select('sku,orden,cantidad,fecha_eta,fecha_etd,estado').gte('fecha_eta', hoy).order('fecha_eta', { ascending: true }),
@@ -831,6 +831,133 @@ app.get('/api/comida/:id/csv', requireAuth, async (req, res) => {
     res.set('Content-Type', 'text/csv; charset=utf-8');
     res.set('Content-Disposition', 'attachment; filename="comida-' + String(comida.semana || comida.id) + '.csv"');
     res.send('\uFEFF' + lineas.join('\r\n'));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══ ABAST v44: vistas configurables (urgente / criticos / sobrestock) + historial por SKU ══
+// Tabla ab_config: clave text pk, valor jsonb, actualizado timestamptz, por text.
+// Las vistas se calculan en el hub con estos umbrales (dias); aca solo se guardan.
+const AB_VISTAS_DEF = { urgente_dias: 30, criticos_dias: 90, sobrestock_dias: 180 };
+let _abConfigCache = { ts: 0, valor: null };
+function abVistasLimpiar(v) {
+  const out = {};
+  Object.keys(AB_VISTAS_DEF).forEach(k => { const n = parseInt((v || {})[k], 10); if (n >= 1 && n <= 3650) out[k] = n; });
+  return out;
+}
+async function abConfigLeer() {
+  if (_abConfigCache.valor && Date.now() - _abConfigCache.ts < 60 * 1000) return _abConfigCache.valor;
+  let vistas = Object.assign({}, AB_VISTAS_DEF);
+  try {
+    const { data, error } = await supabase.from('ab_config').select('clave,valor').eq('clave', 'vistas').maybeSingle();
+    if (!error && data && data.valor) vistas = Object.assign(vistas, abVistasLimpiar(data.valor));
+  } catch (e) {}
+  _abConfigCache = { ts: Date.now(), valor: { vistas } };
+  return _abConfigCache.valor;
+}
+app.get('/api/abast/config', requireAuth, soloAbast, async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try { res.json(Object.assign({}, await abConfigLeer(), { defaults: AB_VISTAS_DEF, puede_editar: puedeAbastEditar(req) })); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.put('/api/abast/config', requireAuth, soloAbastEditar, async (req, res) => {
+  const b = req.body || {};
+  const vistas = Object.assign({}, AB_VISTAS_DEF, abVistasLimpiar(b.vistas || b));
+  const { error } = await supabase.from('ab_config').upsert({ clave: 'vistas', valor: vistas, actualizado: new Date().toISOString(), por: chatEmail(req) }, { onConflict: 'clave' });
+  if (error) return res.status(500).json({ error: /schema cache|does not exist|ab_config/i.test(error.message) ? 'Falta crear la tabla ab_config en Supabase' : error.message });
+  _abConfigCache = { ts: 0, valor: null };
+  res.json({ ok: true, vistas });
+});
+
+// Ultima foto completa de stock: primero la fecha mas nueva y despues todas sus filas,
+// paginado (Supabase corta en 1000 filas; el catalogo ya pasa las 800).
+async function abStockUltimaFoto() {
+  const { data: ult } = await supabase.from('ab_stock_dia').select('fecha').order('fecha', { ascending: false }).limit(1);
+  const foto = ult && ult[0] ? ult[0].fecha : null;
+  if (!foto) return { data: [] };
+  const out = []; let offset = 0;
+  while (true) {
+    const { data, error } = await supabase.from('ab_stock_dia').select('*').eq('fecha', foto).order('sku').range(offset, offset + 999);
+    if (error) throw new Error('ab_stock_dia: ' + error.message);
+    out.push(...(data || []));
+    if (!data || data.length < 1000) break;
+    offset += 1000; if (offset > 20000) break;
+  }
+  return { data: out };
+}
+
+// Historial por SKU: ventas por dia (tabla ventas, todo lo que haya) + foto de stock por dia
+// (ab_stock_dia, desde que existe Abastecimiento). Venta perdida estimada por quiebre =
+// dias sin stock x velocidad de los dias con stock (del mismo mes; si el mes tiene pocos
+// dias con stock, la del periodo entero).
+async function abHistorialSku(sku, desde, hasta) {
+  const ventasDia = {}, ordenesDia = {};
+  let offset = 0;
+  while (true) {
+    const { data, error } = await supabase.from('ventas').select('sku,unidades,estado,fecha').ilike('sku', sku).gte('fecha', desde).order('fecha', { ascending: true }).range(offset, offset + 999);
+    if (error) throw new Error('ventas: ' + error.message);
+    (data || []).forEach(v => {
+      if (abSku(v.sku) !== sku || /cancel/i.test(String(v.estado || ''))) return;
+      const f = String(v.fecha || '').slice(0, 10); if (!f) return;
+      ventasDia[f] = (ventasDia[f] || 0) + (Number(v.unidades) || 0); ordenesDia[f] = (ordenesDia[f] || 0) + 1;
+    });
+    if (!data || data.length < 1000) break;
+    offset += 1000; if (offset > 50000) break;
+  }
+  const stockDia = {};
+  offset = 0;
+  while (true) {
+    const { data, error } = await supabase.from('ab_stock_dia').select('fecha,stock,disponible,en_transito').eq('sku', sku).gte('fecha', desde).order('fecha', { ascending: true }).range(offset, offset + 999);
+    if (error) throw new Error('ab_stock_dia: ' + error.message);
+    (data || []).forEach(r => { stockDia[String(r.fecha).slice(0, 10)] = { disponible: Number(r.disponible || 0), stock: Number(r.stock || 0), en_transito: Number(r.en_transito || 0) }; });
+    if (!data || data.length < 1000) break;
+    offset += 1000; if (offset > 20000) break;
+  }
+  let primeraVenta = null, primeraFoto = null;
+  try {
+    const { data: pv } = await supabase.from('ventas').select('sku,fecha').ilike('sku', sku).order('fecha', { ascending: true }).limit(5);
+    (pv || []).forEach(v => { if (abSku(v.sku) === sku && !primeraVenta) primeraVenta = String(v.fecha || '').slice(0, 10); });
+    const { data: pf } = await supabase.from('ab_stock_dia').select('fecha').eq('sku', sku).order('fecha', { ascending: true }).limit(1);
+    primeraFoto = pf && pf[0] ? String(pf[0].fecha).slice(0, 10) : null;
+  } catch (e) {}
+  const dias = [];
+  for (let d = new Date(desde + 'T00:00:00Z'), fin = new Date(hasta + 'T00:00:00Z'); d <= fin; d.setUTCDate(d.getUTCDate() + 1)) {
+    const f = d.toISOString().slice(0, 10); const st = stockDia[f] || null;
+    dias.push({ fecha: f, vendidas: ventasDia[f] || 0, ordenes: ordenesDia[f] || 0, disponible: st ? st.disponible : null, en_transito: st ? st.en_transito : null });
+  }
+  const porMes = {};
+  dias.forEach(x => {
+    const m = x.fecha.slice(0, 7);
+    const o = porMes[m] = porMes[m] || { mes: m, vendidas: 0, ordenes: 0, dias: 0, dias_con_foto: 0, dias_con_stock: 0, dias_sin_stock: 0, vendidas_con_stock: 0 };
+    o.vendidas += x.vendidas; o.ordenes += x.ordenes; o.dias++;
+    if (x.disponible !== null) { o.dias_con_foto++; if (x.disponible > 0) { o.dias_con_stock++; o.vendidas_con_stock += x.vendidas; } else o.dias_sin_stock++; }
+  });
+  const meses = Object.values(porMes).sort((a, b) => a.mes.localeCompare(b.mes));
+  const totConStock = meses.reduce((t, m) => t + m.dias_con_stock, 0), totVendConStock = meses.reduce((t, m) => t + m.vendidas_con_stock, 0);
+  const velPeriodo = totConStock > 0 ? totVendConStock / totConStock : 0;
+  meses.forEach(m => {
+    const vel = m.dias_con_stock >= 5 ? m.vendidas_con_stock / m.dias_con_stock : velPeriodo;
+    m.velocidad_con_stock = Math.round(vel * 100) / 100;
+    m.venta_perdida_est = Math.round(m.dias_sin_stock * vel);
+  });
+  const totales = {
+    vendidas: meses.reduce((t, m) => t + m.vendidas, 0),
+    ordenes: meses.reduce((t, m) => t + m.ordenes, 0),
+    dias_con_foto: meses.reduce((t, m) => t + m.dias_con_foto, 0),
+    dias_sin_stock: meses.reduce((t, m) => t + m.dias_sin_stock, 0),
+    venta_perdida_est: meses.reduce((t, m) => t + m.venta_perdida_est, 0),
+    velocidad_con_stock: Math.round(velPeriodo * 100) / 100
+  };
+  return { sku, desde, hasta, primera_venta: primeraVenta, primera_foto: primeraFoto, meses, totales, dias };
+}
+app.get('/api/abast/historial/:sku', requireAuth, soloAbast, async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try {
+    const sku = abSku(req.params.sku); if (!sku) return res.status(400).json({ error: 'Falta el SKU' });
+    const hasta = abHoy();
+    const meses = Math.min(36, Math.max(1, parseInt(req.query.meses, 10) || 13));
+    const d = new Date(hasta + 'T00:00:00Z'); d.setUTCDate(1); d.setUTCMonth(d.getUTCMonth() - (meses - 1));
+    const desde = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.desde || '')) ? String(req.query.desde) : d.toISOString().slice(0, 10);
+    res.json(await abHistorialSku(sku, desde, hasta));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
