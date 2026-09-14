@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v46-combos', costo_congelado: true, pack_envio: true, chat: true, abastecimiento: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v47-temporada', costo_congelado: true, pack_envio: true, chat: true, abastecimiento: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -564,13 +564,13 @@ async function abResumen() {
     const ra = a.ratio === null ? 999 : a.ratio, rb = b.ratio === null ? 999 : b.ratio;
     return ra - rb;
   });
-  return { hoy, ventana_dias: AB_VENTANA_ML, bandas: { baja: AB_BANDA_BAJA, alta: AB_BANDA_ALTA }, colchon_dias: AB_COLCHON_DIAS, inactivos, foto, ultima_sync: _abUltimaSync, filas };
+  return { hoy, ventana_dias: AB_VENTANA_ML, bandas: { baja: AB_BANDA_BAJA, alta: AB_BANDA_ALTA }, colchon_dias: AB_COLCHON_DIAS, inactivos, foto, ultima_sync: _abUltimaSync, enriquecido: !!mesCache, filas };
 }
 
 app.get('/api/abast/resumen', requireAuth, soloAbast, async (req, res) => {
   res.set('Cache-Control', 'no-store');
   try {
-    if (!_abUltimoResumen || (Date.now() - _abUltimoResumen.ts) > 5 * 60 * 1000 || req.query.fresco === '1') {
+    if (!_abUltimoResumen || (Date.now() - _abUltimoResumen.ts) > 5 * 60 * 1000 || req.query.fresco === '1' || !_abUltimoResumen.datos.enriquecido) {   // v47: sin cache mensual no se guarda (arranque en frio)
       _abUltimoResumen = { ts: Date.now(), datos: await abResumen() };
     }
     const d = _abUltimoResumen.datos;
@@ -1164,12 +1164,12 @@ function abSugerirPrecio(x, pm, reglas, ctx) {
   else if (r >= 0.6) { accion = 'mantener'; motivo = 'stock y ventas equilibrados (' + cobTxt + ')'; }
   else if (r >= 0.25) { accion = 'sacar_descuento'; motivo = 'falta stock (' + cobTxt + '): sacar promos y no bajar precio'; }
   else { accion = 'subir'; tier = (ctx.urgencia === 'ya' && cobDias <= 7) ? 10 : 5; motivo = 'se queda sin stock antes de reponer (' + cobTxt + '): subir el precio para estirar la cobertura'; }
-  // v46: temporada por empezar. Si el pico viene en los proximos 3 meses, no conviene bajar ni liquidar todavia
+  // v46/v47: temporada por empezar. Si el pico viene en los proximos 4 meses (y hoy no vende, o su salto estacional es fuerte), no bajar ni liquidar todavia
   if ((accion === 'bajar' || accion === 'liquidar') && ctx.est && /estacional|poca historia/.test(String(ctx.est.tipo || '')) && ctx.hoy && (Number(ctx.ventas_12m) || 0) > 0) {
     const mHoy = abMesNum(ctx.hoy), pico = Number(ctx.est.pico) || 0, idx = ctx.est.idx || {};
     const dist = ((pico - mHoy) + 12) % 12;
     const salto = pico && idx[pico] && idx[mHoy] ? idx[pico] / idx[mHoy] : 1;
-    if (dist >= 1 && dist <= 3 && salto >= 1.5) {
+    if (dist >= 1 && dist <= 4 && (vend === 0 || salto >= 1.5)) {
       let revisar = abRestarMeses(abMesDe(ctx.hoy), -(dist - 1)) + '-01';   // primer dia del mes anterior al pico
       if (revisar <= ctx.hoy) revisar = abSumarDias(ctx.hoy, 15);
       accion = 'esperar'; tier = 0; out.revisar = revisar;
