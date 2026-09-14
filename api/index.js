@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v44-historial', costo_congelado: true, pack_envio: true, chat: true, abastecimiento: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v45-plan', costo_congelado: true, pack_envio: true, chat: true, abastecimiento: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -349,10 +349,10 @@ async function cbStockSku(token, sku, deps) {
 // ── Ventas de ML por SKU (tabla ventas, ya sincronizada) ─────────
 async function abVentasML(dias) {
   const desde = new Date(Date.now() - dias * 86400000).toISOString();
-  const porSku = {}, titulo = {};
+  const porSku = {}, titulo = {}, monto = {};
   let offset = 0;
   while (true) {
-    const { data, error } = await supabase.from('ventas').select('sku,unidades,estado,titulo,fecha')
+    const { data, error } = await supabase.from('ventas').select('sku,unidades,estado,titulo,fecha,precio')
       .gte('fecha', desde).order('fecha', { ascending: false }).range(offset, offset + 999);
     if (error) throw new Error('ventas: ' + error.message);
     (data || []).forEach(v => {
@@ -360,11 +360,12 @@ async function abVentasML(dias) {
       const s = abSku(v.sku); if (!s) return;
       porSku[s] = (porSku[s] || 0) + (Number(v.unidades) || 0);
       if (!titulo[s] && v.titulo) titulo[s] = v.titulo;
+      monto[s] = (monto[s] || 0) + (Number(v.precio) || 0);   // facturado con IVA (lo que pago el comprador)
     });
     if (!data || data.length < 1000) break;
     offset += 1000; if (offset > 200000) break;
   }
-  return { porSku, titulo };
+  return { porSku, titulo, monto };
 }
 
 // Guarda la foto del dia. Si la tabla todavia no tiene las columnas nuevas
@@ -469,6 +470,7 @@ async function abSincronizar(motivo) {
     res.segundos = Math.round((Date.now() - inicio) / 1000);
     _abUltimaSync = Object.assign({ cuando: new Date().toISOString() }, res);
     _abUltimoResumen = null;
+    abVentasMesCache(true).catch(() => {});
     console.log('[ABAST] sync', JSON.stringify(_abUltimaSync).slice(0, 500));
   }
   return _abUltimaSync;
@@ -486,13 +488,15 @@ setInterval(() => { abSincronizar('auto').catch(() => {}); }, AB_CADA_MS);
 // ── Resumen: la tabla maestra con el calculo ──────────────────────
 async function abResumen() {
   const hoy = abHoy();
-  const [{ data: stockRows }, { data: prods }, { data: provs }, { data: ings }, ventas, costos] = await Promise.all([
+  const [{ data: stockRows }, { data: prods }, { data: provs }, { data: ings }, ventas, costos, mesCache, cfgV] = await Promise.all([
     abStockUltimaFoto(),   // v44: solo la ultima foto, paginada (Supabase corta en 1000 filas)
     supabase.from('ab_productos').select('*'),
     supabase.from('ab_proveedores').select('*'),
     supabase.from('ab_ingresos').select('sku,orden,cantidad,fecha_eta,fecha_etd,estado').gte('fecha_eta', hoy).order('fecha_eta', { ascending: true }),
     abVentasML(AB_VENTANA_ML),
-    contabiliumMapaCostos().catch(() => ({}))
+    contabiliumMapaCostos().catch(() => ({})),
+    abVentasMesCache().catch(e => { console.log('[ABAST] cache mensual: ' + e.message); return null; }),
+    abConfigLeer().catch(() => ({ vistas: {} }))
   ]);
   const stock = {}; (stockRows || []).forEach(r => { if (!stock[r.sku]) stock[r.sku] = r; });
   const prod = {}; (prods || []).forEach(p => { prod[abSku(p.sku)] = p; });
@@ -546,9 +550,11 @@ async function abResumen() {
       pedir, accion, costo: Number(costos[sku] || 0) || null,
       margen_minimo_pct: p.margen_minimo_pct != null ? Number(p.margen_minimo_pct) : null,
       descuento_max_pct: p.descuento_max_pct != null ? Number(p.descuento_max_pct) : null,
-      activo: p.activo !== false, notas: p.notas || null
+      activo: p.activo !== false, notas: p.notas || null,
+      facturado: Math.round((ventas.monto || {})[sku] || 0)
     });
   });
+  if (mesCache) { try { abEnriquecerFilas(mesCache, filas, ings, hoy, cfgV && cfgV.vistas); } catch (e) { console.log('[ABAST] enriquecer: ' + e.message); } }
   filas.sort((a, b) => {
     const ra = a.ratio === null ? 999 : a.ratio, rb = b.ratio === null ? 999 : b.ratio;
     return ra - rb;
@@ -563,7 +569,9 @@ app.get('/api/abast/resumen', requireAuth, soloAbast, async (req, res) => {
       _abUltimoResumen = { ts: Date.now(), datos: await abResumen() };
     }
     const d = _abUltimoResumen.datos;
-    if (req.rol === 'operador') d.filas.forEach(f => { delete f.costo; });
+    if (req.rol === 'operador') {   // copia sin costos/margenes (antes se borraba del cache y el admin dejaba de verlos)
+      return res.json(Object.assign({}, d, { filas: d.filas.map(f => { const g = Object.assign({}, f); delete g.costo; delete g.margen_pct; delete g.costo_venta_u; if (g.sugerencia) g.sugerencia = Object.assign({}, g.sugerencia, { margen_pct: null, margen_sug_pct: null }); return g; }) }));
+    }
     res.json(d);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -837,7 +845,7 @@ app.get('/api/comida/:id/csv', requireAuth, async (req, res) => {
 // ══ ABAST v44: vistas configurables (urgente / criticos / sobrestock) + historial por SKU ══
 // Tabla ab_config: clave text pk, valor jsonb, actualizado timestamptz, por text.
 // Las vistas se calculan en el hub con estos umbrales (dias); aca solo se guardan.
-const AB_VISTAS_DEF = { urgente_dias: 30, criticos_dias: 90, sobrestock_dias: 180 };
+const AB_VISTAS_DEF = { urgente_dias: 30, criticos_dias: 90, sobrestock_dias: 180, compra_dias: 60 };
 let _abConfigCache = { ts: 0, valor: null };
 function abVistasLimpiar(v) {
   const out = {};
@@ -957,9 +965,278 @@ app.get('/api/abast/historial/:sku', requireAuth, soloAbast, async (req, res) =>
     const meses = Math.min(36, Math.max(1, parseInt(req.query.meses, 10) || 13));
     const d = new Date(hasta + 'T00:00:00Z'); d.setUTCDate(1); d.setUTCMonth(d.getUTCMonth() - (meses - 1));
     const desde = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.desde || '')) ? String(req.query.desde) : d.toISOString().slice(0, 10);
-    res.json(await abHistorialSku(sku, desde, hasta));
+    res.json(await abHistorialSkuV2(sku, desde, hasta));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+// ══ ABAST v45: facturado, estacionalidad, plan de compra y sugerencia de precio ══
+// Fuente: vistas ab_ventas_mes_v / ab_ventas_dia_v (ventas de ML agrupadas, sin canceladas,
+// fecha en hora Argentina). Cache en memoria 6 h; se refresca tambien en cada sync.
+const AB_MES_CACHE_MS = 6 * 60 * 60 * 1000;
+const AB_HORIZONTE_DIAS = 400;          // hasta donde se simula el stock
+const AB_TRANSITO_SIN_FECHA_DIAS = 7;   // "pendiente de recepcion" sin fecha: se asume que entra en una semana
+const AB_MESES_NOMBRE = ['ene', 'feb', 'mar', 'abr', 'may', 'jun', 'jul', 'ago', 'sep', 'oct', 'nov', 'dic'];
+let _abMes = { ts: 0, porSku: {}, global: {}, meses: [] };
+
+function abMesDe(iso) { return String(iso || '').slice(0, 7); }
+function abMesNum(mes) { return parseInt(String(mes).slice(5, 7), 10); }   // 'YYYY-MM' -> 1..12
+function abSumarDias(iso, n) { const d = new Date(iso + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); }
+function abRestarMeses(mes, n) { const d = new Date(mes + '-01T00:00:00Z'); d.setUTCMonth(d.getUTCMonth() - n); return d.toISOString().slice(0, 7); }
+
+async function abVentasMesCache(forzar) {
+  if (!forzar && _abMes.ts && Date.now() - _abMes.ts < AB_MES_CACHE_MS) return _abMes;
+  const porSku = {}, global = {}, mesesSet = new Set();
+  let offset = 0;
+  while (true) {
+    const { data, error } = await supabase.from('ab_ventas_mes_v').select('*').order('mes').order('sku').range(offset, offset + 999);
+    if (error) throw new Error('ab_ventas_mes_v: ' + error.message + ' (hay que crear la vista en Supabase)');
+    (data || []).forEach(r => {
+      const s = abSku(r.sku), m = String(r.mes); if (!s || !m) return;
+      const fila = { u: Number(r.unidades) || 0, monto: Number(r.monto) || 0, ordenes: Number(r.ordenes) || 0, comision: Number(r.comision) || 0, envio: Number(r.envio) || 0, costo: Number(r.costo) || 0, envio_comprador: Number(r.envio_comprador) || 0, financiero: Number(r.financiero) || 0 };
+      (porSku[s] = porSku[s] || {})[m] = fila;
+      const g = global[m] = global[m] || { u: 0, monto: 0, skus: 0 };
+      g.u += fila.u; g.monto += fila.monto; g.skus++;
+      mesesSet.add(m);
+    });
+    if (!data || data.length < 1000) break;
+    offset += 1000; if (offset > 100000) break;
+  }
+  _abMes = { ts: Date.now(), porSku, global, meses: Array.from(mesesSet).sort() };
+  return _abMes;
+}
+
+// Indice estacional por mes calendario (1..12). Mezcla el del producto con el global
+// segun cuantas observaciones tenga el producto en ese mes.
+function abIndiceGlobal(cache, hastaMes) {
+  // Se descarta el mes en curso (incompleto) y se usan hasta 24 meses cerrados.
+  // El negocio viene creciendo, asi que primero se saca la tendencia (recta sobre el log
+  // de las unidades) y el indice es lo que queda: real / tendencia.
+  const meses = cache.meses.filter(m => m < hastaMes && cache.global[m] && cache.global[m].u > 0).slice(-24);
+  const n = meses.length;
+  const idx = {}; for (let c = 1; c <= 12; c++) idx[c] = 1;
+  if (n < 6) return { idx, meses: n, tendencia_mensual_pct: 0 };
+  const ys = meses.map(m => Math.log(cache.global[m].u));
+  let sx = 0, sy = 0, sxx = 0, sxy = 0;
+  ys.forEach((y, i) => { sx += i; sy += y; sxx += i * i; sxy += i * y; });
+  const b = (n * sxy - sx * sy) / (n * sxx - sx * sx || 1), a = (sy - b * sx) / n;
+  const porCal = {};
+  meses.forEach((m, i) => { const ratio = cache.global[m].u / Math.exp(a + b * i); const c = abMesNum(m); (porCal[c] = porCal[c] || []).push(ratio); });
+  let suma = 0;
+  for (let c = 1; c <= 12; c++) { const arr = porCal[c] || []; idx[c] = arr.length ? arr.reduce((x, y) => x + y, 0) / arr.length : 1; suma += idx[c]; }
+  for (let c = 1; c <= 12; c++) idx[c] = idx[c] * 12 / suma;
+  return { idx, meses: n, tendencia_mensual_pct: Math.round((Math.exp(b) - 1) * 1000) / 10 };
+}
+function abEstacionalidadSku(cache, sku, hastaMes) {
+  const g = abIndiceGlobal(cache, hastaMes);
+  const hist = cache.porSku[sku] || {};
+  const meses = Object.keys(hist).filter(m => m < hastaMes && hist[m].u > 0).sort().slice(-24);
+  const porCal = {}; let total = 0;
+  meses.forEach(m => { const c = abMesNum(m); (porCal[c] = porCal[c] || []).push(hist[m].u); total += hist[m].u; });
+  const media = meses.length ? total / meses.length : 0;
+  const propio = {}, idx = {}; let suma = 0, sumaP = 0, nP = 0;
+  const pesoGlobal = meses.length >= 9 ? 1 : 2;   // con buena historia manda el producto
+  for (let c = 1; c <= 12; c++) {
+    const arr = porCal[c] || [];
+    const pr = arr.length && media ? (arr.reduce((a, b) => a + b, 0) / arr.length) / media : null;
+    if (pr !== null) { propio[c] = pr; sumaP += pr; nP++; }
+    const v = pr === null ? g.idx[c] : (arr.length * pr + pesoGlobal * g.idx[c]) / (arr.length + pesoGlobal);
+    idx[c] = v; suma += v;
+  }
+  for (let c = 1; c <= 12; c++) idx[c] = suma ? Math.round(idx[c] * 12 / suma * 100) / 100 : 1;   // normalizado: promedio 1
+  let pico = 1, valle = 1;
+  for (let c = 1; c <= 12; c++) { if (idx[c] > idx[pico]) pico = c; if (idx[c] < idx[valle]) valle = c; }
+  const amplitud = idx[valle] > 0 ? idx[pico] / idx[valle] : 9;
+  // el tipo se decide con la historia PROPIA del producto (el global siempre tiene picos)
+  let tipo = 'sin datos', ampPropia = null;
+  if (nP) { const vals = Object.values(propio); ampPropia = Math.min(...vals) > 0 ? Math.max(...vals) / Math.min(...vals) : 9; }
+  if (meses.length >= 9) tipo = ampPropia >= 2 ? 'estacional' : (ampPropia < 1.4 ? 'estable' : 'algo estacional');
+  else if (meses.length >= 4) tipo = 'poca historia';
+  return { idx, tipo, pico, valle, amplitud: Math.round(amplitud * 100) / 100, amplitud_propia: ampPropia === null ? null : Math.round(ampPropia * 100) / 100, meses_con_ventas: meses.length, media_mensual: Math.round(media), basado_en: meses.length >= 9 ? 'producto + global' : (meses.length ? 'mas global que producto' : 'global'), tendencia_global_pct: g.tendencia_mensual_pct };
+}
+
+// Simulacion dia a dia: cuando se queda sin stock, cuando hay que pedir y cuanto.
+function abPlanSku(est, opts) {
+  const hoy = opts.hoy, velocidad = Number(opts.velocidad) || 0, plazo = Math.max(1, Number(opts.plazo) || 30);
+  const compraDias = Math.max(7, Number(opts.compra_dias) || 60), colchon = Number(opts.colchon) || 7;
+  const idxHoy = Math.max(0.3, est.idx[abMesNum(hoy)] || 1);
+  const base = velocidad / idxHoy;                       // velocidad "desestacionalizada"
+  const llegadas = {};                                   // fecha -> unidades
+  (opts.ingresos || []).forEach(i => { if (/recib|cancel|anul/i.test(String(i.estado || ''))) return; const f = String(i.fecha_eta || '').slice(0, 10); if (!f) return; const ff = f < hoy ? hoy : f; llegadas[ff] = (llegadas[ff] || 0) + (Number(i.cantidad) || 0); });
+  if (opts.transito_sin_fecha > 0) { const f = abSumarDias(hoy, AB_TRANSITO_SIN_FECHA_DIAS); llegadas[f] = (llegadas[f] || 0) + Number(opts.transito_sin_fecha); }
+  const demanda = f => base * Math.max(0.3, est.idx[abMesNum(f)] || 1);
+  let stock = Number(opts.disponible) || 0, quiebre = null;
+  const curva = [];   // stock proyectado a fin de cada mes (para el grafico)
+  const stockEn = {};
+  let f = hoy;
+  for (let t = 0; t <= AB_HORIZONTE_DIAS; t++) {
+    if (t > 0) { f = abSumarDias(f, 1); stock += llegadas[f] || 0; stock -= demanda(f); }
+    stockEn[f] = stock;
+    if (quiebre === null && stock <= 0 && velocidad > 0) quiebre = f;
+    if (f.slice(8, 10) === '01' || t === AB_HORIZONTE_DIAS) curva.push({ fecha: f, stock: Math.round(stock) });
+  }
+  if ((Number(opts.disponible) || 0) <= 0 && velocidad > 0) quiebre = hoy;
+  let pedirAntes = null, fechaPedido = hoy, llegada = null, cantidad = 0, demandaVentana = 0;
+  if (velocidad > 0) {
+    pedirAntes = quiebre ? abSumarDias(quiebre, -plazo) : null;
+    fechaPedido = pedirAntes && pedirAntes > hoy ? pedirAntes : hoy;
+    llegada = abSumarDias(fechaPedido, plazo);
+    // cubrir desde que llega hasta llegada + compra_dias + colchon, descontando lo que ya llega en ese lapso
+    let stockLlegada = stockEn[llegada]; if (stockLlegada === undefined) stockLlegada = 0;
+    let ff = llegada;
+    for (let t = 0; t < compraDias + colchon; t++) { ff = abSumarDias(llegada, t); demandaVentana += demanda(ff); }
+    let llegaEnVentana = 0; Object.keys(llegadas).forEach(k => { if (k > llegada && k <= abSumarDias(llegada, compraDias + colchon)) llegaEnVentana += llegadas[k]; });
+    cantidad = Math.max(0, Math.ceil(demandaVentana - Math.max(0, stockLlegada) - llegaEnVentana));
+  }
+  const prox = [];   // demanda estimada de los proximos 6 meses
+  let m = abMesDe(hoy);
+  for (let k = 0; k < 6; k++) { const c = abMesNum(m); const dias = new Date(Date.UTC(parseInt(m.slice(0, 4), 10), c, 0)).getUTCDate(); prox.push({ mes: m, unidades: Math.round(base * (est.idx[c] || 1) * dias) }); m = abRestarMeses(m, -1); }
+  return {
+    quiebre_est: quiebre, pedir_antes: pedirAntes, urgencia: pedirAntes ? (pedirAntes <= hoy ? 'ya' : (abDiasEntre(hoy, pedirAntes) <= 7 ? 'esta semana' : 'programar')) : null,
+    fecha_pedido: velocidad > 0 ? fechaPedido : null, llegada, cantidad, cubre_hasta: llegada ? abSumarDias(llegada, compraDias + colchon) : null,
+    velocidad_base: Math.round(base * 100) / 100, idx_hoy: Math.round(idxHoy * 100) / 100, demanda_ventana: Math.round(demandaVentana),
+    proximos_meses: prox, curva
+  };
+}
+
+// Precio promedio y margen (misma formula que el asistente de MargenML: precio - comision - envio neto - costo - financiero)
+function abPrecioMargen(cache, sku, hastaMes) {
+  const hist = cache.porSku[sku] || {};
+  const meses = [hastaMes, abRestarMeses(hastaMes, 1), abRestarMeses(hastaMes, 2)];
+  let u = 0, monto = 0, com = 0, env = 0, envC = 0, costo = 0, fin = 0, uCosto = 0;
+  for (const m of meses) { const r = hist[m]; if (!r || !r.u) continue; u += r.u; monto += r.monto; com += r.comision; env += r.envio; envC += r.envio_comprador; fin += r.financiero; if (r.costo > 0) { costo += r.costo; uCosto += r.u; } if (u >= 10) break; }
+  if (!u) { const ult = Object.keys(hist).filter(m => hist[m].u > 0).sort().pop(); if (ult) { const r = hist[ult]; u = r.u; monto = r.monto; com = r.comision; env = r.envio; envC = r.envio_comprador; fin = r.financiero; if (r.costo > 0) { costo = r.costo; uCosto = r.u; } } }
+  if (!u) return null;
+  const precio = monto / u, comision = com / u, envioNeto = (env - envC) / u, financiero = fin / u;
+  const costoU = uCosto ? costo / uCosto : null;
+  const margen = costoU === null ? null : precio - comision - envioNeto - costoU - financiero;
+  return { precio_prom: Math.round(precio), comision_pct: precio ? Math.round(comision / precio * 1000) / 10 : null, envio_neto_u: Math.round(envioNeto), costo_u: costoU === null ? null : Math.round(costoU), financiero_u: Math.round(financiero), margen_u: margen === null ? null : Math.round(margen), margen_pct: margen === null || !precio ? null : Math.round(margen / precio * 1000) / 10, unidades_base: u };
+}
+
+// Sugerencia de precio por cobertura (ratio = dias de cobertura / dias hasta que llega algo)
+function abSugerirPrecio(x, pm, reglas) {
+  const margenMin = reglas.margen_minimo_pct != null ? Number(reglas.margen_minimo_pct) : 15;
+  const descMax = reglas.descuento_max_pct != null ? Number(reglas.descuento_max_pct) : 30;
+  const out = { accion: 'mantener', pct: 0, precio_sugerido: pm ? pm.precio_prom : null, margen_pct: pm ? pm.margen_pct : null, margen_sug_pct: pm ? pm.margen_pct : null, motivo: '' };
+  if (!pm || !pm.precio_prom) { out.motivo = 'sin ventas recientes para conocer el precio'; return out; }
+  const P = pm.precio_prom, c = (pm.comision_pct || 0) / 100, fijos = (pm.envio_neto_u || 0) + (pm.costo_u || 0) + (pm.financiero_u || 0);
+  const conCosto = pm.costo_u != null;
+  // precio minimo que respeta el margen minimo (la comision es proporcional al precio)
+  const denom = 1 - c - margenMin / 100;
+  const pMin = conCosto && denom > 0.05 ? fijos / denom : null;
+  const margenA = p => conCosto ? (p * (1 - c) - fijos) / p * 100 : null;
+  const ratio = x.ratio, cob = x.cobertura, disp = Number(x.disponible) || 0, vend = Number(x.vendidas) || 0;
+  let tier = 0, accion = 'mantener', motivo = '';
+  if (cob === null && disp > 0) { tier = descMax; accion = 'liquidar'; motivo = 'tiene stock y no vende: liquidar'; }
+  else if (vend === 0 || disp <= 0) { accion = 'mantener'; motivo = disp <= 0 ? 'sin stock: no tocar el precio hasta reponer' : 'sin ventas'; }
+  else if (ratio === null) { motivo = 'sin datos de cobertura'; }
+  else if (ratio > 4) { tier = 25; accion = 'bajar'; motivo = 'sobra mucho stock (' + Math.round(cob) + ' dias de cobertura): descuento fuerte'; }
+  else if (ratio > 2) { tier = 15; accion = 'bajar'; motivo = 'sobra stock (' + Math.round(cob) + ' dias): descuento medio'; }
+  else if (ratio > 1.2) { tier = 8; accion = 'bajar'; motivo = 'un poco de sobrestock: descuento chico'; }
+  else if (ratio >= 0.8) { accion = 'mantener'; motivo = 'stock y ventas equilibrados'; }
+  else if (ratio >= 0.5) { accion = 'sacar_descuento'; motivo = 'falta stock: sacar promos y no bajar precio'; }
+  else { accion = 'subir'; tier = x.urgente ? 10 : 5; motivo = 'se queda sin stock antes de reponer: subir el precio para estirar la cobertura'; }
+  if (accion === 'bajar' || accion === 'liquidar') {
+    let pct = Math.min(tier, descMax);
+    if (pMin !== null) { const dMax = Math.max(0, (1 - pMin / P) * 100); if (dMax < pct) { pct = Math.floor(dMax); motivo += ' (tope por margen minimo ' + margenMin + '%)'; } }
+    if (conCosto && (pm.margen_pct || 0) < margenMin) { pct = 0; accion = 'mantener'; motivo = 'ya esta por debajo del margen minimo (' + pm.margen_pct + '%): no bajar mas'; }
+    out.pct = -Math.round(pct);
+  } else if (accion === 'subir') {
+    out.pct = Math.round(tier);
+  }
+  if (conCosto && (pm.margen_pct || 0) < margenMin && accion !== 'subir' && disp > 0 && vend > 0 && pMin !== null && pMin > P) {
+    // vende pero pierde margen: sugerir llevarlo al minimo
+    out.pct = Math.round((pMin / P - 1) * 100); accion = 'subir'; motivo = 'margen ' + pm.margen_pct + '% por debajo del minimo ' + margenMin + '%: subir al precio que lo respeta';
+  }
+  out.accion = accion; out.motivo = motivo;
+  out.precio_sugerido = Math.round(P * (1 + out.pct / 100));
+  out.margen_sug_pct = conCosto ? Math.round(margenA(out.precio_sugerido) * 10) / 10 : null;
+  return out;
+}
+
+// Enriquecer las filas del resumen (se llama al final de abResumen)
+function abEnriquecerFilas(cache, filas, ings, hoy, cfg) {
+  const mesHoy = abMesDe(hoy);
+  const porSkuIng = {};
+  (ings || []).forEach(i => { const s = abSku(i.sku); (porSkuIng[s] = porSkuIng[s] || []).push(i); });
+  const compraDias = cfg && cfg.compra_dias ? cfg.compra_dias : 60;
+  filas.forEach(x => {
+    const hist = cache.porSku[x.sku] || {};
+    let u12 = 0, f12 = 0; for (let k = 0; k < 12; k++) { const r = hist[abRestarMeses(mesHoy, k)]; if (r) { u12 += r.u; f12 += r.monto; } }
+    x.ventas_12m = u12; x.facturado_12m = Math.round(f12);
+    const est = abEstacionalidadSku(cache, x.sku, mesHoy);
+    x.estacionalidad = { tipo: est.tipo, pico: est.pico, valle: est.valle, amplitud: est.amplitud, idx_hoy: est.idx[abMesNum(hoy)], meses_con_ventas: est.meses_con_ventas };
+    const transitoSinFecha = Math.max(0, (Number(x.en_transito) || 0) - (porSkuIng[x.sku] || []).reduce((t, i) => t + (/recib|cancel|anul/i.test(String(i.estado || '')) ? 0 : (Number(i.cantidad) || 0)), 0));
+    const plan = abPlanSku(est, { hoy, velocidad: x.velocidad, plazo: x.plazo, disponible: x.disponible, ingresos: porSkuIng[x.sku] || [], transito_sin_fecha: transitoSinFecha, compra_dias: compraDias, colchon: AB_COLCHON_DIAS });
+    x.quiebre_est = plan.quiebre_est; x.pedir_antes = plan.pedir_antes; x.pedir_estacional = plan.cantidad; x.urgencia_compra = plan.urgencia; x.llegada_est = plan.llegada; x.cubre_hasta = plan.cubre_hasta;
+    const pm = abPrecioMargen(cache, x.sku, mesHoy);
+    x.precio_prom = pm ? pm.precio_prom : null; x.margen_pct = pm ? pm.margen_pct : null; x.costo_venta_u = pm ? pm.costo_u : null; x.comision_pct = pm ? pm.comision_pct : null;
+    x.sugerencia = abSugerirPrecio(x, pm, { margen_minimo_pct: x.margen_minimo_pct, descuento_max_pct: x.descuento_max_pct });
+  });
+}
+
+// Estacionalidad global (para el grafico y para explicar el indice)
+app.get('/api/abast/estacionalidad', requireAuth, soloAbast, async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try {
+    const cache = await abVentasMesCache();
+    const hoy = abHoy(), mesHoy = abMesDe(hoy);
+    const g = abIndiceGlobal(cache, mesHoy);
+    const meses = cache.meses.map(m => ({ mes: m, unidades: cache.global[m].u, monto: Math.round(cache.global[m].monto), skus: cache.global[m].skus, cerrado: m < mesHoy }));
+    res.json({ hoy, meses, indice: g.idx, meses_usados: g.meses, nombres: AB_MESES_NOMBRE });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Historial v2: por dia y por mes desde las vistas (rapido) + monto + estacionalidad + plan
+async function abHistorialSkuV2(sku, desde, hasta) {
+  const cache = await abVentasMesCache();
+  const [{ data: dRows, error: e1 }, { data: sRows, error: e2 }, { data: ings }, { data: prodRows }] = await Promise.all([
+    supabase.from('ab_ventas_dia_v').select('fecha,unidades,ordenes,monto').eq('sku', sku).gte('fecha', desde).order('fecha').range(0, 4999),
+    supabase.from('ab_stock_dia').select('fecha,disponible,en_transito').eq('sku', sku).gte('fecha', desde).order('fecha').range(0, 4999),
+    supabase.from('ab_ingresos').select('sku,cantidad,fecha_eta,estado').eq('sku', sku).gte('fecha_eta', hasta),
+    supabase.from('ab_productos').select('dias_reposicion,proveedor_id,margen_minimo_pct,descuento_max_pct').eq('sku', sku).limit(1)
+  ]);
+  if (e1) throw new Error('ab_ventas_dia_v: ' + e1.message + ' (hay que crear la vista en Supabase)');
+  if (e2) throw new Error('ab_stock_dia: ' + e2.message);
+  const ventasDia = {}; (dRows || []).forEach(r => { ventasDia[String(r.fecha).slice(0, 10)] = { u: Number(r.unidades) || 0, o: Number(r.ordenes) || 0, m: Number(r.monto) || 0 }; });
+  const stockDia = {}; (sRows || []).forEach(r => { stockDia[String(r.fecha).slice(0, 10)] = { disponible: Number(r.disponible || 0), en_transito: Number(r.en_transito || 0) }; });
+  let primeraVenta = null, primeraFoto = null;
+  try {
+    const { data: pv } = await supabase.from('ab_ventas_dia_v').select('fecha').eq('sku', sku).order('fecha').limit(1);
+    primeraVenta = pv && pv[0] ? String(pv[0].fecha).slice(0, 10) : null;
+    const { data: pf } = await supabase.from('ab_stock_dia').select('fecha').eq('sku', sku).order('fecha').limit(1);
+    primeraFoto = pf && pf[0] ? String(pf[0].fecha).slice(0, 10) : null;
+  } catch (e) {}
+  const dias = [];
+  for (let f = desde; f <= hasta; f = abSumarDias(f, 1)) { const v = ventasDia[f] || { u: 0, o: 0, m: 0 }, st = stockDia[f] || null; dias.push({ fecha: f, vendidas: v.u, ordenes: v.o, monto: Math.round(v.m), disponible: st ? st.disponible : null, en_transito: st ? st.en_transito : null }); }
+  const porMes = {};
+  dias.forEach(x => {
+    const m = x.fecha.slice(0, 7);
+    const o = porMes[m] = porMes[m] || { mes: m, vendidas: 0, ordenes: 0, monto: 0, dias: 0, dias_con_foto: 0, dias_con_stock: 0, dias_sin_stock: 0, vendidas_con_stock: 0 };
+    o.vendidas += x.vendidas; o.ordenes += x.ordenes; o.monto += x.monto; o.dias++;
+    if (x.disponible !== null) { o.dias_con_foto++; if (x.disponible > 0) { o.dias_con_stock++; o.vendidas_con_stock += x.vendidas; } else o.dias_sin_stock++; }
+  });
+  const meses = Object.values(porMes).sort((a, b) => a.mes.localeCompare(b.mes));
+  const totConStock = meses.reduce((t, m) => t + m.dias_con_stock, 0), totVendConStock = meses.reduce((t, m) => t + m.vendidas_con_stock, 0);
+  const velPeriodo = totConStock > 0 ? totVendConStock / totConStock : 0;
+  meses.forEach(m => { const vel = m.dias_con_stock >= 5 ? m.vendidas_con_stock / m.dias_con_stock : velPeriodo; m.velocidad_con_stock = Math.round(vel * 100) / 100; m.venta_perdida_est = Math.round(m.dias_sin_stock * vel); m.precio_prom = m.vendidas ? Math.round(m.monto / m.vendidas) : null; });
+  const totales = { vendidas: meses.reduce((t, m) => t + m.vendidas, 0), ordenes: meses.reduce((t, m) => t + m.ordenes, 0), monto: meses.reduce((t, m) => t + m.monto, 0), dias_con_foto: meses.reduce((t, m) => t + m.dias_con_foto, 0), dias_sin_stock: meses.reduce((t, m) => t + m.dias_sin_stock, 0), venta_perdida_est: meses.reduce((t, m) => t + m.venta_perdida_est, 0), velocidad_con_stock: Math.round(velPeriodo * 100) / 100 };
+  // estacionalidad + plan con la velocidad de los ultimos 15 dias (misma que la tabla)
+  const mesHoy = abMesDe(hasta);
+  const est = abEstacionalidadSku(cache, sku, mesHoy);
+  let v15 = 0; for (let k = 0; k < AB_VENTANA_ML; k++) { const f = abSumarDias(hasta, -k); v15 += (ventasDia[f] || { u: 0 }).u; }
+  const velocidad = v15 / AB_VENTANA_ML;
+  const ultFoto = Object.keys(stockDia).sort().pop();
+  const disponible = ultFoto ? stockDia[ultFoto].disponible : 0, transito = ultFoto ? stockDia[ultFoto].en_transito : 0;
+  const prod = (prodRows || [])[0] || {};
+  let plazo = Number(prod.dias_reposicion) || 0;
+  if (!plazo && prod.proveedor_id) { const { data: pv } = await supabase.from('ab_proveedores').select('dias_reposicion').eq('id', prod.proveedor_id).limit(1); plazo = pv && pv[0] ? Number(pv[0].dias_reposicion) || 0 : 0; }
+  if (!plazo) plazo = AB_PLAZO_DEF;
+  const cfg = await abConfigLeer();
+  const enCamino = (ings || []).reduce((t, i) => t + (/recib|cancel|anul/i.test(String(i.estado || '')) ? 0 : (Number(i.cantidad) || 0)), 0);
+  const plan = abPlanSku(est, { hoy: hasta, velocidad, plazo, disponible, ingresos: ings || [], transito_sin_fecha: Math.max(0, transito - enCamino), compra_dias: cfg.vistas.compra_dias || 60, colchon: AB_COLCHON_DIAS });
+  const idxMeses = []; for (let c = 1; c <= 12; c++) idxMeses.push({ mes: c, nombre: AB_MESES_NOMBRE[c - 1], idx: est.idx[c] });
+  return { sku, desde, hasta, primera_venta: primeraVenta, primera_foto: primeraFoto, meses, totales, dias, estacionalidad: Object.assign({ indices: idxMeses }, est, { idx: undefined }), plan: Object.assign({ velocidad_15d: Math.round(velocidad * 100) / 100, plazo, disponible, compra_dias: cfg.vistas.compra_dias || 60 }, plan) };
+}
 
 // ══ USUARIOS v14 (solo admin): gestion del equipo desde el panel ══
 // Crea el login en Supabase Auth Y la fila de rol en mml_roles de un saque.
