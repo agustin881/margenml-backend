@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v45-plan', costo_congelado: true, pack_envio: true, chat: true, abastecimiento: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v46-combos', costo_congelado: true, pack_envio: true, chat: true, abastecimiento: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -508,6 +508,11 @@ async function abResumen() {
     const s = abSku(i.sku); if (!eta[s]) eta[s] = i;
     enCamino[s] = (enCamino[s] || 0) + (Number(i.cantidad) || 0);
   });
+  // v46: la venta de los combos ("COMBO 4X VST280-NE") suma unidades al producto base, que es el que tiene el stock
+  Object.keys(ventas.porSku).forEach(s => {
+    const c = abCombo(s, b => !!(stock[b] || prod[b] || ventas.porSku[b] != null)); if (!c) return;
+    ventas.porSku[c.base] = (Number(ventas.porSku[c.base]) || 0) + c.mult * (Number(ventas.porSku[s]) || 0);
+  });
   const universo = new Set([...Object.keys(stock), ...Object.keys(ventas.porSku), ...Object.keys(prod)]);
   const filas = []; let inactivos = 0;
   universo.forEach(sku => {
@@ -982,6 +987,15 @@ function abMesDe(iso) { return String(iso || '').slice(0, 7); }
 function abMesNum(mes) { return parseInt(String(mes).slice(5, 7), 10); }   // 'YYYY-MM' -> 1..12
 function abSumarDias(iso, n) { const d = new Date(iso + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); }
 function abRestarMeses(mes, n) { const d = new Date(mes + '-01T00:00:00Z'); d.setUTCMonth(d.getUTCMonth() - n); return d.toISOString().slice(0, 7); }
+// v46: combos ("COMBO 4X VST280-NE" = 4 x VST280-NE) comparten stock con el producto base
+function abCombo(sku, existe) {
+  const m = /^COMBO\s+(\d+)\s*X?\s+(.+)$/i.exec(String(sku || '').trim());
+  if (!m) return null;
+  const base = abSku(m[2]), mult = parseInt(m[1], 10) || 1;
+  if (!base || base === abSku(sku) || (existe && !existe(base))) return null;
+  return { base, mult };
+}
+function abU(r) { return r ? (Number(r.u) || 0) + (Number(r.uc) || 0) : 0; }   // unidades propias + las vendidas dentro de combos
 
 async function abVentasMesCache(forzar) {
   if (!forzar && _abMes.ts && Date.now() - _abMes.ts < AB_MES_CACHE_MS) return _abMes;
@@ -1001,6 +1015,11 @@ async function abVentasMesCache(forzar) {
     if (!data || data.length < 1000) break;
     offset += 1000; if (offset > 100000) break;
   }
+  // v46: las unidades vendidas en combos se suman al producto base (campo uc): estacionalidad y ventas 12m
+  Object.keys(porSku).forEach(s => {
+    const c = abCombo(s, b => !!porSku[b]); if (!c) return;
+    Object.keys(porSku[s]).forEach(m => { const b = porSku[c.base][m] = porSku[c.base][m] || { u: 0, monto: 0, ordenes: 0, comision: 0, envio: 0, costo: 0, envio_comprador: 0, financiero: 0 }; b.uc = (b.uc || 0) + c.mult * porSku[s][m].u; });
+  });
   _abMes = { ts: Date.now(), porSku, global, meses: Array.from(mesesSet).sort() };
   return _abMes;
 }
@@ -1029,9 +1048,9 @@ function abIndiceGlobal(cache, hastaMes) {
 function abEstacionalidadSku(cache, sku, hastaMes) {
   const g = abIndiceGlobal(cache, hastaMes);
   const hist = cache.porSku[sku] || {};
-  const meses = Object.keys(hist).filter(m => m < hastaMes && hist[m].u > 0).sort().slice(-24);
+  const meses = Object.keys(hist).filter(m => m < hastaMes && abU(hist[m]) > 0).sort().slice(-24);
   const porCal = {}; let total = 0;
-  meses.forEach(m => { const c = abMesNum(m); (porCal[c] = porCal[c] || []).push(hist[m].u); total += hist[m].u; });
+  meses.forEach(m => { const c = abMesNum(m); (porCal[c] = porCal[c] || []).push(abU(hist[m])); total += abU(hist[m]); });
   const media = meses.length ? total / meses.length : 0;
   const propio = {}, idx = {}; let suma = 0, sumaP = 0, nP = 0;
   const pesoGlobal = meses.length >= 9 ? 1 : 2;   // con buena historia manda el producto
@@ -1112,11 +1131,13 @@ function abPrecioMargen(cache, sku, hastaMes) {
   return { precio_prom: Math.round(precio), comision_pct: precio ? Math.round(comision / precio * 1000) / 10 : null, envio_neto_u: Math.round(envioNeto), costo_u: costoU === null ? null : Math.round(costoU), financiero_u: Math.round(financiero), margen_u: margen === null ? null : Math.round(margen), margen_pct: margen === null || !precio ? null : Math.round(margen / precio * 1000) / 10, unidades_base: u };
 }
 
-// Sugerencia de precio por cobertura (ratio = dias de cobertura / dias hasta que llega algo)
-function abSugerirPrecio(x, pm, reglas) {
+// Sugerencia de precio por cobertura. v46: la cobertura se compara contra el ciclo de compra completo
+// (plazo + dias de compra + colchon) y usa el quiebre estimado con estacionalidad y llegadas si lo hay.
+function abSugerirPrecio(x, pm, reglas, ctx) {
+  ctx = ctx || {};
   const margenMin = reglas.margen_minimo_pct != null ? Number(reglas.margen_minimo_pct) : 15;
   const descMax = reglas.descuento_max_pct != null ? Number(reglas.descuento_max_pct) : 30;
-  const out = { accion: 'mantener', pct: 0, precio_sugerido: pm ? pm.precio_prom : null, margen_pct: pm ? pm.margen_pct : null, margen_sug_pct: pm ? pm.margen_pct : null, motivo: '' };
+  const out = { accion: 'mantener', pct: 0, precio_sugerido: pm ? pm.precio_prom : null, margen_pct: pm ? pm.margen_pct : null, margen_sug_pct: pm ? pm.margen_pct : null, motivo: '', cobertura_est: null, objetivo_dias: null, revisar: null };
   if (!pm || !pm.precio_prom) { out.motivo = 'sin ventas recientes para conocer el precio'; return out; }
   const P = pm.precio_prom, c = (pm.comision_pct || 0) / 100, fijos = (pm.envio_neto_u || 0) + (pm.costo_u || 0) + (pm.financiero_u || 0);
   const conCosto = pm.costo_u != null;
@@ -1124,21 +1145,42 @@ function abSugerirPrecio(x, pm, reglas) {
   const denom = 1 - c - margenMin / 100;
   const pMin = conCosto && denom > 0.05 ? fijos / denom : null;
   const margenA = p => conCosto ? (p * (1 - c) - fijos) / p * 100 : null;
-  const ratio = x.ratio, cob = x.cobertura, disp = Number(x.disponible) || 0, vend = Number(x.vendidas) || 0;
+  const cob = x.cobertura, disp = Number(x.disponible) || 0, vend = Number(x.vendidas) || 0;
+  const objetivo = Math.max(14, Number(ctx.objetivo) || ((Number(x.plazo) || AB_PLAZO_DEF) + AB_COLCHON_DIAS));
+  // cobertura "real": dias hasta el quiebre estimado (estacionalidad + llegadas) si lo hay; si no, la plana
+  let cobDias = cob;
+  if (ctx.hoy && ctx.quiebre_est) cobDias = Math.max(0, abDiasEntre(ctx.hoy, ctx.quiebre_est));
+  else if (cob !== null && ctx.sin_quiebre) cobDias = Math.max(cob, AB_HORIZONTE_DIAS);
+  const r = cobDias === null ? null : cobDias / objetivo;
+  out.cobertura_est = cobDias === null ? null : Math.round(cobDias); out.objetivo_dias = objetivo;
+  const cobTxt = cobDias === null ? '' : Math.round(cobDias) + ' dias de stock vs ' + objetivo + ' del ciclo de compra';
   let tier = 0, accion = 'mantener', motivo = '';
   if (cob === null && disp > 0) { tier = descMax; accion = 'liquidar'; motivo = 'tiene stock y no vende: liquidar'; }
   else if (vend === 0 || disp <= 0) { accion = 'mantener'; motivo = disp <= 0 ? 'sin stock: no tocar el precio hasta reponer' : 'sin ventas'; }
-  else if (ratio === null) { motivo = 'sin datos de cobertura'; }
-  else if (ratio > 4) { tier = 25; accion = 'bajar'; motivo = 'sobra mucho stock (' + Math.round(cob) + ' dias de cobertura): descuento fuerte'; }
-  else if (ratio > 2) { tier = 15; accion = 'bajar'; motivo = 'sobra stock (' + Math.round(cob) + ' dias): descuento medio'; }
-  else if (ratio > 1.2) { tier = 8; accion = 'bajar'; motivo = 'un poco de sobrestock: descuento chico'; }
-  else if (ratio >= 0.8) { accion = 'mantener'; motivo = 'stock y ventas equilibrados'; }
-  else if (ratio >= 0.5) { accion = 'sacar_descuento'; motivo = 'falta stock: sacar promos y no bajar precio'; }
-  else { accion = 'subir'; tier = x.urgente ? 10 : 5; motivo = 'se queda sin stock antes de reponer: subir el precio para estirar la cobertura'; }
+  else if (r === null) { motivo = 'sin datos de cobertura'; }
+  else if (r > 3) { tier = 25; accion = 'bajar'; motivo = 'sobra mucho stock (' + cobTxt + '): descuento fuerte'; }
+  else if (r > 2) { tier = 15; accion = 'bajar'; motivo = 'sobra stock (' + cobTxt + '): descuento medio'; }
+  else if (r > 1.4) { tier = 8; accion = 'bajar'; motivo = 'un poco de sobrestock (' + cobTxt + '): descuento chico'; }
+  else if (r >= 0.6) { accion = 'mantener'; motivo = 'stock y ventas equilibrados (' + cobTxt + ')'; }
+  else if (r >= 0.25) { accion = 'sacar_descuento'; motivo = 'falta stock (' + cobTxt + '): sacar promos y no bajar precio'; }
+  else { accion = 'subir'; tier = (ctx.urgencia === 'ya' && cobDias <= 7) ? 10 : 5; motivo = 'se queda sin stock antes de reponer (' + cobTxt + '): subir el precio para estirar la cobertura'; }
+  // v46: temporada por empezar. Si el pico viene en los proximos 3 meses, no conviene bajar ni liquidar todavia
+  if ((accion === 'bajar' || accion === 'liquidar') && ctx.est && /estacional|poca historia/.test(String(ctx.est.tipo || '')) && ctx.hoy && (Number(ctx.ventas_12m) || 0) > 0) {
+    const mHoy = abMesNum(ctx.hoy), pico = Number(ctx.est.pico) || 0, idx = ctx.est.idx || {};
+    const dist = ((pico - mHoy) + 12) % 12;
+    const salto = pico && idx[pico] && idx[mHoy] ? idx[pico] / idx[mHoy] : 1;
+    if (dist >= 1 && dist <= 3 && salto >= 1.5) {
+      let revisar = abRestarMeses(abMesDe(ctx.hoy), -(dist - 1)) + '-01';   // primer dia del mes anterior al pico
+      if (revisar <= ctx.hoy) revisar = abSumarDias(ctx.hoy, 15);
+      accion = 'esperar'; tier = 0; out.revisar = revisar;
+      motivo = 'temporada por empezar: pico en ' + AB_MESES_NOMBRE[pico - 1] + ' (x' + (Math.round(salto * 10) / 10) + ' vs hoy). No bajar todavia; revisar el ' + revisar.slice(8, 10) + '/' + revisar.slice(5, 7);
+    }
+  }
   if (accion === 'bajar' || accion === 'liquidar') {
     let pct = Math.min(tier, descMax);
     if (pMin !== null) { const dMax = Math.max(0, (1 - pMin / P) * 100); if (dMax < pct) { pct = Math.floor(dMax); motivo += ' (tope por margen minimo ' + margenMin + '%)'; } }
     if (conCosto && (pm.margen_pct || 0) < margenMin) { pct = 0; accion = 'mantener'; motivo = 'ya esta por debajo del margen minimo (' + pm.margen_pct + '%): no bajar mas'; }
+    else if (pct < 1) { pct = 0; accion = 'sin_margen'; motivo = 'sobra stock (' + cobTxt + ') pero el margen (' + pm.margen_pct + '%) no deja bajar sin perforar el minimo ' + margenMin + '%'; }
     out.pct = -Math.round(pct);
   } else if (accion === 'subir') {
     out.pct = Math.round(tier);
@@ -1159,9 +1201,11 @@ function abEnriquecerFilas(cache, filas, ings, hoy, cfg) {
   const porSkuIng = {};
   (ings || []).forEach(i => { const s = abSku(i.sku); (porSkuIng[s] = porSkuIng[s] || []).push(i); });
   const compraDias = cfg && cfg.compra_dias ? cfg.compra_dias : 60;
+  const porSku = {}; filas.forEach(x => { porSku[x.sku] = x; });
   filas.forEach(x => {
+    x.combo = abCombo(x.sku, b => !!porSku[b]);
     const hist = cache.porSku[x.sku] || {};
-    let u12 = 0, f12 = 0; for (let k = 0; k < 12; k++) { const r = hist[abRestarMeses(mesHoy, k)]; if (r) { u12 += r.u; f12 += r.monto; } }
+    let u12 = 0, f12 = 0; for (let k = 0; k < 12; k++) { const r = hist[abRestarMeses(mesHoy, k)]; if (r) { u12 += abU(r); f12 += r.monto; } }
     x.ventas_12m = u12; x.facturado_12m = Math.round(f12);
     const est = abEstacionalidadSku(cache, x.sku, mesHoy);
     x.estacionalidad = { tipo: est.tipo, pico: est.pico, valle: est.valle, amplitud: est.amplitud, idx_hoy: est.idx[abMesNum(hoy)], meses_con_ventas: est.meses_con_ventas };
@@ -1170,7 +1214,20 @@ function abEnriquecerFilas(cache, filas, ings, hoy, cfg) {
     x.quiebre_est = plan.quiebre_est; x.pedir_antes = plan.pedir_antes; x.pedir_estacional = plan.cantidad; x.urgencia_compra = plan.urgencia; x.llegada_est = plan.llegada; x.cubre_hasta = plan.cubre_hasta;
     const pm = abPrecioMargen(cache, x.sku, mesHoy);
     x.precio_prom = pm ? pm.precio_prom : null; x.margen_pct = pm ? pm.margen_pct : null; x.costo_venta_u = pm ? pm.costo_u : null; x.comision_pct = pm ? pm.comision_pct : null;
-    x.sugerencia = abSugerirPrecio(x, pm, { margen_minimo_pct: x.margen_minimo_pct, descuento_max_pct: x.descuento_max_pct });
+    const objetivo = (Number(x.plazo) || AB_PLAZO_DEF) + compraDias + AB_COLCHON_DIAS;
+    x.sugerencia = abSugerirPrecio(x, pm, { margen_minimo_pct: x.margen_minimo_pct, descuento_max_pct: x.descuento_max_pct },
+      { hoy, objetivo, quiebre_est: plan.quiebre_est, sin_quiebre: (Number(x.velocidad) || 0) > 0 && !plan.quiebre_est, urgencia: plan.urgencia, est, ventas_12m: u12 });
+  });
+  // v46: los combos no se compran ni se valuan aparte: siguen el plan y la sugerencia del producto base
+  filas.forEach(x => {
+    if (!x.combo) return;
+    const b = porSku[x.combo.base]; if (!b) return;
+    x.quiebre_est = b.quiebre_est; x.pedir_antes = b.pedir_antes; x.urgencia_compra = null; x.pedir_estacional = 0; x.llegada_est = b.llegada_est; x.cubre_hasta = b.cubre_hasta;
+    x.pedir = 0; x.compra = null;
+    const sb = b.sugerencia || {};
+    const acc = ['bajar', 'liquidar', 'sacar_descuento', 'subir', 'esperar', 'sin_margen'].includes(sb.accion) ? sb.accion : 'mantener';
+    x.sugerencia = Object.assign({}, x.sugerencia || {}, { accion: acc, pct: sb.pct || 0, revisar: sb.revisar || null, margen_sug_pct: null, cobertura_est: sb.cobertura_est == null ? null : sb.cobertura_est, objetivo_dias: sb.objetivo_dias || null, motivo: 'combo de ' + x.combo.mult + ' x ' + x.combo.base + ' (mismo stock): ' + (sb.motivo || 'sigue al producto base') });
+    x.sugerencia.precio_sugerido = x.precio_prom ? Math.round(x.precio_prom * (1 + (x.sugerencia.pct || 0) / 100)) : null;
   });
 }
 
