@@ -8,7 +8,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // Marcador de version (para verificar que Railway tiene el codigo nuevo)
-app.get('/api/version', (req, res) => res.json({ version: 'v47-temporada', costo_congelado: true, pack_envio: true, chat: true, abastecimiento: true }));
+app.get('/api/version', (req, res) => res.json({ version: 'v48-accesos', costo_congelado: true, pack_envio: true, chat: true, abastecimiento: true }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -3428,7 +3428,7 @@ app.get('/api/ventas', requireAuth, async (req, res) => {
 
 // ── DIAGNOSTICO devoluciones (TEMPORAL): estados reales + reembolsos ──
 // GET /api/ventas/estados?user_id=67619515
-app.get('/api/ventas/estados', async (req, res) => {
+app.get('/api/ventas/estados', requireAuth, soloRoles('admin'), async (req, res) => {
   try {
     const user_id = req.query.user_id;
     if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
@@ -3466,7 +3466,7 @@ app.get('/api/ventas/estados', async (req, res) => {
 
 // ── DIAGNOSTICO devoluciones (TEMPORAL): estructura de una orden con mediacion ──
 // GET /api/ventas/raw-devol?user_id=67619515  -> campos NO sensibles para saber si volvio el producto
-app.get('/api/ventas/raw-devol', async (req, res) => {
+app.get('/api/ventas/raw-devol', requireAuth, soloRoles('admin'), async (req, res) => {
   try {
     const user_id = req.query.user_id;
     if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
@@ -3508,7 +3508,7 @@ app.get('/api/ventas/raw-devol', async (req, res) => {
 
 // ── PROBE devoluciones (TEMPORAL): detectar "se lo queda" vs "lo devuelve" ──
 // GET /api/devol/probe?user_id=67619515
-app.get('/api/devol/probe', async (req, res) => {
+app.get('/api/devol/probe', requireAuth, soloRoles('admin'), async (req, res) => {
   try {
     const user_id = req.query.user_id;
     if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
@@ -3553,7 +3553,7 @@ app.get('/api/devol/probe', async (req, res) => {
 
 // ── PROBE2 devoluciones (TEMPORAL): comparar caso conocido "se lo queda" vs "lo devuelve" ──
 // GET /api/devol/probe2?user_id=67619515   (usa freidora vs silla por defecto; ?nros=a,b para otros)
-app.get('/api/devol/probe2', async (req, res) => {
+app.get('/api/devol/probe2', requireAuth, soloRoles('admin'), async (req, res) => {
   try {
     const user_id = req.query.user_id;
     if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
@@ -3585,7 +3585,7 @@ app.get('/api/devol/probe2', async (req, res) => {
 
 // ── DEVOLUCIONES: enriquecer con el reclamo de ML (se lo queda vs lo devuelve) ──
 // GET /api/devol/enrich?user_id=67619515&limit=150  (llamar en loop hasta faltan=0)
-app.get('/api/devol/enrich', async (req, res) => {
+app.get('/api/devol/enrich', requireAuth, async (req, res) => {
   try {
     const user_id = req.query.user_id;
     if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
@@ -3627,7 +3627,7 @@ app.get('/api/devol/enrich', async (req, res) => {
 
 // ── LOOKUP devolucion (TEMPORAL): ver como quedo analizada una venta ──
 // GET /api/devol/ver?user_id=67619515&nro=2000017080396472
-app.get('/api/devol/ver', async (req, res) => {
+app.get('/api/devol/ver', requireAuth, soloRoles('admin'), async (req, res) => {
   try {
     const user_id = req.query.user_id;
     const nros = String(req.query.nro || '2000017080396472,2000017080396318').split(',').map(x => x.trim()).filter(Boolean);
@@ -3648,7 +3648,7 @@ app.get('/api/devol/ver', async (req, res) => {
 
 // ── INSPECTOR de venta (TEMPORAL): todo lo que ML devuelve de una venta ──
 // GET /api/venta/inspect?user_id=67619515&nro=2000013785412851
-app.get('/api/venta/inspect', async (req, res) => {
+app.get('/api/venta/inspect', requireAuth, soloRoles('admin'), async (req, res) => {
   try {
     const user_id = req.query.user_id;
     const nro = String(req.query.nro || '').trim();
@@ -3713,7 +3713,7 @@ app.get('/api/venta/inspect', async (req, res) => {
 
 // ── PROBE3 (TEMPORAL): donde vive el cargo real por devolucion ──
 // GET /api/devol/probe3?user_id=67619515&claims=5539834073,5533529331,5535841572
-app.get('/api/devol/probe3', async (req, res) => {
+app.get('/api/devol/probe3', requireAuth, soloRoles('admin'), async (req, res) => {
   try {
     const user_id = req.query.user_id;
     if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
@@ -3751,7 +3751,7 @@ app.get('/api/devol/probe3', async (req, res) => {
 
 // ── PROBE4 (TEMPORAL): retorno completo + costos de envios de devolucion ──
 // GET /api/devol/probe4?user_id=67619515&claims=5539834073,5535841572
-app.get('/api/devol/probe4', async (req, res) => {
+app.get('/api/devol/probe4', requireAuth, soloRoles('admin'), async (req, res) => {
   try {
     const user_id = req.query.user_id;
     if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
@@ -3795,7 +3795,7 @@ app.get('/api/devol/probe4', async (req, res) => {
 
 // ── PROBE5 (TEMPORAL): API de facturacion ML (cargos reales por devolucion) ──
 // GET /api/devol/probe5?user_id=67619515&order=2000017191703550
-app.get('/api/devol/probe5', async (req, res) => {
+app.get('/api/devol/probe5', requireAuth, soloRoles('admin'), async (req, res) => {
   try {
     const user_id = req.query.user_id;
     if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
@@ -3840,7 +3840,7 @@ app.get('/api/devol/probe5', async (req, res) => {
 
 // ── PROBE6 (TEMPORAL): lineas de facturacion de ordenes especificas ──
 // GET /api/devol/probe6?user_id=67619515&orders=2000017191703550,2000017077382238,2000017080396472&periods=2026-07-01,2026-06-01
-app.get('/api/devol/probe6', async (req, res) => {
+app.get('/api/devol/probe6', requireAuth, soloRoles('admin'), async (req, res) => {
   try {
     const user_id = req.query.user_id;
     if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
@@ -3900,7 +3900,7 @@ app.get('/api/devol/probe6', async (req, res) => {
 // ── DEVOLUCIONES: cargos reales desde la facturacion de ML (incremental con cursor) ──
 // 1) GET /api/devol/cargos-prep?user_id=..&periods=p1,p2  -> prepara cursores (full scan solo la 1ra vez)
 // 2) GET /api/devol/cargos-sync?user_id=..&period=..      -> procesa UNA pagina desde el cursor guardado
-app.get('/api/devol/cargos-prep', async (req, res) => {
+app.get('/api/devol/cargos-prep', requireAuth, async (req, res) => {
   try {
     const user_id = req.query.user_id;
     const periods = String(req.query.periods || '').split(',').map(x => x.trim()).filter(Boolean);
@@ -3927,7 +3927,7 @@ app.get('/api/devol/cargos-prep', async (req, res) => {
 });
 
 const _devolCache = {};
-app.get('/api/devol/cargos-sync', async (req, res) => {
+app.get('/api/devol/cargos-sync', requireAuth, async (req, res) => {
   try {
     const user_id = req.query.user_id;
     const period = String(req.query.period || '').trim();
@@ -4030,7 +4030,7 @@ app.get('/api/devol/cargos-sync', async (req, res) => {
 
 // ── PROBE7 (TEMPORAL): variantes de filtro por orden en facturacion ──
 // GET /api/devol/probe7?user_id=67619515&order=2000017191703550
-app.get('/api/devol/probe7', async (req, res) => {
+app.get('/api/devol/probe7', requireAuth, soloRoles('admin'), async (req, res) => {
   try {
     const user_id = req.query.user_id;
     if (!user_id) return res.status(400).json({ error: 'user_id requerido' });
@@ -4210,7 +4210,7 @@ async function runSync(userId, dias, incluirEnvio, desdeStr, hastaStr) {
 }
 
 // POST /api/sync  { user_id, dias, envio }
-app.post('/api/sync', (req, res) => {
+app.post('/api/sync', requireAuth, (req, res) => {
   const { user_id, dias, envio } = req.body || {};
   const incluirEnvio = envio !== false && envio !== 'no';
   res.json({ message: 'Sincronización iniciada', user_id, dias, envio: incluirEnvio });
@@ -4218,7 +4218,7 @@ app.post('/api/sync', (req, res) => {
 });
 
 // GET /api/sync?user_id=...&dias=...&envio=si|no  (para disparar desde el navegador)
-app.get('/api/sync', (req, res) => {
+app.get('/api/sync', requireAuth, (req, res) => {
   const user_id = req.query.user_id;
   const dias    = Number(req.query.dias) || 7;
   const incluirEnvio = req.query.envio !== 'no';
@@ -4255,7 +4255,7 @@ async function getContabiliumToken() {
 
 // ── ML: thumbnails por item_id (proxy, evita CORS en el navegador) ──
 // GET /api/thumbs?ids=MLA1,MLA2&user_id=...  -> { id: url }
-app.get('/api/thumbs', async (req, res) => {
+app.get('/api/thumbs', requireAuth, async (req, res) => {
   try {
     const ids = String(req.query.ids||'').split(',').map(s=>s.trim()).filter(Boolean);
     if (!ids.length) return res.json({});
@@ -4282,7 +4282,7 @@ app.get('/api/thumbs', async (req, res) => {
 // GET /api/compras/probe -> prueba rutas candidatas y devuelve cual responde + muestra.
 // Si seteas PROBE_SECRET en Railway, hay que pasar ?secret=...; si no, queda abierto.
 // Borrar este endpoint cuando armemos la feature real de compras.
-app.get('/api/compras/probe', async (req, res) => {
+app.get('/api/compras/probe', requireAuth, soloRoles('admin'), async (req, res) => {
   try {
     if (process.env.PROBE_SECRET && req.query.secret !== process.env.PROBE_SECRET) {
       return res.status(401).json({ error: 'secret requerido' });
@@ -4535,7 +4535,7 @@ app.post('/api/costos/backfill', requireAuth, soloRoles('admin'), async (req, re
 
 // ── DIAGNÓSTICO BONIFICACIONES (TEMPORAL, abierto): respuesta cruda de facturación ──
 // Uso: /api/bonif/diag?user_id=67619515&nro_venta=2000016718538322
-app.get('/api/bonif/diag', async (req, res) => {
+app.get('/api/bonif/diag', requireAuth, soloRoles('admin'), async (req, res) => {
   try {
     const { user_id, nro_venta } = req.query;
     if (!user_id || !nro_venta) return res.status(400).json({ error: 'Falta user_id o nro_venta' });
@@ -4579,7 +4579,7 @@ app.get('/api/bonif/diag', async (req, res) => {
 
 // ── DIAGNÓSTICO FLEX (TEMPORAL): vuelca el desglose del envío para ubicar la bonificación ──
 // Uso: /api/bonif/diagflex?user_id=67619515&nro_venta=2000016891494744
-app.get('/api/bonif/diagflex', async (req, res) => {
+app.get('/api/bonif/diagflex', requireAuth, soloRoles('admin'), async (req, res) => {
   try {
     const { user_id, nro_venta } = req.query;
     if (!user_id || !nro_venta) return res.status(400).json({ error: 'Falta user_id o nro_venta' });
@@ -4707,7 +4707,7 @@ app.get('/api/medidas', requireAuth, async (req, res) => {
 
 // ── DIAGNÓSTICO BONIFICACIONES 2 (TEMPORAL): periodos + detalles de facturacion ──
 // Uso: /api/bonif/diag2?user_id=67619515&nro_venta=2000016718538322
-app.get('/api/bonif/diag2', async (req, res) => {
+app.get('/api/bonif/diag2', requireAuth, soloRoles('admin'), async (req, res) => {
   try {
     const { user_id, nro_venta } = req.query;
     if (!user_id) return res.status(400).json({ error: 'Falta user_id' });
@@ -4748,7 +4748,7 @@ app.get('/api/bonif/diag2', async (req, res) => {
 
 // ── DIAGNÓSTICO BONIFICACIONES 3 (TEMPORAL): detalle del pago (Mercado Pago) ──
 // Uso: /api/bonif/diag3?user_id=67619515&nro_venta=2000016718538322
-app.get('/api/bonif/diag3', async (req, res) => {
+app.get('/api/bonif/diag3', requireAuth, soloRoles('admin'), async (req, res) => {
   try {
     const { user_id, nro_venta, payment_id } = req.query;
     if (!user_id) return res.status(400).json({ error: 'Falta user_id' });
@@ -4780,7 +4780,7 @@ app.get('/api/bonif/diag3', async (req, res) => {
 
 // ── DIAGNÓSTICO PUBLICIDAD v3 (TEMPORAL): anuncios ACTIVOS (gasto>0) por publicación ──
 // Uso: /api/ads/diag?user_id=67619515
-app.get('/api/ads/diag', async (req, res) => {
+app.get('/api/ads/diag', requireAuth, soloRoles('admin'), async (req, res) => {
   try {
     const { user_id } = req.query;
     if (!user_id) return res.status(400).json({ error: 'Falta user_id. Ej: /api/ads/diag?user_id=67619515' });
@@ -4843,7 +4843,7 @@ app.get('/api/ads/diag', async (req, res) => {
 const _adsCache = {}; // key: user|desde|hasta -> { ts, data }
 const ADS_TTL_MS = 6 * 60 * 60 * 1000; // 6 horas
 
-app.get('/api/ads/items', async (req, res) => {
+app.get('/api/ads/items', requireAuth, async (req, res) => {
   try {
     const { user_id, desde, hasta } = req.query;
     if (!user_id || !desde || !hasta) return res.status(400).json({ error: 'Faltan user_id, desde, hasta (YYYY-MM-DD)' });
@@ -4965,7 +4965,7 @@ app.get('/api/ads/items', async (req, res) => {
 // ── DIAGNÓSTICO ENVÍO (TEMPORAL) ──
 // 1 venta:  /api/envio/diag?user_id=67619515&order=2000017022730948
 // muestra varias: /api/envio/diag?user_id=67619515&sample=1
-app.get('/api/envio/diag', async (req, res) => {
+app.get('/api/envio/diag', requireAuth, soloRoles('admin'), async (req, res) => {
   try {
     const { user_id, order, shipment, sample } = req.query;
     if (!user_id) return res.status(400).json({ error: 'Falta user_id' });
@@ -5040,7 +5040,7 @@ app.get('/api/envio/diag', async (req, res) => {
 // Uso: /api/envio/rawfull?user_id=67619515&order=2000017591069580
 // Devuelve el JSON crudo completo de la orden y del shipment, sin recortar nada.
 // Sirve para ubicar el campo de origen/deposito (Flex Baires vs Flex Rosario).
-app.get('/api/envio/rawfull', async (req, res) => {
+app.get('/api/envio/rawfull', requireAuth, soloRoles('admin'), async (req, res) => {
   try {
     const { user_id, order } = req.query;
     if (!user_id || !order) return res.status(400).json({ error: 'Pasá user_id y order' });
@@ -5150,9 +5150,8 @@ app.post('/api/fb/config/umbral', requireAuth, soloRoles('admin'), async (req, r
 // Uso: /api/diag/rol?clave=pontec2026&email=marina@pontecsa.com
 // Muestra qué rol y pestañas tiene guardado ese email en mml_roles,
 // tal cual lo devolvería /api/mi-rol (sin depender del token del navegador).
-app.get('/api/diag/rol', async (req, res) => {
+app.get('/api/diag/rol', requireAuth, soloRoles('admin'), async (req, res) => {
   try {
-    if ((req.query.clave || '') !== 'pontec2026') return res.status(403).json({ error: 'clave incorrecta' });
     const email = String(req.query.email || '').toLowerCase().trim();
     if (!email) return res.status(400).json({ error: 'pasá email' });
     const { data, error } = await supabase.from('mml_roles')
@@ -5173,7 +5172,7 @@ app.get('/api/diag/rol', async (req, res) => {
 // Uso: /api/ads/diag2?user_id=67619515
 // Prueba las rutas de la API de Publicidad de ML para encontrar la vigente:
 // 1) lista los advertisers de la cuenta, 2) prueba variantes del endpoint de items.
-app.get('/api/ads/diag2', async (req, res) => {
+app.get('/api/ads/diag2', requireAuth, soloRoles('admin'), async (req, res) => {
   try {
     const { user_id } = req.query;
     if (!user_id) return res.status(400).json({ error: 'Pasá user_id' });
@@ -5216,7 +5215,7 @@ app.get('/api/ads/diag2', async (req, res) => {
 // ML desactivó los endpoints viejos (27-may-2026). El modelo nuevo es
 // campañas → ad groups → anuncios. Este diag recorre la cadena con las rutas
 // nuevas y devuelve las estructuras reales para reescribir /api/ads/items.
-app.get('/api/ads/diag3', async (req, res) => {
+app.get('/api/ads/diag3', requireAuth, soloRoles('admin'), async (req, res) => {
   try {
     const { user_id } = req.query;
     if (!user_id) return res.status(400).json({ error: 'Pasá user_id' });
